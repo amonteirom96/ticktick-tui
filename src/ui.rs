@@ -50,6 +50,10 @@ struct App {
     preview_focus: bool,
     preview_cursor: usize,
     preview_width: usize,
+    /// Task column width (%) when the preview is visible.
+    split: u16,
+    zoom: bool,
+    hide_lists: bool,
     collapsed: HashSet<String>,
     /// Highlighted option in the due/reminder pickers, or the checklist item being renamed.
     pick: usize,
@@ -164,6 +168,8 @@ impl App {
     fn focus(&mut self, pane: u8) {
         self.projects_focus = pane == 0;
         self.preview_focus = pane == 2;
+        self.zoom &= self.preview_focus;
+        self.hide_lists &= !self.projects_focus;
         if self.preview_focus {
             self.details = true;
         }
@@ -677,6 +683,19 @@ impl App {
             }
             K::Char('r') => self.send(Job::Refresh),
             K::Char('?') => self.mode = Mode::Help,
+            K::Char('f') => {
+                let zoom = !self.zoom;
+                self.focus(2);
+                self.zoom = zoom;
+            }
+            K::Char('b') => {
+                self.hide_lists = !self.hide_lists;
+                if self.projects_focus {
+                    self.focus(1);
+                }
+            }
+            K::Char('<') => self.split = self.split.saturating_sub(5).max(15),
+            K::Char('>') => self.split = (self.split + 5).min(70),
             K::Enter => self.focus(2),
             K::Char('v') => {
                 self.details = !self.details;
@@ -754,6 +773,9 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         preview_focus: false,
         preview_cursor: 0,
         preview_width: 60,
+        split: 34,
+        zoom: false,
+        hide_lists: false,
         collapsed: HashSet::new(),
         pick: 0,
         theme_request: None,
@@ -1054,14 +1076,14 @@ fn body_area(area: Rect) -> Rect {
 }
 fn preview_area(area: Rect, app: &App) -> Rect {
     let body = body_area(area);
-    if app.preview_focus && body.width < 110 {
+    if app.preview_focus && (app.zoom || body.width < 110) {
         return body;
     }
     if app.details && body.width >= 110 {
-        let sidebar = if body.width >= 150 { 25 } else { 21 };
+        let sidebar = if app.hide_lists { 0 } else if body.width >= 150 { 25 } else { 21 };
         return Layout::horizontal([
             Constraint::Length(sidebar),
-            Constraint::Percentage(34),
+            Constraint::Percentage(app.split),
             Constraint::Min(40),
         ])
         .split(body)[2];
@@ -1150,18 +1172,18 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .style(Style::default().bg(panel))
     };
     let preview = preview_area(f.area(), app);
-    let fullscreen = app.preview_focus && rows[1].width < 110;
+    let fullscreen = app.preview_focus && (app.zoom || rows[1].width < 110);
     if !fullscreen {
         let cols = if preview.width > 0 {
             Layout::horizontal([
-                Constraint::Length(if rows[1].width >= 150 { 25 } else { 21 }),
-                Constraint::Percentage(34),
+                Constraint::Length(if app.hide_lists { 0 } else if rows[1].width >= 150 { 25 } else { 21 }),
+                Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
             .split(rows[1])
         } else {
             Layout::horizontal([
-                Constraint::Length(if rows[1].width < 55 { 17 } else { 25 }),
+                Constraint::Length(if app.hide_lists { 0 } else if rows[1].width < 55 { 17 } else { 25 }),
                 Constraint::Min(0),
             ])
             .split(rows[1])
@@ -1412,7 +1434,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         }
         _ => {
             if app.preview_focus {
-                " PREVIEW  j/k navegar · a novo item · cc renomear · dd apagar · Space marcar · h voltar".into()
+                " PREVIEW  j/k navegar · f zoom · a novo item · cc renomear · dd apagar · Space marcar · h voltar".into()
             } else {
                 " NORMAL  h/j/k/l navegar · a nova · m mover · D prazo · R lembrete · za recolher · ? ajuda".into()
             }
@@ -1478,9 +1500,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         );
     }
     if app.mode == Mode::Help {
-        let area = centered(f.area(), 84, 29);
+        let area = centered(f.area(), 84, 31);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / cc / dd    Novo item / renomear / apagar item do checklist\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / cc / dd    Novo item / renomear / apagar item do checklist\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
 }
 const DUE: [(&str, &str); 4] = [
@@ -1553,6 +1575,9 @@ mod tests {
             preview_focus: false,
             preview_cursor: 0,
             preview_width: 60,
+            split: 34,
+            zoom: false,
+            hide_lists: false,
             collapsed: HashSet::new(),
             pick: 0,
             theme_request: None,

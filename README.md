@@ -66,6 +66,9 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `/` | Filtrar títulos; Enter aplica |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
+| `f` | Zoom: preview em tela cheia (`f`/`Esc` volta) |
+| `<` / `>` | Estreitar / alargar a coluna de tarefas |
+| `b` | Ocultar / mostrar a coluna de listas (`h` reabre) |
 | `r`, `:sync`, `:w` | Sincronizar |
 | `:complete`, `:delete` | Concluir / excluir |
 | `:noh` | Limpar filtro |
