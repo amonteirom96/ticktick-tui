@@ -26,12 +26,15 @@ pub enum Action {
 pub struct Row {
     pub line: Line<'static>,
     pub action: Option<Action>,
+    /// First Markdown link destination on the row, opened with `gx`.
+    pub link: Option<String>,
 }
 impl Row {
     fn text(line: impl Into<Line<'static>>) -> Self {
         Self {
             line: line.into(),
             action: None,
+            link: None,
         }
     }
 }
@@ -44,8 +47,11 @@ struct Markdown<'a> {
     rows: Vec<Row>,
     spans: Vec<Span<'static>>,
     action: Option<Action>,
+    link: Option<String>,
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
+    /// Per open list item: whether it pushed the "done" style.
+    items: Vec<bool>,
     quote: usize,
     code: bool,
 }
@@ -67,6 +73,7 @@ impl<'a> Markdown<'a> {
         self.rows.push(Row {
             line: Line::from(std::mem::take(&mut self.spans)),
             action: self.action.take(),
+            link: self.link.take(),
         });
     }
     fn blank(&mut self) {
@@ -90,8 +97,10 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
         rows: vec![],
         spans: vec![],
         action: None,
+        link: None,
         styles: vec![],
         lists: vec![],
+        items: vec![],
         quote: 0,
         code: false,
     };
@@ -117,7 +126,12 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                 Tag::Strong => m.styles.push(Style::default().bold()),
                 Tag::Emphasis => m.styles.push(Style::default().italic()),
                 Tag::Strikethrough => m.styles.push(Style::default().crossed_out()),
-                Tag::Link { .. } | Tag::Image { .. } => m
+                Tag::Link { dest_url, .. } => {
+                    m.link.get_or_insert(dest_url.to_string());
+                    m.styles
+                        .push(Style::default().fg(color(&theme.accent)).underlined());
+                }
+                Tag::Image { .. } => m
                     .styles
                     .push(Style::default().fg(color(&theme.accent)).underlined()),
                 Tag::List(start) => {
@@ -125,6 +139,7 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                     m.lists.push(start);
                 }
                 Tag::Item => {
+                    m.items.push(false);
                     m.flush();
                     m.prefix();
                     let indent = "  ".repeat(m.lists.len().saturating_sub(1));
@@ -183,7 +198,12 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                 | TagEnd::Image => {
                     m.styles.pop();
                 }
-                TagEnd::Item => m.flush(),
+                TagEnd::Item => {
+                    m.flush();
+                    if m.items.pop() == Some(true) {
+                        m.styles.pop();
+                    }
+                }
                 TagEnd::List(_) => {
                     m.flush();
                     m.lists.pop();
@@ -240,6 +260,11 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                         offset,
                         checked,
                     });
+                }
+                if checked && let Some(done) = m.items.last_mut() {
+                    *done = true;
+                    m.styles
+                        .push(Style::default().fg(color(&theme.muted)).crossed_out());
                 }
                 m.spans.push(Span::styled(
                     if checked { "● " } else { "○ " },
@@ -304,6 +329,7 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
                 result.push(Row {
                     line: Line::from(std::mem::take(&mut spans)),
                     action: row.action.clone(),
+                    link: row.link.clone(),
                 });
                 used = 0;
                 wrapped = true;
@@ -317,6 +343,7 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
                     result.push(Row {
                         line: Line::from(std::mem::take(&mut spans)),
                         action: row.action.clone(),
+                        link: row.link.clone(),
                     });
                     used = 0;
                     wrapped = true;
@@ -331,11 +358,12 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
         result.push(Row {
             line: Line::from(spans),
             action: row.action,
+            link: row.link,
         });
     }
     result
 }
-pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Vec<Row> {
+pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_done: bool) -> Vec<Row> {
     let mut rows = vec![
         Row::text(Span::styled(
             task.title.clone(),
@@ -418,6 +446,9 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
         ])));
         rows.push(Row::text(""));
         for (i, item) in task.items.iter().enumerate() {
+            if hide_done && item.status == 1 {
+                continue;
+            }
             rows.push(Row {
                 line: Line::from(vec![
                     Span::styled(
@@ -436,7 +467,15 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
                     ),
                 ]),
                 action: Some(Action::Checklist(i)),
+                link: None,
             });
+        }
+        let hidden = task.items.iter().filter(|i| i.status == 1).count();
+        if hide_done && hidden > 0 {
+            rows.push(Row::text(Span::styled(
+                format!("  {hidden} concluído(s) oculto(s) · zh mostra"),
+                Style::default().fg(color(&theme.muted)).italic(),
+            )));
         }
     }
     let children = data
@@ -459,10 +498,70 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
                     Span::styled("  ↵", Style::default().fg(color(&theme.muted))),
                 ]),
                 action: Some(Action::Subtask(t.id.clone())),
+                link: None,
             });
         }
     }
     wrap(rows, width)
+}
+fn source<'a>(task: &'a mut Task, field: &Field) -> Option<&'a mut String> {
+    match field {
+        Field::Content => Some(&mut task.content),
+        Field::Description => task.desc.as_mut(),
+    }
+}
+/// Byte ranges of a Markdown task marker's line: (line start, text start, line end).
+fn task_line(source: &str, offset: usize) -> Option<(usize, usize, usize)> {
+    let bytes = source.as_bytes();
+    if !matches!(bytes.get(offset), Some(b' ' | b'x' | b'X')) || bytes.get(offset + 1) != Some(&b']') {
+        return None;
+    }
+    let start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = source[offset..].find('\n').map_or(source.len(), |i| offset + i);
+    let rest = &source[offset + 2..end];
+    Some((start, end - rest.trim_start().len(), end))
+}
+/// Title of a checklist item or Markdown task. Subtasks live in other tasks.
+pub fn label(task: &Task, action: &Action) -> Option<String> {
+    match action {
+        Action::Checklist(i) => task.items.get(*i).map(|i| i.title.clone()),
+        Action::Markdown { field, offset, .. } => {
+            let source = match field {
+                Field::Content => &task.content,
+                Field::Description => task.desc.as_ref()?,
+            };
+            let (_, text, end) = task_line(source, *offset)?;
+            Some(source[text..end].to_owned())
+        }
+        Action::Subtask(_) => None,
+    }
+}
+pub fn rename(task: &mut Task, action: &Action, title: &str) -> bool {
+    match action {
+        Action::Checklist(i) => task.items.get_mut(*i).map(|i| i.title = title.into()).is_some(),
+        Action::Markdown { field, offset, .. } => source(task, field)
+            .and_then(|s| task_line(s, *offset).map(|(_, text, end)| s.replace_range(text..end, title)))
+            .is_some(),
+        Action::Subtask(_) => false,
+    }
+}
+pub fn remove(task: &mut Task, action: &Action) -> bool {
+    match action {
+        Action::Checklist(i) if *i < task.items.len() => {
+            task.items.remove(*i);
+            true
+        }
+        Action::Markdown { field, offset, .. } => source(task, field)
+            .and_then(|s| {
+                let (start, _, end) = task_line(s, *offset)?;
+                // Drop the line together with one of its newlines.
+                let range = if end < s.len() { start..end + 1 } else { start.saturating_sub(1)..end };
+                s.replace_range(range, "");
+                Some(())
+            })
+            .is_some(),
+        _ => false,
+    }
 }
 pub fn toggle(task: &mut Task, action: &Action) -> bool {
     match action {
@@ -471,12 +570,8 @@ pub fn toggle(task: &mut Task, action: &Action) -> bool {
             offset,
             checked,
         } => {
-            let source = match field {
-                Field::Content => &mut task.content,
-                Field::Description => match &mut task.desc {
-                    Some(s) => s,
-                    None => return false,
-                },
+            let Some(source) = source(task, field) else {
+                return false;
             };
             if !matches!(source.as_bytes().get(*offset), Some(b' ' | b'x' | b'X')) {
                 return false;

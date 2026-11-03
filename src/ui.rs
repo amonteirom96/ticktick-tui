@@ -58,8 +58,13 @@ struct App {
     zoom: bool,
     hide_lists: bool,
     collapsed: HashSet<String>,
-    /// Highlighted option in the due/reminder pickers, or the checklist item being renamed.
+    /// Highlighted option in the due/reminder pickers, or where the next checklist item goes.
     pick: usize,
+    /// Preview entry being renamed with `cc`.
+    item: Option<Action>,
+    hide_done: bool,
+    /// Inverse patches of `update`, newest last.
+    undo: Vec<Job>,
     theme_request: Option<String>,
     mode: Mode,
     input: String,
@@ -98,7 +103,7 @@ impl App {
         if let Some(before) = self.data.tasks.iter().find(|t| t.id == task.id) {
             let old = serde_json::to_value(before).unwrap();
             let new = serde_json::to_value(&task).unwrap();
-            let fields = new
+            let fields: serde_json::Map<_, _> = new
                 .as_object()
                 .unwrap()
                 .iter()
@@ -107,6 +112,21 @@ impl App {
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            if fields.is_empty() {
+                return;
+            }
+            let inverse = fields
+                .keys()
+                .map(|k| (k.clone(), old.get(k).cloned().unwrap_or_default()))
+                .collect();
+            self.undo.push(Job::Patch {
+                id: task.id.clone(),
+                project: task.project_id.clone(),
+                fields: inverse,
+            });
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
             self.send(Job::Patch {
                 id: task.id,
                 project: task.project_id,
@@ -220,16 +240,185 @@ impl App {
     }
     fn preview(&self, theme: &config::Theme) -> Vec<preview::Row> {
         self.task()
-            .map(|t| preview::document(&t, &self.data, theme, self.preview_width))
+            .map(|t| preview::document(&t, &self.data, theme, self.preview_width, self.hide_done))
             .unwrap_or_default()
     }
     fn focus(&mut self, pane: u8) {
+        let entering = pane == 2 && !self.preview_focus;
         self.projects_focus = pane == 0;
         self.preview_focus = pane == 2;
         self.zoom &= self.preview_focus;
         self.hide_lists &= !self.projects_focus;
         if self.preview_focus {
             self.details = true;
+        }
+        if entering && let Some(&i) = self.open_boxes().first() {
+            self.preview_cursor = i;
+        }
+    }
+    /// Preview rows whose checkbox (Markdown task or checklist item) is still open.
+    fn open_boxes(&self) -> Vec<usize> {
+        let Some(task) = self.task() else {
+            return vec![];
+        };
+        self.preview(&config::Theme::default())
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| match &r.action {
+                Some(Action::Markdown { checked, .. }) => !checked,
+                Some(Action::Checklist(i)) => task.items.get(*i).is_some_and(|i| i.status != 1),
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+    /// Preview j/k: next/previous checkbox or subtask; scrolls a line when none is left that way.
+    fn jump(&mut self, delta: isize) {
+        let rows = self.preview(&config::Theme::default());
+        for _ in 0..delta.unsigned_abs() {
+            let here = rows.get(self.preview_cursor).and_then(|r| r.action.as_ref());
+            // Wrapped rows repeat their action, so skip rows of the current entry.
+            let other = |r: &&preview::Row| r.action.is_some() && r.action.as_ref() != here;
+            let found = if delta > 0 {
+                rows.iter().skip(self.preview_cursor + 1).position(|r| other(&r)).map(|i| self.preview_cursor + 1 + i)
+            } else {
+                rows[..self.preview_cursor.min(rows.len())].iter().rposition(|r| other(&r)).map(|mut i| {
+                    while i > 0 && rows[i - 1].action == rows[i].action {
+                        i -= 1;
+                    }
+                    i
+                })
+            };
+            self.preview_cursor = found.unwrap_or_else(|| {
+                self.preview_cursor.saturating_add_signed(delta.signum()).min(rows.len().saturating_sub(1))
+            });
+        }
+    }
+    fn cursor_to(&mut self, action: Action) {
+        if let Some(i) = self
+            .preview(&config::Theme::default())
+            .iter()
+            .position(|r| r.action.as_ref() == Some(&action))
+        {
+            self.preview_cursor = i;
+        }
+    }
+    /// Inserts checklist items at `pick` into `target` and keeps the cursor on the last one.
+    fn insert_items(&mut self, items: &[(String, bool)]) {
+        let Some(mut t) = self.target.take() else {
+            return;
+        };
+        for (title, done) in items {
+            self.pick = self.pick.min(t.items.len());
+            t.items.insert(self.pick, new_item(title, *done));
+            self.pick += 1;
+        }
+        renumber(&mut t.items);
+        self.update(t);
+        self.target = self.task();
+        self.cursor_to(Action::Checklist(self.pick - 1));
+    }
+    fn undo(&mut self) {
+        match self.undo.pop() {
+            Some(job) => {
+                self.send(job);
+                self.message = format!("Desfeito · {} restante(s)", self.undo.len());
+            }
+            None => self.message = "Nada para desfazer.".into(),
+        }
+    }
+    /// `gs`: checklist item / Markdown task → subtask, or a plain subtask → checklist item.
+    fn convert(&mut self) {
+        let (Some(mut t), Some(action)) = (self.task(), self.cursor_action()) else {
+            return;
+        };
+        if let Action::Subtask(id) = action {
+            let Some(sub) = self.data.tasks.iter().find(|s| s.id == id).cloned() else {
+                return;
+            };
+            let has_children = self.data.tasks.iter().any(|c| c.parent_id.as_deref() == Some(&id));
+            if !sub.content.trim().is_empty() || !sub.items.is_empty() || has_children {
+                self.message = "Subtarefa com conteúdo, checklist ou filhas; não convertida.".into();
+                return;
+            }
+            t.items.push(new_item(&sub.title, false));
+            renumber(&mut t.items);
+            self.update(t);
+            self.send(Job::Delete(sub));
+            self.cursor_to(Action::Checklist(self.task().map_or(0, |t| t.items.len() - 1)));
+            return;
+        }
+        let Some(title) = preview::label(&t, &action) else {
+            return;
+        };
+        if preview::remove(&mut t, &action) {
+            let parent = t.id.clone();
+            let project = t.project_id.clone();
+            self.update(t);
+            self.create(project, title, Some(parent.clone()));
+            // create() selects the new subtask; stay on the parent so the preview keeps context.
+            if let Some(i) = self.visible().iter().position(|v| v.id == parent) {
+                self.selected = i;
+            }
+            self.message = "Convertido em subtarefa.".into();
+        }
+    }
+    /// `gx`: link on the cursor row (preview) or the task's first link.
+    fn open_link(&mut self) {
+        let rows = self.preview(&config::Theme::default());
+        let rows = if self.preview_focus {
+            rows.get(self.preview_cursor..=self.preview_cursor).unwrap_or_default()
+        } else {
+            &rows[..]
+        };
+        let url = rows.iter().find_map(|r| {
+            r.link.clone().or_else(|| {
+                let text = r.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                text.split_whitespace().find(|w| w.starts_with("http")).map(str::to_owned)
+            })
+        });
+        // Only web/mail links: `open file:///…` would launch arbitrary local apps.
+        self.message = match url.filter(|u| ["http://", "https://", "mailto:"].iter().any(|p| u.starts_with(p))) {
+            Some(url) => match std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+                .arg(&url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => format!("Abrindo {url}"),
+                Err(e) => format!("Não foi possível abrir o link: {e}"),
+            },
+            None => "Nenhum link aqui.".into(),
+        };
+    }
+    /// Bracketed paste: several lines in checklist mode become several items.
+    fn paste(&mut self, text: &str) {
+        if self.mode == Mode::Item && self.target.is_some() {
+            let items = text
+                .lines()
+                .filter_map(|l| {
+                    let l = l.trim().trim_start_matches(['-', '*', '+', '•']).trim_start();
+                    let (done, l) = match l.get(..3) {
+                        Some("[ ]") => (false, &l[3..]),
+                        Some("[x]" | "[X]") => (true, &l[3..]),
+                        _ => (false, l),
+                    };
+                    let l = l.trim();
+                    (!l.is_empty()).then(|| (l.to_owned(), done))
+                })
+                .collect::<Vec<_>>();
+            if items.len() > 1 {
+                self.insert_items(&items);
+                self.message = format!("{} itens adicionados", items.len());
+                return;
+            }
+        }
+        if matches!(self.mode, Mode::Normal | Mode::Visual | Mode::Help | Mode::Delete | Mode::Token) {
+            return;
+        }
+        for c in text.trim().chars() {
+            let c = if c.is_control() { ' ' } else { c };
+            self.key(KeyEvent::new(K::Char(c), M::NONE));
         }
     }
     fn fold(&mut self, open: Option<bool>) {
@@ -274,10 +463,18 @@ impl App {
                 } else if let Some(t) = self.data.tasks.iter().find(|t| t.id == id) {
                     self.send(Job::Complete(t.clone()));
                 }
-            } else if let Some(mut task) = self.task()
-                && preview::toggle(&mut task, &action)
-            {
-                self.update(task);
+            } else if let Some(mut task) = self.task() {
+                let checking = match &action {
+                    Action::Markdown { checked, .. } => !checked,
+                    Action::Checklist(i) => task.items.get(*i).is_some_and(|i| i.status != 1),
+                    Action::Subtask(_) => false,
+                };
+                if preview::toggle(&mut task, &action) {
+                    self.update(task);
+                    if checking && self.open_boxes().is_empty() {
+                        self.message = "Tudo marcado ✓ · h depois x conclui a tarefa".into();
+                    }
+                }
             }
         }
     }
@@ -317,12 +514,9 @@ impl App {
             self.input = input;
         }
     }
-    /// Native checklist item under the preview cursor. Row layout does not depend on colors.
-    fn checklist_item(&self) -> Option<usize> {
-        match self.preview(&config::Theme::default()).get(self.preview_cursor)?.action {
-            Some(Action::Checklist(i)) => Some(i),
-            _ => None,
-        }
+    /// Preview entry under the cursor. Row layout does not depend on colors.
+    fn cursor_action(&self) -> Option<Action> {
+        self.preview(&config::Theme::default()).get(self.preview_cursor)?.action.clone()
     }
     fn task(&self) -> Option<Task> {
         self.visible().get(self.selected).map(|t| (*t).clone())
@@ -419,30 +613,27 @@ impl App {
                     self.create(t.project_id, text, Some(t.id));
                 }
             }
-            Mode::Item if !text.is_empty() => {
-                if let Some(mut t) = self.target.take() {
-                    t.items.push(crate::api::ChecklistItem {
-                        // TickTick ids are 24 hex chars, generated by the client.
-                        id: uuid::Uuid::new_v4().simple().to_string()[..24].into(),
-                        title: text,
-                        ..Default::default()
-                    });
-                    self.update(t);
-                    // Stay open for the next item; Enter on an empty line or Esc finishes.
-                    self.target = self.task();
-                    self.input.clear();
-                    self.input_cursor = 0;
-                    return false;
-                }
+            Mode::Item if !text.is_empty() && self.target.is_some() => {
+                self.insert_items(&[(text, false)]);
+                // Stay open for the next item; Enter on an empty line or Esc finishes.
+                self.input.clear();
+                self.input_cursor = 0;
+                return false;
             }
-            Mode::ItemRename if !text.is_empty() => {
-                if let Some(mut t) = self.target.take()
-                    && let Some(item) = t.items.get_mut(self.pick)
-                {
-                    item.title = text;
-                    self.update(t);
+            Mode::ItemRename if !text.is_empty() => match (self.target.take(), self.item.take()) {
+                (Some(_), Some(Action::Subtask(id))) => {
+                    if let Some(mut sub) = self.data.tasks.iter().find(|t| t.id == id).cloned() {
+                        sub.title = text;
+                        self.update(sub);
+                    }
                 }
-            }
+                (Some(mut t), Some(action)) => {
+                    if preview::rename(&mut t, &action, &text) {
+                        self.update(t);
+                    }
+                }
+                _ => (),
+            },
             Mode::Rename if !text.is_empty() => {
                 if let Some(mut t) = self.target.take() {
                     t.title = text;
@@ -648,7 +839,30 @@ impl App {
             K::Char('v') | K::Esc if self.mode == Mode::Visual => self.mode = Mode::Normal,
             K::Char('J') if self.mode == Mode::Visual => self.shift(n as isize),
             K::Char('K') if self.mode == Mode::Visual => self.shift(-(n as isize)),
+            K::Char('J' | 'K') if self.preview_focus => {
+                if let (Some(mut t), Some(Action::Checklist(i))) = (self.task(), self.cursor_action()) {
+                    let j = if key.code == K::Char('J') { i + 1 } else { i.wrapping_sub(1) };
+                    if j < t.items.len() {
+                        t.items.swap(i, j);
+                        renumber(&mut t.items);
+                        self.update(t);
+                        self.cursor_to(Action::Checklist(j));
+                    }
+                }
+            }
+            K::Char('J' | 'K') if !self.projects_focus && self.mode == Mode::Normal => {
+                self.anchor = self.selected;
+                self.shift(if key.code == K::Char('J') { n as isize } else { -(n as isize) });
+            }
+            K::Char('h') if pending == 'z' => {
+                self.hide_done = !self.hide_done;
+                self.message = if self.hide_done { "Concluídos ocultos" } else { "Concluídos visíveis" }.into();
+            }
+            K::Char('s') if pending == 'g' && self.preview_focus => self.convert(),
+            K::Char('x') if pending == 'g' => self.open_link(),
             K::Char('q') => return true,
+            K::Char('j' | ']') | K::Down if self.preview_focus => self.jump(n as isize),
+            K::Char('k' | '[') | K::Up if self.preview_focus => self.jump(-(n as isize)),
             K::Char('j') | K::Down => self.movement(n as isize),
             K::Char('k') | K::Up => self.movement(-(n as isize)),
             K::Char('h') | K::Left => self.focus(if self.preview_focus { 1 } else { 0 }),
@@ -689,13 +903,25 @@ impl App {
             K::Char('G') => self.movement(100000),
             K::Char('d') if key.modifiers.contains(M::CONTROL) => self.movement(10),
             K::Char('u') if key.modifiers.contains(M::CONTROL) => self.movement(-10),
-            K::Char('d') if pending == 'd' && self.preview_focus => {
-                if let (Some(mut t), Some(i)) = (self.task(), self.checklist_item()) {
-                    t.items.remove(i);
-                    self.update(t);
-                    self.preview_cursor = self.preview_cursor.saturating_sub(1);
+            K::Char('u') => self.undo(),
+            K::Char('d') if pending == 'd' && self.preview_focus => match self.cursor_action() {
+                Some(Action::Subtask(id)) => {
+                    self.target = self.data.tasks.iter().find(|t| t.id == id).cloned();
+                    if self.target.is_some() {
+                        self.mode = Mode::Delete;
+                    }
                 }
-            }
+                Some(action) => {
+                    if let Some(mut t) = self.task()
+                        && preview::remove(&mut t, &action)
+                    {
+                        self.update(t);
+                        self.preview_cursor = self.preview_cursor.saturating_sub(1);
+                        self.message = "Item apagado · u desfaz".into();
+                    }
+                }
+                None => (),
+            },
             K::Char('d') if pending == 'd' => {
                 if let Some(t) = self.task() {
                     self.target = Some(t);
@@ -725,15 +951,31 @@ impl App {
                 self.mode = Mode::Command;
                 self.input.clear();
             }
-            K::Char('a') | K::Char('o') if self.preview_focus => self.edit(Mode::Item, String::new()),
+            K::Char(c @ ('a' | 'o' | 'O')) if self.preview_focus => {
+                let len = self.task().map_or(0, |t| t.items.len());
+                let at = match (c, self.cursor_action()) {
+                    ('o', Some(Action::Checklist(i))) => i + 1,
+                    ('O', Some(Action::Checklist(i))) => i,
+                    ('O', _) => 0,
+                    _ => len,
+                };
+                self.edit(Mode::Item, String::new());
+                self.pick = at;
+            }
             K::Char('a') | K::Char('i') | K::Char('o') => {
                 self.mode = Mode::Add;
                 self.input.clear();
             }
             K::Char('c') if pending == 'c' && self.preview_focus => {
-                if let (Some(t), Some(i)) = (self.task(), self.checklist_item()) {
-                    self.edit(Mode::ItemRename, t.items[i].title.clone());
-                    self.pick = i;
+                if let (Some(t), Some(action)) = (self.task(), self.cursor_action()) {
+                    let title = match &action {
+                        Action::Subtask(id) => self.data.tasks.iter().find(|s| &s.id == id).map(|s| s.title.clone()),
+                        _ => preview::label(&t, &action),
+                    };
+                    if let Some(title) = title {
+                        self.edit(Mode::ItemRename, title);
+                        self.item = Some(action);
+                    }
                 }
             }
             K::Char('c') if pending == 'c' => {
@@ -805,13 +1047,13 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), event::DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
     enable_raw_mode()?;
     let _restore = Restore;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, event::EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let api = if !demo && api.is_none() {
         match crate::token_ui::configure(&mut terminal, &config)? {
@@ -852,6 +1094,9 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         hide_lists: false,
         collapsed: HashSet::new(),
         pick: 0,
+        item: None,
+        hide_done: false,
+        undo: Vec::new(),
         theme_request: None,
         mode: Mode::Normal,
         input: String::new(),
@@ -973,39 +1218,24 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             app.send(Job::Refresh);
         }
         terminal.draw(|f| draw(f, &app, &config))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
+        let event = if event::poll(Duration::from_millis(100))? {
+            Some(event::read()?)
+        } else {
+            None
+        };
+        if let Some(Event::Paste(text)) = &event {
+            app.paste(text);
+        }
+        if let Some(Event::Key(key)) = event {
             if key.kind != event::KeyEventKind::Press {
                 continue;
             }
             if app.mode == Mode::Normal
                 && app.preview_focus
+                && app.pending != 'g'
                 && matches!(key.code, K::Char(' ') | K::Char('x') | K::Enter)
             {
                 app.preview_action(&config.theme, key.code == K::Enter);
-            } else if app.mode == Mode::Normal
-                && app.preview_focus
-                && matches!(key.code, K::Char(']') | K::Char('['))
-            {
-                let rows = app.preview(&config.theme);
-                let index = if key.code == K::Char(']') {
-                    rows.iter()
-                        .enumerate()
-                        .skip(app.preview_cursor + 1)
-                        .find(|(_, r)| r.action.is_some())
-                        .map(|(i, _)| i)
-                } else {
-                    rows.iter()
-                        .enumerate()
-                        .take(app.preview_cursor)
-                        .rev()
-                        .find(|(_, r)| r.action.is_some())
-                        .map(|(i, _)| i)
-                };
-                if let Some(i) = index {
-                    app.preview_cursor = i;
-                }
             } else if app.mode == Mode::Normal && key.code == K::Char('e') {
                 if let Some(mut t) = app.task() {
                     disable_raw_mode()?;
@@ -1030,6 +1260,21 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+fn new_item(title: &str, done: bool) -> crate::api::ChecklistItem {
+    crate::api::ChecklistItem {
+        // TickTick ids are 24 hex chars, generated by the client.
+        id: uuid::Uuid::new_v4().simple().to_string()[..24].into(),
+        title: title.into(),
+        status: done.into(),
+        ..Default::default()
+    }
+}
+/// TickTick orders checklist items by `sortOrder`, so keep it in sync with the vector order.
+fn renumber(items: &mut [crate::api::ChecklistItem]) {
+    for (i, item) in items.iter_mut().enumerate() {
+        item.extra.insert("sortOrder".into(), serde_json::json!(i));
+    }
 }
 fn input_view(input: &str, cursor: usize, width: usize) -> String {
     use unicode_width::UnicodeWidthStr;
@@ -1484,7 +1729,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             input_prompt(&app.input, app.input_cursor)
         ),
         Mode::Item => format!(
-            " CHECKLIST  Novo item: {}   Enter adiciona outro · Esc termina",
+            " CHECKLIST  Novo item: {}   Enter adiciona outro · colar várias linhas · Esc termina",
             input_prompt(&app.input, app.input_cursor)
         ),
         Mode::ItemRename => format!(
@@ -1516,9 +1761,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         }
         _ => {
             if app.preview_focus {
-                " PREVIEW  j/k navegar · f zoom · a novo item · cc renomear · dd apagar · Space marcar · h voltar".into()
+                " PREVIEW  x marcar · o/O novo item · J/K mover · cc renomear · dd apagar · u desfazer · gs subtarefa · zh ocultar feitos · h voltar".into()
             } else {
-                " NORMAL  h/j/k/l navegar · a nova · m mover · D prazo · R lembrete · za recolher · ? ajuda".into()
+                " NORMAL  h/j/k/l navegar · a nova · J/K mover · m lista · D prazo · R lembrete · za recolher · ? ajuda".into()
             }
         }
     };
@@ -1582,9 +1827,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         );
     }
     if app.mode == Mode::Help {
-        let area = centered(f.area(), 84, 31);
+        let area = centered(f.area(), 84, 35);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / cc / dd    Novo item / renomear / apagar item do checklist\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
 }
 const DUE: [(&str, &str); 4] = [
@@ -1663,6 +1908,9 @@ mod tests {
             hide_lists: false,
             collapsed: HashSet::new(),
             pick: 0,
+            item: None,
+            hide_done: false,
+            undo: Vec::new(),
             theme_request: None,
             mode: Mode::Normal,
             input: String::new(),
@@ -1778,6 +2026,74 @@ mod tests {
         press(&mut a, 'd');
         press(&mut a, 'd');
         assert_eq!(titles(&a), ["um"]);
+    }
+    #[test]
+    fn preview_vim_editing_of_checkboxes_and_checklist() {
+        let mut a = app();
+        let typing = |a: &mut App, text: &str| {
+            for c in text.chars() {
+                let code = match c {
+                    '\r' => K::Enter,
+                    '\x1b' => K::Esc,
+                    c => K::Char(c),
+                };
+                a.key(KeyEvent::new(code, M::NONE));
+            }
+        };
+        a.data.tasks[0].content = "- [x] alfa\n- [ ] beta\nfim".into();
+        a.focus(2);
+        // Entering the preview lands on the first open checkbox.
+        assert!(matches!(a.cursor_action(), Some(Action::Markdown { checked: false, .. })));
+        typing(&mut a, "cc");
+        a.key(KeyEvent::new(K::Char('u'), M::CONTROL));
+        typing(&mut a, "gama\r");
+        assert_eq!(a.task().unwrap().content, "- [x] alfa\n- [ ] gama\nfim");
+        typing(&mut a, "dd");
+        assert_eq!(a.task().unwrap().content, "- [x] alfa\nfim");
+        typing(&mut a, "u");
+        assert_eq!(a.task().unwrap().content, "- [x] alfa\n- [ ] gama\nfim");
+
+        let titles = |a: &App| a.task().unwrap().items.iter().map(|i| i.title.clone()).collect::<Vec<_>>();
+        typing(&mut a, "a");
+        a.paste("- [ ] um\n- [x] três\n");
+        typing(&mut a, "\x1b");
+        assert_eq!(titles(&a), ["um", "três"]);
+        assert_eq!(a.task().unwrap().items[1].status, 1);
+        typing(&mut a, "Odois\r\x1b");
+        assert_eq!(titles(&a), ["um", "dois", "três"]);
+        typing(&mut a, "K");
+        assert_eq!(titles(&a), ["dois", "um", "três"]);
+        assert_eq!(a.task().unwrap().items[0].extra["sortOrder"], 0);
+        typing(&mut a, "zh");
+        assert!(!a.preview(&config::Theme::default()).iter().any(|r| r.action == Some(Action::Checklist(2))));
+        a.cursor_to(Action::Checklist(0));
+        typing(&mut a, "gs");
+        assert_eq!(titles(&a), ["um", "três"]);
+        assert_eq!(a.task().unwrap().id, "0");
+        assert!(a.data.tasks.iter().any(|t| t.parent_id.as_deref() == Some("0") && t.title == "dois"));
+    }
+    #[test]
+    fn j_k_jump_between_checkboxes_and_shift_k_moves_task_without_visual() {
+        let mut a = app();
+        for (i, t) in a.data.tasks.iter_mut().enumerate() {
+            t.sort_order = i as i64;
+        }
+        a.data.tasks[0].content = "texto\n\n- [ ] um\n\nmais texto\n\n- [ ] dois\n\nfim".into();
+        a.focus(2);
+        let label = |a: &App| a.cursor_action().and_then(|x| preview::label(&a.task().unwrap(), &x));
+        assert_eq!(label(&a).as_deref(), Some("um"));
+        press(&mut a, 'j');
+        assert_eq!(label(&a).as_deref(), Some("dois"));
+        // No checkbox below: j scrolls the remaining text, k returns to the checkbox.
+        press(&mut a, 'j');
+        assert_eq!(label(&a), None);
+        press(&mut a, 'k');
+        assert_eq!(label(&a).as_deref(), Some("dois"));
+        a.focus(1);
+        press(&mut a, 'J');
+        assert_eq!(a.task().unwrap().id, "0");
+        assert_eq!(a.selected, 1);
+        assert!(a.mode == Mode::Normal);
     }
     #[test]
     fn small_terminal_and_help_render() {

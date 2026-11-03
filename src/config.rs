@@ -88,9 +88,11 @@ pub fn load() -> Result<Config> {
     let mut c: Config = toml::from_str(&text).context("Invalid config.toml")?;
     if let Some(file) = &c.theme_file {
         c.theme = read_theme(&config_dir().join(file))?;
-    } else if !table.contains_key("theme") && terminal_light::luma().is_ok_and(|l| l > 0.6) {
-        // No explicit theme: follow the terminal background. Must run before raw mode.
-        c.theme = named_theme("light")?;
+    } else if !table.contains_key("theme") {
+        // No explicit theme: follow the terminal background (user's theme-*.toml first).
+        // Must run before raw mode.
+        let light = terminal_light::luma().is_ok_and(|l| l > 0.6);
+        c.theme = named_theme(if light { "light" } else { "dark" })?;
     }
     validate_theme(&c.theme)?;
     Ok(c)
