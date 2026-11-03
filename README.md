@@ -58,6 +58,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `x`, `Space` | Concluir tarefa |
 | `dd` | Excluir, com confirmação `y` |
 | `p` | Alternar prioridade: nenhuma → baixa → média → alta |
+| `a` / `cc` / `dd` na preview | Novo item / renomear / apagar item do checklist (Enter adiciona o próximo) |
 | `m` | Mover tarefa para outra lista (digite parte do nome) |
 | `D` | Prazo: escolha Hoje / Amanhã / Próxima semana / Sem prazo, ou digite `sex 14:30`, `+3`, `25/12` |
 | `R` | Lembretes: `Space` marca as opções, ou digite `2h`, `3d` |
@@ -73,7 +74,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `?`, `:help` | Ajuda |
 | `q`, `:q`, `Ctrl-c` | Sair |
 
-Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. Abaixo da linha `--- checklist ---` ficam os itens do checklist nativo do TickTick: `- [ ] item` ou `- [x] feito`, um por linha. Adicione, renomeie ou apague linhas para editar o checklist. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi`. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
+Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi`. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
 
 A interface usa modos Normal, Inserção e Comando. Não implementa todo o motor de edição do Vim (macros, registros e operadores de texto); para todos os comandos de edição, use `e` com Vim/Neovim.
 
