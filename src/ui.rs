@@ -1,6 +1,7 @@
 use crate::{
     api::{Api, Project, Snapshot, Task},
     config::{self, Config},
+    fields,
     preview::{self, Action},
     sidebar::{self, View},
     sync::{self, Job},
@@ -13,6 +14,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
+use unicode_width::UnicodeWidthStr;
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -28,6 +30,9 @@ enum Mode {
     Add,
     Subtask,
     Rename,
+    Move,
+    Due,
+    Remind,
     Delete,
     Help,
     Token,
@@ -208,6 +213,34 @@ impl App {
             }
         }
     }
+    fn tz(&self) -> Option<chrono_tz::Tz> {
+        self.data.time_zone.as_ref().and_then(|s| s.parse().ok())
+    }
+    /// Inbox and lists whose name contains `query`, in sidebar order.
+    fn lists(&self, query: &str) -> Vec<(String, String)> {
+        let query = query.to_lowercase();
+        let inbox = self.data.inbox_id.clone();
+        inbox
+            .iter()
+            .map(|id| (id.clone(), "Inbox".to_owned()))
+            .chain(
+                self.data
+                    .projects
+                    .iter()
+                    .filter(|p| Some(&p.id) != inbox.as_ref())
+                    .map(|p| (p.id.clone(), p.name.clone())),
+            )
+            .filter(|(_, name)| name.to_lowercase().contains(&query))
+            .collect()
+    }
+    fn edit(&mut self, mode: Mode, input: String) {
+        self.target = self.task();
+        if self.target.is_some() {
+            self.mode = mode;
+            self.input_cursor = input.chars().count();
+            self.input = input;
+        }
+    }
     fn task(&self) -> Option<Task> {
         self.visible().get(self.selected).map(|t| (*t).clone())
     }
@@ -307,6 +340,46 @@ impl App {
                 if let Some(mut t) = self.target.take() {
                     t.title = text;
                     self.update(t);
+                }
+            }
+            Mode::Move if !text.is_empty() => {
+                if let Some(t) = self.target.take() {
+                    match self.lists(&text).into_iter().next() {
+                        Some((id, _)) if id == t.project_id => {
+                            self.message = "A tarefa já está nessa lista.".into()
+                        }
+                        Some((to, _)) => self.send(Job::Move { task: t, to }),
+                        None => self.message = format!("Lista não encontrada: {text}"),
+                    }
+                }
+            }
+            Mode::Due => {
+                if let Some(t) = self.target.take() {
+                    match fields::due_fields(&text, sidebar::today(&self.data), self.tz()) {
+                        Ok(fields) => self.send(Job::Patch {
+                            id: t.id,
+                            project: t.project_id,
+                            fields,
+                        }),
+                        Err(e) => self.message = e,
+                    }
+                }
+            }
+            Mode::Remind => {
+                if let Some(t) = self.target.take() {
+                    match fields::parse_reminders(&text) {
+                        Ok(r) if !r.is_empty() && t.due_date.is_none() => {
+                            self.message = "Defina um prazo (D) antes do lembrete.".into()
+                        }
+                        Ok(r) => self.send(Job::Patch {
+                            id: t.id,
+                            project: t.project_id,
+                            fields: [("reminders".to_owned(), serde_json::json!(r))]
+                                .into_iter()
+                                .collect(),
+                        }),
+                        Err(e) => self.message = e,
+                    }
                 }
             }
             Mode::Command => match text.as_str() {
@@ -463,6 +536,21 @@ impl App {
                 }
             }
             K::Char('d') => self.pending = 'd',
+            K::Char('m') => self.edit(Mode::Move, String::new()),
+            K::Char('D') => {
+                let due = self.task().and_then(|t| {
+                    let all_day = t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+                    t.due_date.map(|d| fields::format_due(&d, all_day, self.tz()))
+                });
+                self.edit(Mode::Due, due.unwrap_or_default());
+            }
+            K::Char('R') => {
+                let reminders = self
+                    .task()
+                    .and_then(|t| serde_json::from_value(t.extra.get("reminders")?.clone()).ok())
+                    .map(|r: Vec<String>| fields::format_reminders(&r));
+                self.edit(Mode::Remind, reminders.unwrap_or_default());
+            }
             K::Char('/') => {
                 self.mode = Mode::Search;
                 self.search_original = self.query.clone();
@@ -1032,6 +1120,10 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             &mut state,
         );
         let tree = app.tree();
+        let (tz, today) = (app.tz(), sidebar::today(&app.data));
+        let danger = preview::color(&t.danger);
+        // Borders, padding and the highlight symbol take 5 columns.
+        let row_width = cols[1].width.saturating_sub(5) as usize;
         let items = tree
             .iter()
             .map(|row| {
@@ -1048,59 +1140,50 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 } else if row.depth > 0 {
                     "└ "
                 } else {
-                    "  "
+                    ""
                 };
-                let priority = match task.priority {
-                    5 => " ●",
-                    3 => " ●",
-                    1 => " ·",
-                    _ => "",
+                let pill = |text: String, color: Color| {
+                    Span::styled(format!("  {text}"), Style::default().fg(color))
                 };
-                let priority_color = if task.priority == 5 {
-                    preview::color(&t.danger)
-                } else {
-                    accent
-                };
-                let title = Line::from(vec![
-                    Span::styled(format!(" {indent}{branch}"), Style::default().fg(muted)),
-                    Span::raw(task.title.clone()),
-                    Span::styled(priority, Style::default().fg(priority_color)),
-                ]);
-                let mut meta = Vec::new();
-                if let Some(date) = &task.due_date {
-                    meta.push(date.get(..10).unwrap_or(date).to_owned());
+                let mut badges = Vec::new();
+                match task.priority {
+                    5 => badges.push(pill("● alta".into(), danger)),
+                    3 => badges.push(pill("● média".into(), accent)),
+                    1 => badges.push(pill("● baixa".into(), muted)),
+                    _ => (),
+                }
+                if !task.content.is_empty() {
+                    badges.push(pill("≡".into(), muted));
                 }
                 if !task.items.is_empty() {
-                    meta.push(format!(
-                        "☑ {}/{}",
-                        task.items.iter().filter(|i| i.status == 1).count(),
-                        task.items.len()
-                    ));
+                    let done = task.items.iter().filter(|i| i.status == 1).count();
+                    badges.push(pill(format!("☑ {done}/{}", task.items.len()), muted));
                 }
-                if row.children > 0 {
-                    meta.push(format!("{} subtarefas", row.children));
+                if row.children > 0 && app.collapsed.contains(&task.id) {
+                    badges.push(pill(format!("+{}", row.children), muted));
                 }
-                if row.depth > 0 {
-                    meta.push(format!("nível {}", row.depth));
+                if task.extra.get("reminders").and_then(|v| v.as_array()).is_some_and(|r| !r.is_empty()) {
+                    badges.push(pill("⏰".into(), muted));
                 }
-                if meta.is_empty() {
-                    meta.push(
-                        if task.content.is_empty() {
-                            "Sem descrição"
-                        } else {
-                            "≡ Descrição"
-                        }
-                        .into(),
-                    );
+                let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+                if let Some((label, overdue)) = task
+                    .due_date
+                    .as_deref()
+                    .and_then(|d| fields::relative_due(d, all_day, tz, today))
+                {
+                    badges.push(pill(label, if overdue { danger } else { accent }));
                 }
-                ListItem::new(vec![
-                    title,
-                    Line::from(Span::styled(
-                        format!("   {indent}{}", meta.join("  ·  ")),
-                        Style::default().fg(muted),
-                    )),
-                    Line::default(),
-                ])
+                let left = format!(" {indent}{branch}○ ");
+                let right: usize = badges.iter().map(Span::width).sum();
+                let title = truncate(&task.title, row_width.saturating_sub(left.width() + right + 1));
+                let pad = row_width.saturating_sub(left.width() + title.width() + right);
+                let mut line = vec![
+                    Span::styled(left, Style::default().fg(muted)),
+                    Span::raw(title),
+                    Span::raw(" ".repeat(pad)),
+                ];
+                line.extend(badges);
+                ListItem::new(Line::from(line))
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(if tree.is_empty() {
@@ -1204,6 +1287,27 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             " INSERIR  Título: {}",
             input_prompt(&app.input, app.input_cursor)
         ),
+        Mode::Move => {
+            let names = app
+                .lists(&app.input)
+                .into_iter()
+                .take(4)
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>();
+            format!(
+                " MOVER  Lista: {}   → {}",
+                input_prompt(&app.input, app.input_cursor),
+                if names.is_empty() { "nenhuma lista".into() } else { names.join(" · ") }
+            )
+        }
+        Mode::Due => format!(
+            " PRAZO  {}   hoje · amanhã · +3 · 25/12 14:30 · vazio remove",
+            input_prompt(&app.input, app.input_cursor)
+        ),
+        Mode::Remind => format!(
+            " LEMBRETE  {}   antes do prazo: 0, 15m, 1h, 1d · vazio remove",
+            input_prompt(&app.input, app.input_cursor)
+        ),
         Mode::Delete => {
             " EXCLUIR  Confirmar exclusão permanente? y / qualquer tecla cancela".into()
         }
@@ -1211,7 +1315,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             if app.preview_focus {
                 " PREVIEW  j/k navegar   [/] checkbox   Space marcar   Enter abrir   h voltar   e editar".into()
             } else {
-                " NORMAL  h/j/k/l navegar   Enter preview   a nova   A subtarefa   za recolher   ? ajuda".into()
+                " NORMAL  h/j/k/l navegar · a nova · m mover · D prazo · R lembrete · za recolher · ? ajuda".into()
             }
         }
     };
@@ -1222,8 +1326,24 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 29);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
+}
+fn truncate(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if text.width() <= width {
+        return text.into();
+    }
+    let mut out = String::new();
+    let mut used = 1; // reserve the ellipsis
+    for c in text.chars() {
+        used += c.width().unwrap_or(0);
+        if used > width {
+            break;
+        }
+        out.push(c);
+    }
+    out + "…"
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(

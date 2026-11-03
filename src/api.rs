@@ -222,6 +222,14 @@ impl Api {
         )?;
         Ok(())
     }
+    pub fn move_task(&self, task: &Task, to: &str) -> Result<()> {
+        self.request(
+            Method::POST,
+            "/task/move",
+            Some(json!([{"fromProjectId": task.project_id, "toProjectId": to, "taskId": task.id}])),
+        )?;
+        Ok(())
+    }
     pub fn complete(&self, task: &Task) -> Result<()> {
         self.request(
             Method::POST,

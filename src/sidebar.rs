@@ -15,7 +15,7 @@ pub struct Entry {
     pub depth: usize,
     pub count: usize,
 }
-fn today(data: &Snapshot) -> NaiveDate {
+pub fn today(data: &Snapshot) -> NaiveDate {
     data.time_zone
         .as_ref()
         .and_then(|s| s.parse::<chrono_tz::Tz>().ok())

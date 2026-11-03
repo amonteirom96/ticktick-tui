@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod fields;
 mod preview;
 mod sidebar;
 mod sync;

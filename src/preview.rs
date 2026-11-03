@@ -362,9 +362,22 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
         Style::default().fg(color(&theme.muted)),
     )));
     if let Some(due) = &task.due_date {
+        let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+        let tz = data.time_zone.as_ref().and_then(|s| s.parse().ok());
         rows.push(Row::text(Span::styled(
-            format!("Vencimento   {}", due.get(..10).unwrap_or(due)),
+            format!("Vencimento   {}", crate::fields::format_due(due, all_day, tz)),
             Style::default().fg(color(&theme.accent)),
+        )));
+    }
+    if let Some(reminders) = task
+        .extra
+        .get("reminders")
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .filter(|r| !r.is_empty())
+    {
+        rows.push(Row::text(Span::styled(
+            format!("Lembretes    {}", crate::fields::format_reminders(&reminders)),
+            Style::default().fg(color(&theme.muted)),
         )));
     }
     if let Some(parent) = task
