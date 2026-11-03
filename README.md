@@ -4,8 +4,11 @@ Um gerenciador de tarefas minimalista em Rust para o terminal, conectado à Open
 
 ## Instalação
 
+Requer Rust (https://rustup.rs). Não precisa clonar o repositório:
+
 ```sh
-cargo install --path . --locked
+cargo install --git https://github.com/amonteirom96/ticktick-tui --locked
+# Para atualizar, rode o mesmo comando com --force.
 # Explore a interface sem conta e sem chamadas de rede:
 ticktick-tui demo
 ```
@@ -55,6 +58,10 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `x`, `Space` | Concluir tarefa |
 | `dd` | Excluir, com confirmação `y` |
 | `p` | Alternar prioridade: nenhuma → baixa → média → alta |
+| `m` | Mover tarefa para outra lista (digite parte do nome) |
+| `D` | Prazo: `hoje`, `amanhã 14:30`, `+3`, `25/12`, `2026-12-25`; vazio remove |
+| `R` | Lembretes antes do prazo: `0, 15m, 1h, 1d`; vazio remove |
+| `za` / `zo` / `zc` | Recolher / expandir pasta (em Listas) ou subtarefas |
 | `/` | Filtrar títulos; Enter aplica |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
@@ -78,6 +85,8 @@ ticktick-tui config > ~/.config/ticktick-tui/config.toml
 ```
 
 Pode versionar `config.toml` nos dotfiles e criar um symlink. Também são respeitados `XDG_CONFIG_HOME` e `XDG_CACHE_HOME`. Exemplos completos em `themes/`; copie o tema escolhido para `config.toml`. Reinicie para aplicar alterações.
+
+Sem `[theme]` nem `theme_file` no `config.toml`, o tema segue o fundo do terminal: claro em terminais claros, escuro nos demais. O `config.toml` gerado pelo comando acima já inclui `[theme]`; remova essa seção para voltar à detecção automática.
 
 ```toml
 sync_seconds = 60

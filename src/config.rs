@@ -79,13 +79,18 @@ pub fn cache_path() -> PathBuf {
 }
 pub fn load() -> Result<Config> {
     let path = config_dir().join("config.toml");
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let mut c: Config =
-        toml::from_str(&fs::read_to_string(&path)?).context("Invalid config.toml")?;
+    let text = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let table: toml::Table = text.parse().context("Invalid config.toml")?;
+    let mut c: Config = table.clone().try_into().context("Invalid config.toml")?;
     if let Some(file) = &c.theme_file {
         c.theme = read_theme(&config_dir().join(file))?;
+    } else if !table.contains_key("theme") && terminal_light::luma().is_ok_and(|l| l > 0.6) {
+        // No explicit theme: follow the terminal background. Must run before raw mode.
+        c.theme = named_theme("light")?;
     }
     validate_theme(&c.theme)?;
     Ok(c)

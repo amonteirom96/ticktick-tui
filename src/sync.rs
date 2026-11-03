@@ -18,6 +18,7 @@ pub enum Job {
     },
     Complete(Task),
     Delete(Task),
+    Move { task: Task, to: String },
 }
 pub enum Event {
     Data(Snapshot, String),
@@ -52,6 +53,11 @@ pub fn apply(data: &mut Snapshot, job: &Job) {
                 }
             }
         }
+        Job::Move { task, to } => {
+            if let Some(t) = data.tasks.iter_mut().find(|t| t.id == task.id) {
+                t.project_id = to.clone();
+            }
+        }
         Job::Complete(task) | Job::Delete(task) => {
             let mut removed = HashSet::from([task.id.clone()]);
             loop {
@@ -79,7 +85,9 @@ pub fn remap(job: &mut Job, old: &str, new: &str) {
         }
     };
     match job {
-        Job::Create(t) | Job::Complete(t) | Job::Delete(t) => map_task(t),
+        Job::Create(t) | Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
+            map_task(t)
+        }
         Job::Patch { id, fields, .. } => {
             if id == old {
                 *id = new.into();
@@ -95,6 +103,10 @@ fn reflected(data: &Snapshot, job: &Job) -> bool {
     match job {
         Job::Create(t) => data.tasks.iter().any(|x| x.id == t.id),
         Job::Complete(t) | Job::Delete(t) => !data.tasks.iter().any(|x| x.id == t.id),
+        Job::Move { task, to } => data
+            .tasks
+            .iter()
+            .any(|x| x.id == task.id && &x.project_id == to),
         Job::Patch { id, fields, .. } => data.tasks.iter().find(|t| &t.id == id).is_some_and(|t| {
             let v = serde_json::to_value(t).unwrap();
             fields.iter().all(|(k, x)| v.get(k) == Some(x))
@@ -129,7 +141,9 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     .as_deref()
                     .is_some_and(|s| s.starts_with("local:")),
                 Job::Patch { id, .. } => id.starts_with("local:"),
-                Job::Complete(t) | Job::Delete(t) => t.id.starts_with("local:"),
+                Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
+                    t.id.starts_with("local:")
+                }
                 Job::Refresh => false,
             };
             let result = if unresolved {
@@ -150,6 +164,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     } => api.patch(id, project, fields.clone()).map(|_| job.clone()),
                     Job::Complete(t) => api.complete(t).map(|_| job.clone()),
                     Job::Delete(t) => api.delete(t).map(|_| job.clone()),
+                    Job::Move { task, to } => api.move_task(task, to).map(|_| job.clone()),
                 }
             };
             let actual = match result {
