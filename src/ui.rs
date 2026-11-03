@@ -49,6 +49,8 @@ struct App {
     preview_cursor: usize,
     preview_width: usize,
     collapsed: HashSet<String>,
+    /// Highlighted option in the due/reminder pickers.
+    pick: usize,
     theme_request: Option<String>,
     mode: Mode,
     input: String,
@@ -233,8 +235,16 @@ impl App {
             .filter(|(_, name)| name.to_lowercase().contains(&query))
             .collect()
     }
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        match self.mode {
+            Mode::Due => &DUE,
+            Mode::Remind => &REMIND,
+            _ => &[],
+        }
+    }
     fn edit(&mut self, mode: Mode, input: String) {
         self.target = self.task();
+        self.pick = 0;
         if self.target.is_some() {
             self.mode = mode;
             self.input_cursor = input.chars().count();
@@ -368,9 +378,6 @@ impl App {
             Mode::Remind => {
                 if let Some(t) = self.target.take() {
                     match fields::parse_reminders(&text) {
-                        Ok(r) if !r.is_empty() && t.due_date.is_none() => {
-                            self.message = "Defina um prazo (D) antes do lembrete.".into()
-                        }
                         Ok(r) => self.send(Job::Patch {
                             id: t.id,
                             project: t.project_id,
@@ -452,6 +459,51 @@ impl App {
             self.target = None;
             self.mode = Mode::Normal;
             return false;
+        }
+        if matches!(self.mode, Mode::Due | Mode::Remind) {
+            let options = self.options();
+            // j/k navigate unless the user is typing a custom date ("hoje" contains a j).
+            let typing = self.mode == Mode::Due && !self.input.is_empty();
+            let step = match key.code {
+                K::Down => 1,
+                K::Up => -1,
+                K::Char('j') if !typing => 1,
+                K::Char('k') if !typing => -1,
+                _ => 0,
+            };
+            if step != 0 {
+                self.pick = (self.pick as isize + step).rem_euclid(options.len() as isize) as usize;
+                return false;
+            }
+            let value = options[self.pick].1;
+            match key.code {
+                K::Tab if self.mode == Mode::Due => {
+                    self.input = format!("{value} ");
+                    self.input_cursor = self.input.chars().count();
+                    return false;
+                }
+                K::Enter if self.mode == Mode::Due && self.input.trim().is_empty() => {
+                    self.input = value.into();
+                    return self.submit();
+                }
+                K::Char(' ') if self.mode == Mode::Remind => {
+                    let mut tokens = self
+                        .input
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    match tokens.iter().position(|t| t == value) {
+                        Some(i) => drop(tokens.remove(i)),
+                        None => tokens.push(value.into()),
+                    }
+                    self.input = tokens.join(", ");
+                    self.input_cursor = self.input.chars().count();
+                    return false;
+                }
+                _ => (),
+            }
         }
         if self.mode != Mode::Normal {
             match key.code {
@@ -537,12 +589,9 @@ impl App {
             }
             K::Char('d') => self.pending = 'd',
             K::Char('m') => self.edit(Mode::Move, String::new()),
-            K::Char('D') => {
-                let due = self.task().and_then(|t| {
-                    let all_day = t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
-                    t.due_date.map(|d| fields::format_due(&d, all_day, self.tz()))
-                });
-                self.edit(Mode::Due, due.unwrap_or_default());
+            K::Char('D') => self.edit(Mode::Due, String::new()),
+            K::Char('R') if self.task().is_some_and(|t| t.due_date.is_none()) => {
+                self.message = "Defina um prazo (D) antes do lembrete.".into()
             }
             K::Char('R') => {
                 let reminders = self
@@ -659,6 +708,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         preview_cursor: 0,
         preview_width: 60,
         collapsed: HashSet::new(),
+        pick: 0,
         theme_request: None,
         mode: Mode::Normal,
         input: String::new(),
@@ -858,7 +908,7 @@ fn input_prompt(input: &str, cursor: usize) -> String {
         .nth(cursor)
         .map(|(i, _)| i)
         .unwrap_or(input.len());
-    format!("{}▏{}", &input[..index], &input[index..])
+    format!("{}█{}", &input[..index], &input[index..])
 }
 fn edit_input(input: &mut String, cursor: &mut usize, key: KeyEvent) {
     let mut chars = input.chars().collect::<Vec<_>>();
@@ -1001,7 +1051,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Paragraph::new(Line::from(vec![
             Span::styled(" ◉ ", Style::default().fg(accent)),
             Span::styled(
-                "TICKTICK",
+                "TickTick TUI",
                 Style::default().fg(preview::color(&t.heading)).bold(),
             ),
         ])),
@@ -1029,7 +1079,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             } else if app.busy {
                 "◌ Sincronizando"
             } else {
-                "● TickTick"
+                "● Sincronizado"
             },
             Style::default().fg(if app.busy {
                 accent
@@ -1300,14 +1350,8 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 if names.is_empty() { "nenhuma lista".into() } else { names.join(" · ") }
             )
         }
-        Mode::Due => format!(
-            " PRAZO  {}   hoje · amanhã · +3 · 25/12 14:30 · vazio remove",
-            input_prompt(&app.input, app.input_cursor)
-        ),
-        Mode::Remind => format!(
-            " LEMBRETE  {}   antes do prazo: 0, 15m, 1h, 1d · vazio remove",
-            input_prompt(&app.input, app.input_cursor)
-        ),
+        Mode::Due => " PRAZO  j/k escolher · Enter salvar · Tab completar · Esc cancelar".into(),
+        Mode::Remind => " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into(),
         Mode::Delete => {
             " EXCLUIR  Confirmar exclusão permanente? y / qualquer tecla cancela".into()
         }
@@ -1323,12 +1367,81 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Paragraph::new(prompt).style(Style::default().bg(selection).fg(accent)),
         rows[3],
     );
+    if matches!(app.mode, Mode::Due | Mode::Remind) {
+        let due = app.mode == Mode::Due;
+        let chosen = app.input.split(',').map(str::trim).collect::<Vec<_>>();
+        let mut lines = app
+            .options()
+            .iter()
+            .enumerate()
+            .map(|(i, (label, value))| {
+                let mark = match (due, chosen.contains(value)) {
+                    (true, _) => "",
+                    (false, true) => "☑ ",
+                    (false, false) => "☐ ",
+                };
+                let style = if i == app.pick {
+                    Style::default().bg(selection).fg(accent)
+                } else {
+                    Style::default()
+                };
+                Line::styled(format!(" {mark}{label:<width$}", width = 36), style)
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled(
+                if due { " Outra data: " } else { " Selecionados: " },
+                Style::default().fg(muted),
+            ),
+            Span::raw(input_prompt(&app.input, app.input_cursor)),
+        ]));
+        lines.push(Line::styled(
+            if due {
+                " ex.: 25/12 · sex 14:30 · +3 · amanhã 09:00"
+            } else {
+                " ou digite: 2h, 3d"
+            },
+            Style::default().fg(muted),
+        ));
+        let current = app.target.as_ref().and_then(|t| {
+            let all_day = t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+            t.due_date.as_deref().map(|d| fields::format_due(d, all_day, app.tz()))
+        });
+        let title = match (due, current) {
+            (true, Some(c)) => format!(" Prazo · atual {c} "),
+            (true, None) => " Prazo ".into(),
+            (false, _) => " Lembretes ".into(),
+        };
+        let area = centered(f.area(), 44, lines.len() as u16 + 4);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(panel).fg(fg))
+                .block(block(title, true).padding(Padding::new(1, 1, 1, 0))),
+            area,
+        );
+    }
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 29);
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
 }
+const DUE: [(&str, &str); 4] = [
+    ("Hoje", "hoje"),
+    ("Amanhã", "amanhã"),
+    ("Próxima semana", "+7"),
+    ("Sem prazo", ""),
+];
+const REMIND: [(&str, &str); 6] = [
+    ("No horário", "0"),
+    ("5 min antes", "5m"),
+    ("15 min antes", "15m"),
+    ("30 min antes", "30m"),
+    ("1 hora antes", "1h"),
+    ("1 dia antes", "1d"),
+];
 fn truncate(text: &str, width: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if text.width() <= width {
@@ -1386,6 +1499,7 @@ mod tests {
             preview_cursor: 0,
             preview_width: 60,
             collapsed: HashSet::new(),
+            pick: 0,
             theme_request: None,
             mode: Mode::Normal,
             input: String::new(),

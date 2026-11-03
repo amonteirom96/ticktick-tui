@@ -3,9 +3,10 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Naiv
 use chrono_tz::Tz;
 use serde_json::{Map, Value, json};
 
+const WEEKDAYS: [&str; 7] = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"];
 const API_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%z";
 
-/// Parses `hoje`, `amanhã`, `+3`, `25/12`, `25/12/2026` or `2026-12-25`, optionally followed by `HH:MM`.
+/// Parses `hoje`, `amanhã`, `+3`, `sex` (next one), `25/12`, `25/12/2026` or `2026-12-25`, optionally followed by `HH:MM`.
 fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTime>), String> {
     let mut parts = input.split_whitespace();
     let day = parts.next().unwrap_or_default().to_lowercase();
@@ -17,6 +18,11 @@ fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTi
         "hoje" => Some(today),
         "amanhã" | "amanha" => Some(today + Duration::days(1)),
         d if d.starts_with('+') => d[1..].parse().ok().map(|n| today + Duration::days(n)),
+        d if WEEKDAYS.contains(&d) => {
+            let target = WEEKDAYS.iter().position(|w| *w == d).unwrap() as i64;
+            let ahead = (target - today.weekday().num_days_from_monday() as i64 - 1).rem_euclid(7) + 1;
+            Some(today + Duration::days(ahead))
+        }
         d => NaiveDate::parse_from_str(d, "%Y-%m-%d")
             .or_else(|_| NaiveDate::parse_from_str(d, "%d/%m/%Y"))
             .or_else(|_| NaiveDate::parse_from_str(&format!("{d}/{}", today.format("%Y")), "%d/%m/%Y"))
@@ -80,9 +86,7 @@ pub fn relative_due(due: &str, all_day: bool, tz: Option<Tz>, today: NaiveDate) 
     let day = match days {
         0 => "hoje".to_owned(),
         1 => "amanhã".to_owned(),
-        2..=6 => ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
-            [local.date().weekday().num_days_from_monday() as usize]
-            .to_owned(),
+        2..=6 => WEEKDAYS[local.date().weekday().num_days_from_monday() as usize].to_owned(),
         _ if local.year() == today.year() => local.format("%d/%m").to_string(),
         _ => local.format("%d/%m/%y").to_string(),
     };
@@ -159,6 +163,9 @@ mod tests {
         assert_eq!(due_fields("+2", today(), tz).unwrap()["dueDate"], "2026-11-05T03:00:00+0000");
         assert_eq!(due_fields("2027-01-10", today(), tz).unwrap()["dueDate"], "2027-01-10T03:00:00+0000");
         assert!(due_fields("", today(), tz).unwrap()["dueDate"].is_null());
+        // today is a Tuesday: "sex" is this Friday, "ter" is next week's.
+        assert_eq!(due_fields("sex 14:30", today(), tz).unwrap()["dueDate"], "2026-11-06T17:30:00+0000");
+        assert_eq!(due_fields("ter", today(), tz).unwrap()["dueDate"], "2026-11-10T03:00:00+0000");
         assert!(due_fields("ontem", today(), tz).is_err());
         assert!(due_fields("hoje 25:00", today(), tz).is_err());
     }

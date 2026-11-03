@@ -59,8 +59,8 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `dd` | Excluir, com confirmação `y` |
 | `p` | Alternar prioridade: nenhuma → baixa → média → alta |
 | `m` | Mover tarefa para outra lista (digite parte do nome) |
-| `D` | Prazo: `hoje`, `amanhã 14:30`, `+3`, `25/12`, `2026-12-25`; vazio remove |
-| `R` | Lembretes antes do prazo: `0, 15m, 1h, 1d`; vazio remove |
+| `D` | Prazo: escolha Hoje / Amanhã / Próxima semana / Sem prazo, ou digite `sex 14:30`, `+3`, `25/12` |
+| `R` | Lembretes: `Space` marca as opções, ou digite `2h`, `3d` |
 | `za` / `zo` / `zc` | Recolher / expandir pasta (em Listas) ou subtarefas |
 | `/` | Filtrar títulos; Enter aplica |
 | `Esc` | Cancelar entrada ou limpar filtro |
