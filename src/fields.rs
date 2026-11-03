@@ -103,7 +103,7 @@ pub fn parse_reminders(input: &str) -> Result<Vec<String>, String> {
             if s == "0" {
                 return Ok("TRIGGER:PT0S".into());
             }
-            let unit = |suffix, fmt: fn(u32) -> String| {
+            let unit = |suffix: char, fmt: fn(u32) -> String| {
                 s.strip_suffix(suffix).and_then(|n| n.parse().ok()).map(fmt)
             };
             unit('m', |n| format!("TRIGGER:-PT{n}M"))

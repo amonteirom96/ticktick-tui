@@ -84,8 +84,8 @@ pub fn load() -> Result<Config> {
     } else {
         String::new()
     };
-    let table: toml::Table = text.parse().context("Invalid config.toml")?;
-    let mut c: Config = table.clone().try_into().context("Invalid config.toml")?;
+    let table: toml::Table = toml::from_str(&text).context("Invalid config.toml")?;
+    let mut c: Config = toml::from_str(&text).context("Invalid config.toml")?;
     if let Some(file) = &c.theme_file {
         c.theme = read_theme(&config_dir().join(file))?;
     } else if !table.contains_key("theme") && terminal_light::luma().is_ok_and(|l| l > 0.6) {
