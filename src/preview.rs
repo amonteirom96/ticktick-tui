@@ -349,23 +349,28 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
         .find(|p| p.id == task.project_id)
         .map(|p| p.name.as_str())
         .unwrap_or("");
-    let priority = match task.priority {
-        5 => "Alta",
-        3 => "Média",
-        1 => "Baixa",
-        _ => "Normal",
+    let field = |label: &str, value: String, fg: &str| {
+        Row::text(Line::from(vec![
+            Span::styled(format!("{label:<14}"), Style::default().fg(color(&theme.muted))),
+            Span::styled(value, Style::default().fg(color(fg))),
+        ]))
     };
-    rows.push(Row::text(Span::styled(
-        format!("{project}   ·   {priority}"),
-        Style::default().fg(color(&theme.muted)),
-    )));
+    let (priority, priority_color) = match task.priority {
+        5 => ("● Alta", &theme.danger),
+        3 => ("● Média", &theme.accent),
+        1 => ("● Baixa", &theme.muted),
+        _ => ("Nenhuma", &theme.muted),
+    };
+    rows.push(field("Lista", project.to_owned(), &theme.foreground));
+    rows.push(field("Prioridade", priority.into(), priority_color));
     if let Some(due) = &task.due_date {
         let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
         let tz = data.time_zone.as_ref().and_then(|s| s.parse().ok());
-        rows.push(Row::text(Span::styled(
-            format!("Vencimento   {}", crate::fields::format_due(due, all_day, tz)),
-            Style::default().fg(color(&theme.accent)),
-        )));
+        rows.push(field(
+            "Vencimento",
+            crate::fields::format_due(due, all_day, tz),
+            &theme.accent,
+        ));
     }
     if let Some(reminders) = task
         .extra
@@ -373,36 +378,44 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
         .filter(|r| !r.is_empty())
     {
-        rows.push(Row::text(Span::styled(
-            format!("Lembretes    {}", crate::fields::format_reminders(&reminders)),
-            Style::default().fg(color(&theme.muted)),
-        )));
+        rows.push(field(
+            "Lembretes",
+            crate::fields::format_reminders(&reminders),
+            &theme.foreground,
+        ));
     }
     if let Some(parent) = task
         .parent_id
         .as_ref()
         .and_then(|id| data.tasks.iter().find(|t| &t.id == id))
     {
-        rows.push(Row::text(Span::styled(
-            format!("↳ {}", parent.title),
-            Style::default().fg(color(&theme.muted)),
-        )));
+        rows.push(field("Subtarefa de", parent.title.clone(), &theme.foreground));
     }
+    rows.push(Row::text(""));
+    rows.push(Row::text(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(color(&theme.border)),
+    )));
     rows.push(Row::text(""));
     rows.extend(markdown(&task.content, Field::Content, theme));
     if let Some(desc) = task.desc.as_ref().filter(|s| !s.is_empty()) {
         rows.extend(markdown(desc, Field::Description, theme));
     }
     if !task.items.is_empty() {
-        rows.push(Row::text(""));
-        rows.push(Row::text(Span::styled(
-            format!(
-                "CHECKLIST   {}/{}",
-                task.items.iter().filter(|i| i.status == 1).count(),
-                task.items.len()
+        if rows.last().is_some_and(|r| r.line.width() > 0) {
+            rows.push(Row::text(""));
+        }
+        rows.push(Row::text(Line::from(vec![
+            Span::styled("Checklist  ", Style::default().fg(color(&theme.heading)).bold()),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    task.items.iter().filter(|i| i.status == 1).count(),
+                    task.items.len()
+                ),
+                Style::default().fg(color(&theme.muted)),
             ),
-            Style::default().fg(color(&theme.muted)).bold(),
-        )));
+        ])));
         rows.push(Row::text(""));
         for (i, item) in task.items.iter().enumerate() {
             rows.push(Row {

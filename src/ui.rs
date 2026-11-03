@@ -1207,14 +1207,18 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     }
                     View::Project(_) => "  ",
                 };
+                let selected = i == app.project;
                 let mut lines = vec![Line::from(vec![
+                    Span::styled(if selected { "▎" } else { " " }, Style::default().fg(accent)),
                     Span::styled(
                         format!(" {}{marker}", "  ".repeat(e.depth)),
                         Style::default().fg(if i < 4 { accent } else { muted }),
                     ),
                     Span::raw(e.name.clone()),
                     Span::styled(format!("  {}", e.count), Style::default().fg(muted)),
-                ])];
+                ])
+                .style(if selected { Style::default().bg(selection).fg(accent) } else { Style::default() })];
+                // The "LISTAS" header lives in item 3, so highlight only the first line by hand.
                 if i == 3 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
@@ -1231,10 +1235,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             List::new(projects)
                 .block(
                     block(" 1 · Listas ".into(), app.projects_focus).padding(Padding::vertical(1)),
-                )
-                .highlight_style(Style::default().bg(selection).fg(accent))
-                .highlight_symbol("▎")
-                .repeat_highlight_symbol(true),
+                ),
             cols[0],
             &mut state,
         );
