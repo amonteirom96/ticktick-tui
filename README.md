@@ -73,7 +73,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `?`, `:help` | Ajuda |
 | `q`, `:q`, `Ctrl-c` | Sair |
 
-Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi`. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
+Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. Abaixo da linha `--- checklist ---` ficam os itens do checklist nativo do TickTick: `- [ ] item` ou `- [x] feito`, um por linha. Adicione, renomeie ou apague linhas para editar o checklist. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi`. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
 
 A interface usa modos Normal, Inserção e Comando. Não implementa todo o motor de edição do Vim (macros, registros e operadores de texto); para todos os comandos de edição, use `e` com Vim/Neovim.
 
