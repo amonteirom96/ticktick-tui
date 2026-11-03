@@ -1207,7 +1207,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 }
                 if !task.items.is_empty() {
                     let done = task.items.iter().filter(|i| i.status == 1).count();
-                    badges.push(pill(format!("☑ {done}/{}", task.items.len()), muted));
+                    badges.push(pill(format!("✓ {done}/{}", task.items.len()), muted));
                 }
                 if row.children > 0 && app.collapsed.contains(&task.id) {
                     badges.push(pill(format!("+{}", row.children), muted));
@@ -1377,8 +1377,8 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .map(|(i, (label, value))| {
                 let mark = match (due, chosen.contains(value)) {
                     (true, _) => "",
-                    (false, true) => "☑ ",
-                    (false, false) => "☐ ",
+                    (false, true) => "● ",
+                    (false, false) => "○ ",
                 };
                 let style = if i == app.pick {
                     Style::default().bg(selection).fg(accent)

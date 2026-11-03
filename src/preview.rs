@@ -242,12 +242,10 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                     });
                 }
                 m.spans.push(Span::styled(
-                    if checked { "☑ " } else { "☐ " },
-                    Style::default().fg(color(if checked {
-                        &theme.success
-                    } else {
-                        &theme.accent
-                    })),
+                    if checked { "● " } else { "○ " },
+                    Style::default()
+                        .fg(color(if checked { &theme.success } else { &theme.accent }))
+                        .bold(),
                 ));
             }
             Event::SoftBreak => {
@@ -410,20 +408,18 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize) -> Ve
             rows.push(Row {
                 line: Line::from(vec![
                     Span::styled(
-                        if item.status == 1 { "☑  " } else { "☐  " },
-                        Style::default().fg(color(if item.status == 1 {
-                            &theme.success
-                        } else {
-                            &theme.accent
-                        })),
+                        if item.status == 1 { "● " } else { "○ " },
+                        Style::default()
+                            .fg(color(if item.status == 1 { &theme.success } else { &theme.accent }))
+                            .bold(),
                     ),
                     Span::styled(
                         item.title.clone(),
-                        Style::default().fg(color(if item.status == 1 {
-                            &theme.muted
+                        if item.status == 1 {
+                            Style::default().fg(color(&theme.muted)).crossed_out()
                         } else {
-                            &theme.foreground
-                        })),
+                            Style::default().fg(color(&theme.foreground))
+                        },
                     ),
                 ]),
                 action: Some(Action::Checklist(i)),
