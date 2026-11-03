@@ -119,7 +119,7 @@ pub fn format_reminders(reminders: &[String]) -> String {
         .iter()
         .map(|r| {
             let short = r.strip_prefix("TRIGGER:").unwrap_or(r);
-            let before = |prefix: &str, unit| {
+            let before = |prefix: &str, unit: &str| {
                 short
                     .strip_prefix(prefix)?
                     .strip_suffix(unit)?
