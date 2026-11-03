@@ -1720,26 +1720,12 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 f.area().width.saturating_sub(4) as usize
             )
         ),
-        Mode::Add => format!(
-            " INSERIR  Nova tarefa: {}",
-            input_prompt(&app.input, app.input_cursor)
-        ),
-        Mode::Subtask => format!(
-            " INSERIR  Subtarefa: {}",
-            input_prompt(&app.input, app.input_cursor)
-        ),
-        Mode::Item => format!(
-            " CHECKLIST  Novo item: {}   Enter adiciona outro · colar várias linhas · Esc termina",
-            input_prompt(&app.input, app.input_cursor)
-        ),
-        Mode::ItemRename => format!(
-            " CHECKLIST  Item: {}",
-            input_prompt(&app.input, app.input_cursor)
-        ),
-        Mode::Rename => format!(
-            " INSERIR  Título: {}",
-            input_prompt(&app.input, app.input_cursor)
-        ),
+        Mode::Add | Mode::Subtask | Mode::Rename | Mode::ItemRename => {
+            " INSERIR  Enter salvar · Esc cancelar".into()
+        }
+        Mode::Item => {
+            " CHECKLIST  Enter adiciona outro · colar várias linhas · Esc termina".into()
+        }
         Mode::Move => {
             let names = app
                 .lists(&app.input)
@@ -1823,6 +1809,30 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             Paragraph::new(lines)
                 .style(Style::default().bg(panel).fg(fg))
                 .block(block(title, true).padding(Padding::new(1, 1, 1, 0))),
+            area,
+        );
+    }
+    let title = match app.mode {
+        Mode::Add => Some(" Nova tarefa "),
+        Mode::Subtask => Some(" Subtarefa "),
+        Mode::Item => Some(" Novo item "),
+        Mode::ItemRename => Some(" Item "),
+        Mode::Rename => Some(" Título "),
+        _ => None,
+    };
+    if let Some(title) = title {
+        use unicode_width::UnicodeWidthStr;
+        let text = input_prompt(&app.input, app.input_cursor);
+        let width = f.area().width.saturating_sub(4).min(72);
+        let inner = width.saturating_sub(4).max(1) as usize;
+        let lines = text.lines().map(|l| l.width() / inner + 1).sum::<usize>().max(1) as u16;
+        let area = centered(f.area(), width, lines + 3);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().bg(panel).fg(fg))
+                .wrap(Wrap { trim: false })
+                .block(block(title.into(), true).padding(Padding::horizontal(1))),
             area,
         );
     }
