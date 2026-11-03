@@ -38,6 +38,7 @@ enum Mode {
     Delete,
     Help,
     Token,
+    Visual,
 }
 struct App {
     data: Snapshot,
@@ -46,6 +47,8 @@ struct App {
     in_flight: usize,
     project: usize,
     selected: usize,
+    /// Fixed end of the visual selection; `selected` is the moving end.
+    anchor: usize,
     projects_focus: bool,
     preview_focus: bool,
     preview_cursor: usize,
@@ -147,15 +150,70 @@ impl App {
         self.selected = self.visible().iter().position(|t| t.id == id).unwrap_or(0);
         self.preview_cursor = 0;
     }
-    fn tree(&self) -> Vec<tree::Row<'_>> {
+    /// Tasks of the current view in TickTick's manual order.
+    fn view_tasks(&self) -> Vec<&Task> {
         let view = self.view();
-        let tasks = self
+        let mut tasks = self
             .data
             .tasks
             .iter()
             .filter(|t| sidebar::matches(&view, t, &self.data))
             .collect::<Vec<_>>();
-        tree::rows(&tasks, &self.collapsed, &self.query)
+        tasks.sort_by_key(|t| t.sort_order);
+        tasks
+    }
+    fn tree(&self) -> Vec<tree::Row<'_>> {
+        tree::rows(&self.view_tasks(), &self.collapsed, &self.query)
+    }
+    /// Visual selection as an inclusive row range.
+    fn range(&self) -> (usize, usize) {
+        let last = self.visible().len().saturating_sub(1);
+        (self.anchor.min(self.selected).min(last), self.anchor.max(self.selected).min(last))
+    }
+    /// Moves the selected siblings `delta` places, reusing the siblings' own sortOrder values.
+    fn shift(&mut self, delta: isize) {
+        let (lo, hi) = self.range();
+        let rows = self.tree();
+        let Some(depth) = rows.get(lo..=hi).and_then(|r| r.iter().map(|r| r.depth).min()) else {
+            return;
+        };
+        // Shallowest rows of a contiguous range are siblings; their subtasks follow them.
+        let block = rows[lo..=hi]
+            .iter()
+            .filter(|r| r.depth == depth)
+            .map(|r| r.task.clone())
+            .collect::<Vec<_>>();
+        drop(rows);
+        let mut siblings = self
+            .view_tasks()
+            .into_iter()
+            .filter(|t| t.parent_id == block[0].parent_id && t.project_id == block[0].project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let start = siblings.iter().position(|t| t.id == block[0].id).unwrap_or(0);
+        if siblings[start..].iter().take(block.len()).map(|t| &t.id).ne(block.iter().map(|t| &t.id)) {
+            self.message = "Selecione tarefas da mesma lista para mover.".into();
+            return;
+        }
+        let mut orders = siblings.iter().map(|t| t.sort_order).collect::<Vec<_>>();
+        for i in 1..orders.len() {
+            orders[i] = orders[i].max(orders[i - 1].saturating_add(1));
+        }
+        let moved = siblings.drain(start..start + block.len()).collect::<Vec<_>>();
+        let at = start.saturating_add_signed(delta).min(siblings.len());
+        siblings.splice(at..at, moved);
+        for (mut t, order) in siblings.into_iter().zip(orders) {
+            if t.sort_order != order {
+                t.sort_order = order;
+                self.update(t);
+            }
+        }
+        let visible = self.visible();
+        let pos = |id: &str| visible.iter().position(|t| t.id == id);
+        if let (Some(first), Some(last)) = (pos(&block[0].id), pos(&block[block.len() - 1].id)) {
+            (self.anchor, self.selected) =
+                if self.selected >= self.anchor { (first, last) } else { (last, first) };
+        }
     }
     fn visible(&self) -> Vec<&Task> {
         self.tree().into_iter().map(|r| r.task).collect()
@@ -544,7 +602,15 @@ impl App {
                 _ => (),
             }
         }
-        if self.mode != Mode::Normal {
+        if self.mode == Mode::Visual
+            && !matches!(
+                key.code,
+                K::Char('v' | 'j' | 'k' | 'J' | 'K' | 'g' | 'G' | '0'..='9') | K::Up | K::Down | K::Esc
+            )
+        {
+            return false;
+        }
+        if !matches!(self.mode, Mode::Normal | Mode::Visual) {
             match key.code {
                 K::Esc => {
                     if self.mode == Mode::Search {
@@ -579,6 +645,9 @@ impl App {
         let pending = self.pending;
         self.pending = '\0';
         match key.code {
+            K::Char('v') | K::Esc if self.mode == Mode::Visual => self.mode = Mode::Normal,
+            K::Char('J') if self.mode == Mode::Visual => self.shift(n as isize),
+            K::Char('K') if self.mode == Mode::Visual => self.shift(-(n as isize)),
             K::Char('q') => return true,
             K::Char('j') | K::Down => self.movement(n as isize),
             K::Char('k') | K::Up => self.movement(-(n as isize)),
@@ -697,7 +766,11 @@ impl App {
             K::Char('<') => self.split = self.split.saturating_sub(5).max(15),
             K::Char('>') => self.split = (self.split + 5).min(70),
             K::Enter => self.focus(2),
-            K::Char('v') => {
+            K::Char('v') if !self.projects_focus && !self.preview_focus && self.task().is_some() => {
+                self.mode = Mode::Visual;
+                self.anchor = self.selected;
+            }
+            K::Char('p') if pending == 'z' => {
                 self.details = !self.details;
                 if !self.details {
                     self.focus(1);
@@ -769,6 +842,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         data,
         project: 0,
         selected: 0,
+        anchor: 0,
         projects_focus: false,
         preview_focus: false,
         preview_cursor: 0,
@@ -1244,9 +1318,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         let danger = preview::color(&t.danger);
         // Borders, padding and the highlight symbol take 5 columns.
         let row_width = cols[1].width.saturating_sub(5) as usize;
+        let visual = (app.mode == Mode::Visual).then(|| app.range());
         let items = tree
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(i, row)| {
                 let task = row.task;
                 // Cap visual indentation to available space, never the actual tree depth.
                 let indent =
@@ -1303,7 +1379,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     Span::raw(" ".repeat(pad)),
                 ];
                 line.extend(badges);
-                ListItem::new(Line::from(line))
+                let item = ListItem::new(Line::from(line));
+                match visual {
+                    Some((lo, hi)) if (lo..=hi).contains(&i) => item.style(Style::default().bg(selection)),
+                    _ => item,
+                }
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(if tree.is_empty() {
@@ -1428,6 +1508,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 if names.is_empty() { "nenhuma lista".into() } else { names.join(" · ") }
             )
         }
+        Mode::Visual => " VISUAL  j/k estender · J/K mover · v/Esc sair".into(),
         Mode::Due => " PRAZO  j/k escolher · Enter salvar · Tab completar · Esc cancelar".into(),
         Mode::Remind => " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into(),
         Mode::Delete => {
@@ -1503,7 +1584,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 31);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nv              Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / cc / dd    Novo item / renomear / apagar item do checklist\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k          Navegar e rolar o Markdown formatado\n] / [          Próximo / anterior checkbox ou subtarefa\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / cc / dd    Novo item / renomear / apagar item do checklist\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
 }
 const DUE: [(&str, &str); 4] = [
@@ -1572,6 +1653,7 @@ mod tests {
             },
             project: 0,
             selected: 0,
+            anchor: 0,
             projects_focus: false,
             preview_focus: false,
             preview_cursor: 0,
@@ -1622,6 +1704,29 @@ mod tests {
         press(&mut a, 'l');
         press(&mut a, 'k');
         assert_eq!(a.selected, 0);
+    }
+    #[test]
+    fn visual_mode_moves_sibling_block_with_subtasks() {
+        let mut a = app();
+        for (i, t) in a.data.tasks.iter_mut().enumerate() {
+            t.sort_order = i as i64;
+        }
+        a.data.tasks[5].parent_id = Some("4".into());
+        a.confirmed = a.data.clone();
+        let ids = |a: &App| a.visible().iter().take(8).map(|t| t.id.clone()).collect::<Vec<_>>();
+        a.selected = 3;
+        press(&mut a, 'v');
+        press(&mut a, 'j');
+        press(&mut a, 'K');
+        assert_eq!(ids(&a), ["0", "1", "3", "4", "5", "2", "6", "7"]);
+        assert_eq!((a.anchor, a.selected), (2, 3));
+        press(&mut a, '2');
+        press(&mut a, 'J');
+        assert_eq!(ids(&a), ["0", "1", "2", "6", "3", "4", "5", "7"]);
+        press(&mut a, 'v');
+        assert!(a.mode == Mode::Normal);
+        press(&mut a, 'J');
+        assert_eq!(ids(&a)[4], "3");
     }
     #[test]
     fn delete_requires_confirmation_and_escape_cancels_input() {

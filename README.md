@@ -54,6 +54,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `Ctrl-d` / `Ctrl-u` | Descer / subir 10 itens |
 | `a`, `i`, `o` | Criar tarefa na lista selecionada |
 | `cc` | Renomear tarefa |
+| `v` + `j`/`k`, `J` / `K` | Selecionar e mover tarefas na lista, com contagem (`3J`); `v`/`Esc` sai. Ordem manual (`sortOrder`) do TickTick; subtarefas acompanham o pai |
 | `e` | Editar título e conteúdo no editor |
 | `x`, `Space` | Concluir tarefa |
 | `dd` | Excluir, com confirmação `y` |
@@ -66,6 +67,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `/` | Filtrar títulos; Enter aplica |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
+| `zp` | Mostrar / ocultar preview |
 | `f` | Zoom: preview em tela cheia (`f`/`Esc` volta) |
 | `<` / `>` | Estreitar / alargar a coluna de tarefas |
 | `b` | Ocultar / mostrar a coluna de listas (`h` reabre) |

@@ -56,6 +56,8 @@ pub struct Task {
     pub status: i32,
     #[serde(default)]
     pub due_date: Option<String>,
+    #[serde(default)]
+    pub sort_order: i64,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
