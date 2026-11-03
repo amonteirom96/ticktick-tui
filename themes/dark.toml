@@ -1,0 +1,14 @@
+# Onemono dark · matches Ghostty, Neovim and lazygit
+[theme]
+background = "#1b2029"
+panel = "#232833"
+foreground = "#c5cdd9"
+muted = "#9299a5"
+border = "#42485a"
+heading = "#e4e9f0"
+accent = "#6cb6eb"
+selection = "#353b4a"
+danger = "#f5898e"
+success = "#a0c980"
+code = "#5dbbc1"
+code_background = "#2b313e"
