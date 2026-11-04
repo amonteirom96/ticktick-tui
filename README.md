@@ -97,7 +97,6 @@ Sem `[theme]` nem `theme_file` no `config.toml`, o tema segue o fundo do termina
 
 ```toml
 sync_seconds = 60
-sounds = true  # false desativa todos os sons
 
 [theme]
 background = "#161b22"
@@ -157,3 +156,18 @@ Logo abaixo do relatório, **Hábitos** consulta `/habit` e mostra os nomes e me
 Hábitos mostra apenas os programados para hoje, seguindo a `repeatRule` do TickTick (dias da semana em `BYDAY`, ou `INTERVAL` diário a partir da data de início); hábitos arquivados ou que ainda não começaram ficam ocultos. `Space` ou `x` conclui o hábito selecionado; num hábito já concluído, desmarca (envia o check-in do dia com valor 0).
 
 Na coluna central de Pomodoro e Stopwatch, `Space` ou `Enter` inicia/pausa o timer; `s` zera; `j`/`k` rola. `t` escolhe a atividade (busca entre as tarefas abertas, com as de hoje/atrasadas primeiro; a primeira opção é “Foco livre”). `c` define os tempos de foco, pausa e pausa longa em minutos (ex.: `50 10 20`; padrão `25 5 15`). Ao fim de um foco, `Space` inicia a pausa, e ao fim da pausa volta ao foco; a cada 4 focos concluídos a pausa é longa. `n` pula para a próxima fase. Há um timer local por vez. O estado (fase, tempos e atividade) é salvo em `focus-timer.json` junto ao cache e continua ao fechar e reabrir o TUI; o modo demo não persiste o timer. Não há alarme com o aplicativo fechado. Estes timers não iniciam foco nos outros dispositivos e não enviam sessões ao histórico do TickTick.
+
+## Timer na barra do tmux
+
+O tmux apenas exibe o timer local controlado pelo TUI. Não requer plugin, token ou rede:
+
+```tmux
+set -g status-interval 1
+set -ag status-right ' #(ticktick-tui focus status --format tmux 2>/dev/null)'
+```
+
+Recarregue com `tmux source-file ~/.tmux.conf`. O executável precisa estar no PATH do servidor tmux; se necessário, use seu caminho absoluto. Coloque a configuração após o tema se ele sobrescrever `status-right`. Remova plugins de Pomodoro independentes para evitar dois timers.
+
+Inicie ou pause pela tela Pomodoro/Stopwatch do TUI. A barra mostra apenas o tempo, sem ícones, na mesma cor do timer do TUI: destaque no foco e sucesso no intervalo ou na conclusão. O tema resolvido pelo TUI é salvo localmente ao abrir e ao trocar de tema; até a primeira abertura, a integração usa as cores padrão. Sem sessão ativa, a saída é vazia. O tempo continua com o TUI fechado e durante a suspensão do computador. Uma fase concluída aguarda ação no TUI, sem iniciar outra automaticamente. Demo não altera o timer compartilhado. Não há daemon nem lógica de timer no tmux: o comando calcula a apresentação usando o mesmo motor e estado persistido do TUI.
+
+Outras integrações podem usar `ticktick-tui focus status --json` (ou `--format json`). O objeto versão 1 contém `state` (`idle`, `running`, `paused`, `completed`), `mode`, `phase`, `elapsed_seconds`, `remaining_seconds`, `duration_seconds`, `cycle` e `task` (`null` ou `{id,title}`). Cronômetros têm duração e tempo restante `null`. Arquivo ausente representa estado inativo; erros de leitura ou JSON inválido retornam código diferente de zero. A consulta é somente leitura e não acessa credenciais. O timer continua local e não inicia sessões nos aplicativos oficiais do TickTick.

@@ -1615,6 +1615,7 @@ impl Drop for Restore {
     }
 }
 pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
+    if !demo { crate::wellness::Timer::save_status_theme(&config.theme)?; }
     enable_raw_mode()?;
     let _restore = Restore;
     execute!(
@@ -1805,6 +1806,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         if let Some(name) = app.theme_request.take() {
             match config::named_theme(&name) {
                 Ok(t) => {
+                    if !demo { crate::wellness::Timer::save_status_theme(&t)?; }
                     config.theme = t;
                     app.message = format!("Tema: {name}");
                 }

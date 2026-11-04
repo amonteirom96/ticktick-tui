@@ -491,3 +491,5 @@ mod tests {
         assert!(habit_due(&json!({"repeatRule":"RRULE:FREQ=WEEKLY;TT_TIMES=3"}), wednesday));
     }
 }
+
+mod status;
