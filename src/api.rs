@@ -61,6 +61,42 @@ pub struct Task {
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
+impl Task {
+    pub fn is_note(&self) -> bool {
+        self.extra.get("kind").and_then(Value::as_str) == Some("NOTE")
+    }
+
+    pub fn marker(&self) -> &'static str {
+        if self.is_note() { "≡" } else { "○" }
+    }
+}
+
+impl Snapshot {
+    /// Resolve ancestors across active tasks and completed history, tolerating cycles.
+    pub fn ancestry(&self, task: &Task) -> String {
+        let mut seen = std::collections::HashSet::from([task.id.as_str()]);
+        let mut next = task.parent_id.as_deref();
+        let mut titles = Vec::new();
+        while let Some(id) = next.filter(|id| !id.is_empty()) {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some(parent) = self
+                .tasks
+                .iter()
+                .chain(self.completed.iter())
+                .find(|t| t.id == id)
+            else {
+                break;
+            };
+            titles.push(parent.title.replace(['\n', '\r'], " "));
+            next = parent.parent_id.as_deref();
+        }
+        titles.reverse();
+        titles.join(" › ")
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
@@ -473,6 +509,9 @@ impl Api {
         Ok(())
     }
     pub fn complete(&self, task: &Task) -> Result<()> {
+        if task.is_note() {
+            bail!("Anotações não podem ser concluídas");
+        }
         self.request(
             Method::POST,
             &format!("/project/{}/task/{}/complete", task.project_id, task.id),
@@ -493,6 +532,34 @@ impl Api {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ancestry_resolves_active_and_completed_parents_and_cycles() {
+        let mut data = Snapshot::default();
+        let root = Task {
+            id: "root".into(),
+            title: "FEAT - Buser Voos".into(),
+            ..Default::default()
+        };
+        let parent = Task {
+            id: "parent".into(),
+            title: "Tela de viagem".into(),
+            parent_id: Some("root".into()),
+            ..Default::default()
+        };
+        let child = Task {
+            id: "child".into(),
+            parent_id: Some("parent".into()),
+            ..Default::default()
+        };
+        data.tasks.push(root);
+        data.completed.push(parent);
+        assert_eq!(data.ancestry(&child), "FEAT - Buser Voos › Tela de viagem");
+        data.tasks[0].parent_id = Some("parent".into());
+        assert_eq!(data.ancestry(&child), "FEAT - Buser Voos › Tela de viagem");
+        data.completed.clear();
+        assert!(data.ancestry(&child).is_empty());
+    }
+
     #[test]
     fn task_roundtrip_preserves_checklists_and_recurrence() {
         let v = json!({"id":"t","projectId":"p","title":"Title","items":[{"id":"s","title":"Step","status":0}],"repeatFlag":"RRULE:FREQ=DAILY","timeZone":"America/Recife"});

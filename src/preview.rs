@@ -515,16 +515,19 @@ pub fn document(
             &theme.foreground,
         ));
     }
-    if let Some(parent) = task
-        .parent_id
-        .as_ref()
-        .and_then(|id| data.tasks.iter().find(|t| &t.id == id))
-    {
-        rows.push(field(
-            "Subtarefa de",
-            parent.title.clone(),
-            &theme.foreground,
-        ));
+    rows.push(field(
+        "Tipo",
+        if task.is_note() {
+            "Anotação"
+        } else {
+            "Atividade"
+        }
+        .into(),
+        &theme.foreground,
+    ));
+    let context = data.ancestry(task);
+    if !context.is_empty() {
+        rows.push(field("Subtarefa de", context, &theme.foreground));
     }
     rows.push(Row::text(""));
     rows.push(Row::text(Span::styled(
@@ -614,7 +617,10 @@ pub fn document(
         for t in children {
             rows.push(Row {
                 line: Line::from(vec![
-                    Span::styled("○ ", Style::default().fg(color(&theme.accent)).bold()),
+                    Span::styled(
+                        format!("{} ", t.marker()),
+                        Style::default().fg(color(&theme.accent)).bold(),
+                    ),
                     Span::raw(t.title.clone()),
                 ]),
                 action: Some(Action::Subtask(t.id.clone())),

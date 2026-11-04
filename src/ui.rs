@@ -725,11 +725,12 @@ impl App {
             .completed
             .iter()
             .filter(|t| {
-                t.extra
-                    .get("completedTime")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|v| sidebar::date(v, &Task::default(), &self.data))
-                    == Some(self.report_day)
+                !t.is_note()
+                    && t.extra
+                        .get("completedTime")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| sidebar::date(v, &Task::default(), &self.data))
+                        == Some(self.report_day)
             })
             .collect::<Vec<_>>();
         tasks.sort_by_key(|t| {
@@ -738,7 +739,35 @@ impl App {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
         });
-        tasks
+        // Preserve completion order between families; keep siblings together.
+        let mut families = std::collections::HashMap::new();
+        let mut family_order = std::collections::HashMap::new();
+        for task in &tasks {
+            let mut family = *task;
+            let mut seen = HashSet::from([task.id.as_str()]);
+            while let Some(parent) = family.parent_id.as_deref().and_then(|id| {
+                self.data
+                    .tasks
+                    .iter()
+                    .chain(self.data.completed.iter())
+                    .find(|t| t.id == id)
+            }) {
+                if !seen.insert(parent.id.as_str()) {
+                    break;
+                }
+                family = parent;
+            }
+            let family = family.id.clone();
+            let key = (task.project_id.clone(), family);
+            let next = families.len();
+            let rank = *families.entry(key).or_insert(next);
+            family_order.insert(task.id.as_str(), rank);
+        }
+        tasks.sort_by_key(|task| family_order[task.id.as_str()]);
+        tree::rows(&tasks, &HashSet::new(), "")
+            .into_iter()
+            .map(|row| row.task)
+            .collect()
     }
     fn task(&self) -> Option<Task> {
         if self.view() == View::Report {
@@ -791,13 +820,19 @@ impl App {
         }
     }
     fn send(&mut self, job: Job) {
+        if matches!(&job, Job::Complete(t) if t.is_note()) {
+            self.message = "Anotação · use e para editar; anotações não são concluídas".into();
+            return;
+        }
         if matches!(self.view(), View::Report | View::Habits | View::Focus)
             && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
         {
             self.message = "Relatório · visualização das atividades concluídas".into();
             return;
         }
-        if matches!(job, Job::Complete(_)) || matches!(job, Job::CheckHabit { value, .. } if value > 0.0) {
+        if matches!(job, Job::Complete(_))
+            || matches!(job, Job::CheckHabit { value, .. } if value > 0.0)
+        {
             self.play(include_bytes!("../assets/check.wav"), 0.7);
         }
         if self.demo {
@@ -1618,7 +1653,9 @@ impl Drop for Restore {
     }
 }
 pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
-    if !demo { crate::wellness::Timer::save_status_theme(&config.theme)?; }
+    if !demo {
+        crate::wellness::Timer::save_status_theme(&config.theme)?;
+    }
     enable_raw_mode()?;
     let _restore = Restore;
     execute!(
@@ -1693,20 +1730,23 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         quitting: false,
         demo,
         // Opened once so each sound plays without startup latency.
-        audio: config.sounds.then(|| {
-            rodio::DeviceSinkBuilder::from_default_device()
-                .and_then(|b| {
-                    // rodio's 2048-frame default is rejected by macOS (max 1024).
-                    b.with_buffer_size(rodio::cpal::BufferSize::Default)
-                        .with_error_callback(|_| {})
-                        .open_stream()
-                })
-                .ok()
-                .map(|mut sink| {
-                    sink.log_on_drop(false);
-                    sink
-                })
-        }).flatten(),
+        audio: config
+            .sounds
+            .then(|| {
+                rodio::DeviceSinkBuilder::from_default_device()
+                    .and_then(|b| {
+                        // rodio's 2048-frame default is rejected by macOS (max 1024).
+                        b.with_buffer_size(rodio::cpal::BufferSize::Default)
+                            .with_error_callback(|_| {})
+                            .open_stream()
+                    })
+                    .ok()
+                    .map(|mut sink| {
+                        sink.log_on_drop(false);
+                        sink
+                    })
+            })
+            .flatten(),
         pending: '\0',
         count: String::new(),
         details: true,
@@ -1810,7 +1850,9 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         if let Some(name) = app.theme_request.take() {
             match config::named_theme(&name) {
                 Ok(t) => {
-                    if !demo { crate::wellness::Timer::save_status_theme(&t)?; }
+                    if !demo {
+                        crate::wellness::Timer::save_status_theme(&t)?;
+                    }
                     config.theme = t;
                     app.message = format!("Tema: {name}");
                 }
@@ -2279,22 +2321,42 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
     let inner = list_block.inner(columns[0]);
     let project_width = if inner.width >= 50 { 16 } else { 0 };
     let title_width = inner.width.saturating_sub(project_width + 5) as usize;
-    let rows = tasks.iter().enumerate().map(|(i, t)| {
+    let hierarchy = tree::rows(&tasks, &HashSet::new(), "");
+    let mut previous_context = String::new();
+    let rows = hierarchy.iter().enumerate().map(|(i, row)| {
+        let task = row.task;
+        let context = app.data.ancestry(task);
+        let show_context = row.depth == 0 && !context.is_empty() && context != previous_context;
+        let mut title = Vec::new();
+        if show_context {
+            title.push(Line::styled(
+                truncate(&context, title_width),
+                Style::default().fg(muted),
+            ));
+        }
+        let depth = row.depth + usize::from(row.depth == 0 && !context.is_empty());
+        let indent = "  ".repeat(depth.min(4));
+        let prefix = format!("{indent}✓ ");
+        title.push(Line::from(vec![
+            Span::styled(prefix.clone(), Style::default().fg(success)),
+            Span::raw(truncate(
+                &task.title.replace(['\n', '\r'], " "),
+                title_width.saturating_sub(prefix.width()),
+            )),
+        ]));
+        previous_context = context;
+        let height = title.len() as u16;
         Row::new(vec![
-            Cell::from("✓").style(Style::default().fg(success)),
-            Cell::from(truncate(&t.title.replace(['\n', '\r'], " "), title_width)),
-            Cell::from(truncate(project_name(t), project_width as usize))
+            Cell::from(Text::from(title)),
+            Cell::from(truncate(project_name(task), project_width as usize))
                 .style(Style::default().fg(muted)),
         ])
+        .height(height)
         .style(Style::default().fg(if i == selected { accent } else { fg }))
     });
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(project_width),
-        ],
+        [Constraint::Min(0), Constraint::Length(project_width)],
     )
     .column_spacing(1)
     .block(list_block)
@@ -2497,28 +2559,40 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if !fullscreen {
         let cols = if preview.width > 0 {
             Layout::horizontal([
-                Constraint::Length(if app.hide_lists {
-                    0
-                } else if rows[1].width >= 150 {
-                    25u16
-                } else {
-                    21
-                }
-                .saturating_add_signed(if app.hide_lists { 0 } else { app.lists })),
+                Constraint::Length(
+                    if app.hide_lists {
+                        0
+                    } else if rows[1].width >= 150 {
+                        25u16
+                    } else {
+                        21
+                    }
+                    .saturating_add_signed(if app.hide_lists {
+                        0
+                    } else {
+                        app.lists
+                    }),
+                ),
                 Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
             .split(rows[1])
         } else {
             Layout::horizontal([
-                Constraint::Length(if app.hide_lists {
-                    0
-                } else if rows[1].width < 55 {
-                    17u16
-                } else {
-                    25
-                }
-                .saturating_add_signed(if app.hide_lists { 0 } else { app.lists })),
+                Constraint::Length(
+                    if app.hide_lists {
+                        0
+                    } else if rows[1].width < 55 {
+                        17u16
+                    } else {
+                        25
+                    }
+                    .saturating_add_signed(if app.hide_lists {
+                        0
+                    } else {
+                        app.lists
+                    }),
+                ),
                 Constraint::Min(0),
             ])
             .split(rows[1])
@@ -2602,6 +2676,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         // Borders, padding and the highlight symbol take 5 columns.
         let row_width = cols[1].width.saturating_sub(5) as usize;
         let visual = (app.mode == Mode::Visual).then(|| app.range());
+        let mut previous_context = String::new();
         let items = tree
             .iter()
             .enumerate()
@@ -2657,7 +2732,14 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 {
                     badges.push(pill(label, if overdue { danger } else { accent }));
                 }
-                let left = format!(" {indent}{branch}○ ");
+                let context = app.data.ancestry(task);
+                let show_context =
+                    row.depth == 0 && !context.is_empty() && context != previous_context;
+                let left = if row.depth == 0 && !context.is_empty() {
+                    format!("   {} ", task.marker())
+                } else {
+                    format!(" {indent}{branch}{} ", task.marker())
+                };
                 let right: usize = badges.iter().map(Span::width).sum();
                 let title = truncate(
                     &task.title,
@@ -2670,7 +2752,16 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     Span::raw(" ".repeat(pad)),
                 ];
                 line.extend(badges);
-                let item = ListItem::new(Line::from(line));
+                let mut lines = Vec::new();
+                if show_context {
+                    lines.push(Line::styled(
+                        truncate(&format!(" {indent}{context}"), row_width),
+                        Style::default().fg(muted),
+                    ));
+                }
+                previous_context = context;
+                lines.push(Line::from(line));
+                let item = ListItem::new(lines);
                 match visual {
                     Some((lo, hi)) if (lo..=hi).contains(&i) => {
                         item.style(Style::default().bg(selection))
@@ -3052,6 +3143,47 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn report_groups_siblings_with_parent_first() {
+        let mut a = app();
+        let stamp = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        let make = |id: &str, parent: Option<&str>| Task {
+            id: id.into(),
+            project_id: "p".into(),
+            title: id.into(),
+            parent_id: parent.map(str::to_owned),
+            status: 2,
+            extra: serde_json::from_value(serde_json::json!({"completedTime": stamp})).unwrap(),
+            ..Default::default()
+        };
+        a.data.completed = vec![
+            make("child-a", Some("parent")),
+            make("other", None),
+            make("child-b", Some("parent")),
+            make("parent", None),
+        ];
+        a.report_day = sidebar::today(&a.data);
+        let ids: Vec<_> = a.report_tasks().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["parent", "child-a", "child-b", "other"]);
+    }
+
+    #[test]
+    fn notes_cannot_be_completed_or_queued() {
+        let mut a = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        a.demo = false;
+        a.data.tasks[0]
+            .extra
+            .insert("kind".into(), serde_json::json!("NOTE"));
+        let note = a.data.tasks[0].clone();
+        assert_eq!(note.marker(), "≡");
+        a.send(Job::Complete(note));
+        assert_eq!(a.data.tasks.len(), 20);
+        assert!(a.pending_jobs.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
     fn app() -> App {
         let mut a = App {
             timer: Default::default(),
