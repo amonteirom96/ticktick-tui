@@ -264,7 +264,7 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                 if checked && let Some(done) = m.items.last_mut() {
                     *done = true;
                     m.styles
-                        .push(Style::default().fg(color(&theme.muted)).crossed_out());
+                        .push(Style::default().fg(color(&theme.muted)));
                 }
                 m.spans.push(Span::styled(
                     if checked { "● " } else { "○ " },
@@ -484,7 +484,7 @@ pub fn document(
                     Span::styled(
                         item.title.clone(),
                         if item.status == 1 {
-                            Style::default().fg(color(&theme.muted)).crossed_out()
+                            Style::default().fg(color(&theme.muted))
                         } else {
                             Style::default().fg(color(&theme.foreground))
                         },
