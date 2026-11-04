@@ -150,6 +150,19 @@ fn reflected(data: &Snapshot, job: &Job) -> bool {
         Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => true,
     }
 }
+/// A newer patch of the same field supersedes the older one, so it is never replayed over it.
+fn track(unindexed: &mut Vec<(Job, std::time::Instant)>, job: Job) {
+    if let Job::Patch { id, fields, .. } = &job {
+        for (old, _) in unindexed.iter_mut() {
+            if let Job::Patch { id: o, fields: f, .. } = old
+                && o == id
+            {
+                f.retain(|k, _| !fields.contains_key(k));
+            }
+        }
+    }
+    unindexed.push((job, std::time::Instant::now()));
+}
 fn cache(data: &Snapshot) -> Option<String> {
     serde_json::to_vec(data)
         .map_err(anyhow::Error::from)
@@ -219,9 +232,25 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
         let mut queue = std::collections::VecDeque::new();
         loop {
             queue.extend(rx.try_iter());
-            let Some(original) = queue.pop_front().or_else(|| rx.recv().ok()) else {
+            let Some(mut original) = queue.pop_front().or_else(|| rx.recv().ok()) else {
                 break;
             };
+            // Burst of edits on one task (e.g. `p` pressed repeatedly): one request carries them all.
+            let mut merged = 1;
+            if let Job::Patch { id, fields, .. } = &mut original {
+                queue.extend(rx.try_iter());
+                while let Some(Job::Patch {
+                    id: next,
+                    fields: more,
+                    ..
+                }) = queue.front()
+                    && next == id
+                {
+                    fields.extend(more.clone());
+                    queue.pop_front();
+                    merged += 1;
+                }
+            }
             let mut job = original.clone();
             for (old, new) in &aliases {
                 remap(&mut job, old, new);
@@ -305,13 +334,15 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
             let actual = match result {
                 Ok(job) => job,
                 Err(e) => {
-                    let _=out.send(Event::Error{message:format!("Falha na gravação: {e}. Alteração local desfeita; use r para conferir antes de tentar novamente."),mutation});
+                    for _ in 0..merged {
+                        let _=out.send(Event::Error{message:format!("Falha na gravação: {e}. Alteração local desfeita; use r para conferir antes de tentar novamente."),mutation});
+                    }
                     continue;
                 }
             };
             if mutation {
                 apply(&mut known, &actual);
-                unindexed.push((actual.clone(), std::time::Instant::now()));
+                track(&mut unindexed, actual.clone());
             }
             let mut message = String::from("Sincronizado com TickTick");
             // More writes queued (e.g. reorder burst): skip the full refetch until the last one.
@@ -408,17 +439,21 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
             if let Some(warning) = cache(&known) {
                 message = format!("{message} · {warning}");
             }
-            let event = if mutation {
-                Event::Applied {
-                    original: Box::new(original),
-                    actual: Box::new(actual),
-                    data: known.clone(),
-                    message,
-                }
-            } else {
-                Event::Data(known.clone(), message)
-            };
-            if out.send(event).is_err() {
+            // The UI pops one pending job per event, so a merged burst answers once per keypress.
+            let sent = (0..merged).all(|_| {
+                let event = if mutation {
+                    Event::Applied {
+                        original: Box::new(original.clone()),
+                        actual: Box::new(actual.clone()),
+                        data: known.clone(),
+                        message: message.clone(),
+                    }
+                } else {
+                    Event::Data(known.clone(), message.clone())
+                };
+                out.send(event).is_ok()
+            });
+            if !sent {
                 break;
             }
         }
@@ -466,5 +501,30 @@ mod tests {
         );
         // Failed optimistic writes are rolled back from the confirmed snapshot.
         assert!(original.completed.is_empty());
+    }
+    #[test]
+    fn superseded_patch_is_not_replayed_over_newer_value() {
+        let patch = |p: i32| Job::Patch {
+            id: "t".into(),
+            project: "p".into(),
+            fields: Map::from_iter([("priority".into(), Value::from(p))]),
+        };
+        let mut unindexed = Vec::new();
+        track(&mut unindexed, patch(1));
+        track(&mut unindexed, patch(3));
+        // Server already shows the final priority; the stale patch must not undo it.
+        let mut data = Snapshot {
+            tasks: vec![Task {
+                id: "t".into(),
+                priority: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        unindexed.retain(|(j, _)| !reflected(&data, j));
+        for (j, _) in &unindexed {
+            apply(&mut data, j);
+        }
+        assert_eq!(data.tasks[0].priority, 3);
     }
 }
