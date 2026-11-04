@@ -2456,7 +2456,6 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         // Borders, padding and the highlight symbol take 5 columns.
         let row_width = cols[1].width.saturating_sub(5) as usize;
         let visual = (app.mode == Mode::Visual).then(|| app.range());
-        let show_list = matches!(app.view(), View::Today | View::Tomorrow);
         let items = tree
             .iter()
             .enumerate()
@@ -2511,16 +2510,6 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     .and_then(|d| fields::relative_due(d, all_day, tz, today))
                 {
                     badges.push(pill(label, if overdue { danger } else { accent }));
-                }
-                // Date views mix lists, so name the list (subtasks share their parent's).
-                if show_list && row.depth == 0 {
-                    let name = app.project_name(&task.project_id);
-                    if !name.is_empty() {
-                        badges.push(Span::styled(
-                            format!("  {}", truncate(&name, 16)),
-                            Style::default().fg(muted).italic(),
-                        ));
-                    }
                 }
                 let left = format!(" {indent}{branch}○ ");
                 let right: usize = badges.iter().map(Span::width).sum();
