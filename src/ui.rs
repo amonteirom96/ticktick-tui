@@ -625,6 +625,9 @@ impl App {
                     Action::Subtask(_) => false,
                 };
                 if preview::toggle(&mut task, &action) {
+                    if checking {
+                        self.play(include_bytes!("../assets/check.wav"), 0.7);
+                    }
                     self.update(task);
                     if checking && self.open_boxes().is_empty() {
                         self.message = "Tudo marcado ✓ · h depois x conclui a tarefa".into();
@@ -780,11 +783,11 @@ impl App {
             }
         }
     }
-    fn play(&self, sound: &'static [u8]) {
+    fn play(&self, sound: &'static [u8], volume: f32) {
         if let Some(audio) = &self.audio
             && let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(sound))
         {
-            audio.mixer().add(source);
+            audio.mixer().add(rodio::Source::amplify(source, volume));
         }
     }
     fn send(&mut self, job: Job) {
@@ -794,8 +797,8 @@ impl App {
             self.message = "Relatório · visualização das atividades concluídas".into();
             return;
         }
-        if matches!(job, Job::Complete(_)) {
-            self.play(include_bytes!("../assets/check.wav"));
+        if matches!(job, Job::Complete(_)) || matches!(job, Job::CheckHabit { value, .. } if value > 0.0) {
+            self.play(include_bytes!("../assets/check.wav"), 0.7);
         }
         if self.demo {
             if let Job::CheckHabit {
@@ -1719,7 +1722,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         // Plays a sound once when a pomodoro phase ends.
         let finished = app.timer.finished();
         if finished && !was_finished {
-            app.play(include_bytes!("../assets/notification.wav"));
+            app.play(include_bytes!("../assets/notification.wav"), 1.0);
         }
         was_finished = finished;
         loop {

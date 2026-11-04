@@ -28,6 +28,8 @@ pub struct Row {
     pub action: Option<Action>,
     /// First Markdown link destination on the row, opened with `gx`.
     pub link: Option<String>,
+    /// Leading spans (quote bar, list marker) repeated as indent on wrapped lines.
+    pub hang: usize,
 }
 impl Row {
     fn text(line: impl Into<Line<'static>>) -> Self {
@@ -35,6 +37,7 @@ impl Row {
             line: line.into(),
             action: None,
             link: None,
+            hang: 0,
         }
     }
 }
@@ -54,6 +57,9 @@ struct Markdown<'a> {
     items: Vec<bool>,
     quote: usize,
     code: bool,
+    hang: usize,
+    /// Cells of the table being parsed, laid out on `TagEnd::Table`.
+    table: Vec<Vec<Vec<Span<'static>>>>,
 }
 impl<'a> Markdown<'a> {
     fn style(&self) -> Style {
@@ -74,6 +80,7 @@ impl<'a> Markdown<'a> {
             line: Line::from(std::mem::take(&mut self.spans)),
             action: self.action.take(),
             link: self.link.take(),
+            hang: std::mem::take(&mut self.hang),
         });
     }
     fn blank(&mut self) {
@@ -85,13 +92,14 @@ impl<'a> Markdown<'a> {
     fn prefix(&mut self) {
         if self.spans.is_empty() && self.quote > 0 {
             self.spans.push(Span::styled(
-                "│ ".repeat(self.quote),
-                Style::default().fg(color(&self.theme.muted)),
+                "▎ ".repeat(self.quote),
+                Style::default().fg(color(&self.theme.accent)),
             ));
+            self.hang = 1;
         }
     }
 }
-fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
+fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row> {
     let mut m = Markdown {
         theme,
         rows: vec![],
@@ -103,6 +111,8 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
         items: vec![],
         quote: 0,
         code: false,
+        hang: 0,
+        table: vec![],
     };
     for (event, range) in Parser::new_ext(
         source,
@@ -152,11 +162,13 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                         _ => "• ".into(),
                     };
                     m.push(format!("{indent}{marker}"));
+                    m.hang = m.spans.len();
                 }
                 Tag::BlockQuote(_) => {
                     m.blank();
                     m.quote += 1;
-                    m.styles.push(Style::default().fg(color(&theme.muted)));
+                    m.styles
+                        .push(Style::default().fg(color(&theme.muted)).italic());
                 }
                 Tag::CodeBlock(kind) => {
                     m.blank();
@@ -175,7 +187,8 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                             .fg(color(&theme.code)),
                     );
                 }
-                Tag::Table(_) | Tag::TableHead | Tag::TableRow => m.flush(),
+                Tag::Table(_) => m.blank(),
+                Tag::TableHead | Tag::TableRow => m.table.push(vec![]),
                 _ => (),
             },
             Event::End(tag) => match tag {
@@ -227,25 +240,70 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                     )));
                     m.blank();
                 }
-                TagEnd::TableCell => m.push("   │   "),
-                TagEnd::TableHead | TagEnd::TableRow => m.flush(),
-                TagEnd::Table => m.blank(),
+                TagEnd::TableCell => {
+                    let cell = std::mem::take(&mut m.spans);
+                    if let Some(row) = m.table.last_mut() {
+                        row.push(cell);
+                    }
+                }
+                TagEnd::Table => {
+                    let table = std::mem::take(&mut m.table);
+                    let mut widths = vec![];
+                    for row in &table {
+                        widths.resize(widths.len().max(row.len()), 0);
+                        for (i, cell) in row.iter().enumerate() {
+                            widths[i] = widths[i].max(cell.iter().map(Span::width).sum());
+                        }
+                    }
+                    let line = Style::default().fg(color(&theme.border));
+                    for (r, row) in table.into_iter().enumerate() {
+                        for (i, cell) in row.into_iter().enumerate() {
+                            if i > 0 {
+                                m.spans.push(Span::styled(" │ ", line));
+                            }
+                            let pad = widths[i] - cell.iter().map(Span::width).sum::<usize>();
+                            m.spans.extend(
+                                cell.into_iter().map(|s| if r == 0 { s.bold() } else { s }),
+                            );
+                            m.spans.push(Span::raw(" ".repeat(pad)));
+                        }
+                        m.flush();
+                        if r == 0 {
+                            let rule = widths
+                                .iter()
+                                .map(|w| "─".repeat(*w))
+                                .collect::<Vec<_>>()
+                                .join("─┼─");
+                            m.rows.push(Row::text(Span::styled(rule, line)));
+                        }
+                    }
+                    m.blank();
+                }
                 _ => (),
             },
             Event::Text(text) => {
                 if m.code {
                     for line in text.lines() {
-                        m.push(format!("│ {line}"));
+                        m.spans
+                            .push(Span::styled("│ ", Style::default().fg(color(&theme.muted))));
+                        m.hang = 1;
+                        m.push(line);
                         m.flush();
                     }
                 } else {
                     m.prefix();
+                    // Text right after a quote bar/marker never starts with a gap.
+                    let text = if m.spans.len() == m.hang {
+                        text.trim_start()
+                    } else {
+                        &text
+                    };
                     m.push(text.to_string());
                 }
             }
             Event::Code(text) => {
                 m.spans.push(Span::styled(
-                    text.to_string(),
+                    format!(" {text} "),
                     m.style()
                         .fg(color(&theme.code))
                         .bg(color(&theme.code_background)),
@@ -263,8 +321,14 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                 }
                 if checked && let Some(done) = m.items.last_mut() {
                     *done = true;
-                    m.styles
-                        .push(Style::default().fg(color(&theme.muted)));
+                    m.styles.push(Style::default().fg(color(&theme.muted)));
+                }
+                // A task item shows its checkbox in place of the bullet.
+                if let Some(last) = m.spans.last_mut()
+                    && last.content.ends_with("• ")
+                {
+                    let indent = last.content.trim_end_matches("• ").to_owned();
+                    last.content = indent.into();
                 }
                 m.spans.push(Span::styled(
                     if checked { "● " } else { "○ " },
@@ -276,6 +340,7 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                         }))
                         .bold(),
                 ));
+                m.hang = m.spans.len();
             }
             Event::SoftBreak => {
                 m.push(" ");
@@ -287,7 +352,7 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
             Event::Rule => {
                 m.blank();
                 m.rows.push(Row::text(Span::styled(
-                    "────────────────────────",
+                    "─".repeat(width),
                     Style::default().fg(color(&theme.border)),
                 )));
                 m.blank();
@@ -306,9 +371,31 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
     let width = width.max(1);
     let mut result = Vec::new();
     for row in rows {
+        let mut spans = row.line.spans;
+        let mut hang: Vec<Span<'static>> = spans.drain(..row.hang.min(spans.len())).collect();
+        let mut indent = hang.iter().map(Span::width).sum::<usize>();
+        if indent * 2 > width {
+            spans.splice(0..0, hang.drain(..));
+            indent = 0;
+        }
+        // Continuation lines keep quote bars and replace list markers with blanks.
+        let gutter = hang
+            .iter()
+            .map(|s| {
+                if s.content
+                    .trim()
+                    .chars()
+                    .all(|c| matches!(c, '▎' | '│' | ' '))
+                {
+                    s.clone()
+                } else {
+                    Span::raw(" ".repeat(s.width()))
+                }
+            })
+            .collect::<Vec<_>>();
         let mut tokens: Vec<Vec<(String, Style)>> = vec![];
         let mut whitespace = None;
-        for span in row.line.spans {
+        for span in spans {
             for g in span.content.graphemes(true) {
                 let space = g.chars().all(char::is_whitespace);
                 if whitespace != Some(space) {
@@ -318,8 +405,8 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
                 tokens.last_mut().unwrap().push((g.to_owned(), span.style));
             }
         }
-        let mut spans = vec![];
-        let mut used = 0;
+        let mut spans = hang;
+        let mut used = indent;
         let mut wrapped = false;
         for token in tokens {
             let size = token
@@ -329,27 +416,29 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
             let space = token
                 .first()
                 .is_some_and(|(s, _)| s.chars().all(char::is_whitespace));
-            if used > 0 && used + size > width && !space && size <= width {
+            if used > indent && used + size > width && !space && size + indent <= width {
                 result.push(Row {
-                    line: Line::from(std::mem::take(&mut spans)),
+                    line: Line::from(std::mem::replace(&mut spans, gutter.clone())),
                     action: row.action.clone(),
                     link: row.link.clone(),
+                    hang: 0,
                 });
-                used = 0;
+                used = indent;
                 wrapped = true;
             }
-            if wrapped && used == 0 && space {
+            if wrapped && used == indent && space {
                 continue;
             }
             for (g, style) in token {
                 let size = UnicodeWidthStr::width(g.as_str());
-                if used + size > width && used > 0 {
+                if used + size > width && used > indent {
                     result.push(Row {
-                        line: Line::from(std::mem::take(&mut spans)),
+                        line: Line::from(std::mem::replace(&mut spans, gutter.clone())),
                         action: row.action.clone(),
                         link: row.link.clone(),
+                        hang: 0,
                     });
-                    used = 0;
+                    used = indent;
                     wrapped = true;
                     if space {
                         continue;
@@ -363,6 +452,7 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
             line: Line::from(spans),
             action: row.action,
             link: row.link,
+            hang: 0,
         });
     }
     result
@@ -442,9 +532,9 @@ pub fn document(
         Style::default().fg(color(&theme.border)),
     )));
     rows.push(Row::text(""));
-    rows.extend(markdown(&task.content, Field::Content, theme));
+    rows.extend(markdown(&task.content, Field::Content, theme, width));
     if let Some(desc) = task.desc.as_ref().filter(|s| !s.is_empty()) {
-        rows.extend(markdown(desc, Field::Description, theme));
+        rows.extend(markdown(desc, Field::Description, theme, width));
     }
     if !task.items.is_empty() {
         if rows.last().is_some_and(|r| r.line.width() > 0) {
@@ -452,8 +542,8 @@ pub fn document(
         }
         rows.push(Row::text(Line::from(vec![
             Span::styled(
-                "Checklist  ",
-                Style::default().fg(color(&theme.heading)).bold(),
+                "CHECKLIST  ",
+                Style::default().fg(color(&theme.muted)).bold(),
             ),
             Span::styled(
                 format!(
@@ -492,6 +582,7 @@ pub fn document(
                 ]),
                 action: Some(Action::Checklist(i)),
                 link: None,
+                hang: 1,
             });
         }
         let hidden = task.items.iter().filter(|i| i.status == 1).count();
@@ -509,19 +600,26 @@ pub fn document(
         .collect::<Vec<_>>();
     if !children.is_empty() {
         rows.push(Row::text(""));
-        rows.push(Row::text(Span::styled(
-            format!("SUBTAREFAS   {}", children.len()),
-            Style::default().fg(color(&theme.muted)).bold(),
-        )));
+        rows.push(Row::text(Line::from(vec![
+            Span::styled(
+                "SUBTAREFAS  ",
+                Style::default().fg(color(&theme.muted)).bold(),
+            ),
+            Span::styled(
+                children.len().to_string(),
+                Style::default().fg(color(&theme.muted)),
+            ),
+        ])));
         rows.push(Row::text(""));
         for t in children {
             rows.push(Row {
                 line: Line::from(vec![
-                    Span::styled("○  ", Style::default().fg(color(&theme.accent))),
+                    Span::styled("○ ", Style::default().fg(color(&theme.accent)).bold()),
                     Span::raw(t.title.clone()),
                 ]),
                 action: Some(Action::Subtask(t.id.clone())),
                 link: None,
+                hang: 1,
             });
         }
     }
@@ -666,6 +764,35 @@ pub fn render(
                 .track_style(Style::default().fg(color(&theme.border))),
             area,
             &mut state,
+        );
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn wrapped_quote_keeps_bar() {
+        let theme = Default::default();
+        let rows = super::wrap(
+            super::markdown(
+                "> um texto longo que quebra",
+                super::Field::Content,
+                &theme,
+                12,
+            ),
+            12,
+        );
+        let text = |r: &super::Row| {
+            r.line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(rows.len() > 1);
+        assert!(
+            rows.iter()
+                .filter(|r| r.line.width() > 0)
+                .all(|r| text(r).starts_with("▎ "))
         );
     }
 }
