@@ -127,6 +127,13 @@ impl Timer {
             self.started = Some(chrono::Utc::now().timestamp());
         }
     }
+    /// Running timer for the app header: remaining time in pomodoro, elapsed in stopwatch.
+    pub fn header(&self) -> Option<String> {
+        self.started?;
+        let label = if self.pomodoro && self.phase != Phase::Focus { "Pausa" } else { "Foco" };
+        let seconds = self.seconds();
+        Some(format!("  ·  ● {label} {}", clock(self.target().map_or(seconds, |t| t.saturating_sub(seconds)))))
+    }
     pub fn reset(&mut self, pomodoro: bool) {
         if self.pomodoro != pomodoro {
             return;

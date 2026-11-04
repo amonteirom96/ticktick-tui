@@ -81,6 +81,8 @@ struct App {
     query: String,
     message: String,
     busy: bool,
+    /// Quit requested while syncing: exit once `busy` clears.
+    quitting: bool,
     demo: bool,
     pending: char,
     count: String,
@@ -1585,6 +1587,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             "Cached tasks · connecting…".into()
         },
         busy: false,
+        quitting: false,
         demo,
         pending: '\0',
         count: String::new(),
@@ -1652,6 +1655,9 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 break;
             }
         }
+        if app.quitting && !app.busy {
+            break;
+        }
         if app.mode == Mode::Token {
             app.mode = Mode::Normal;
             if app.demo {
@@ -1711,7 +1717,12 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             if key.kind != event::KeyEventKind::Press {
                 continue;
             }
-            if app.mode == Mode::Normal
+            if app.quitting {
+                // Ctrl-C forces exit without waiting.
+                if key.code == K::Char('c') && key.modifiers.contains(M::CONTROL) {
+                    break;
+                }
+            } else if app.mode == Mode::Normal
                 && app.preview_focus
                 && app.pending != 'g'
                 && matches!(key.code, K::Char(' ') | K::Char('x') | K::Enter)
@@ -1736,7 +1747,10 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                     }
                 }
             } else if app.key(key) {
-                break;
+                if !app.busy {
+                    break;
+                }
+                app.quitting = true;
             }
         }
     }
@@ -2309,6 +2323,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 },
                 Style::default().fg(muted),
             ),
+            Span::styled(app.timer.header().unwrap_or_default(), Style::default().fg(accent)),
         ])),
         header[1],
     );
@@ -2849,6 +2864,17 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Zerar timer local\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
+    if app.quitting {
+        let area = centered(f.area(), 44, 5);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new("Sincronizando… sai ao terminar.
+Ctrl-C força a saída.")
+                .style(Style::default().bg(panel).fg(fg))
+                .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
+            area,
+        );
+    }
 }
 const DUE: [(&str, &str); 4] = [
     ("Hoje", "hoje"),
@@ -2941,6 +2967,7 @@ mod tests {
             query: String::new(),
             message: String::new(),
             busy: false,
+            quitting: false,
             demo: true,
             pending: '\0',
             count: String::new(),
