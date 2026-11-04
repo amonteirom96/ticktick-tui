@@ -45,6 +45,8 @@ pub struct Config {
     pub sync_seconds: u64,
     pub user_name: Option<String>,
     pub theme_file: Option<String>,
+    /// `false` silences every sound effect.
+    pub sounds: bool,
     pub theme: Theme,
 }
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             sync_seconds: 60,
             user_name: None,
             theme_file: None,
+            sounds: true,
             theme: Theme::default(),
         }
     }

@@ -97,6 +97,7 @@ Sem `[theme]` nem `theme_file` no `config.toml`, o tema segue o fundo do termina
 
 ```toml
 sync_seconds = 60
+sounds = true  # false desativa todos os sons
 
 [theme]
 background = "#161b22"

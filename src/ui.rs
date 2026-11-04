@@ -84,6 +84,8 @@ struct App {
     /// Quit requested while syncing: exit once `busy` clears.
     quitting: bool,
     demo: bool,
+    /// Open audio output; `None` when sounds are off or no device exists.
+    audio: Option<rodio::MixerDeviceSink>,
     pending: char,
     count: String,
     details: bool,
@@ -776,12 +778,22 @@ impl App {
             }
         }
     }
+    fn play(&self, sound: &'static [u8]) {
+        if let Some(audio) = &self.audio
+            && let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(sound))
+        {
+            audio.mixer().add(source);
+        }
+    }
     fn send(&mut self, job: Job) {
         if matches!(self.view(), View::Report | View::Habits | View::Focus)
             && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
         {
             self.message = "Relatório · visualização das atividades concluídas".into();
             return;
+        }
+        if matches!(job, Job::Complete(_)) {
+            self.play(include_bytes!("../assets/check.wav"));
         }
         if self.demo {
             if let Job::CheckHabit {
@@ -1675,6 +1687,21 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         busy: false,
         quitting: false,
         demo,
+        // Opened once so each sound plays without startup latency.
+        audio: config.sounds.then(|| {
+            rodio::DeviceSinkBuilder::from_default_device()
+                .and_then(|b| {
+                    // rodio's 2048-frame default is rejected by macOS (max 1024).
+                    b.with_buffer_size(rodio::cpal::BufferSize::Default)
+                        .with_error_callback(|_| {})
+                        .open_stream()
+                })
+                .ok()
+                .map(|mut sink| {
+                    sink.log_on_drop(false);
+                    sink
+                })
+        }).flatten(),
         pending: '\0',
         count: String::new(),
         details: true,
@@ -1685,7 +1712,14 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
     if !demo {
         app.send(Job::Refresh);
     }
+    let mut was_finished = app.timer.finished();
     loop {
+        // Plays a sound once when a pomodoro phase ends.
+        let finished = app.timer.finished();
+        if finished && !was_finished {
+            app.play(include_bytes!("../assets/notification.wav"));
+        }
+        was_finished = finished;
         loop {
             let event = app.rx.as_ref().and_then(|rx| rx.try_recv().ok());
             if let Some(event) = event {
@@ -3064,6 +3098,7 @@ mod tests {
             busy: false,
             quitting: false,
             demo: true,
+            audio: None,
             pending: '\0',
             count: String::new(),
             details: true,
