@@ -62,6 +62,8 @@ struct App {
     preview_width: usize,
     /// Task column width (%) when the preview is visible.
     split: u16,
+    /// Extra sidebar width (columns), changed with `<`/`>` while the list is focused.
+    lists: i16,
     zoom: bool,
     hide_lists: bool,
     collapsed: HashSet<String>,
@@ -1563,6 +1565,8 @@ impl App {
                     self.focus(1);
                 }
             }
+            K::Char('<') if self.projects_focus => self.lists = (self.lists - 2).max(-6),
+            K::Char('>') if self.projects_focus => self.lists = (self.lists + 2).min(40),
             K::Char('<') => self.split = self.split.saturating_sub(5).max(15),
             K::Char('>') => self.split = (self.split + 5).min(70),
             K::Enter => self.focus(2),
@@ -1666,6 +1670,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         preview_cursor: 0,
         preview_width: 60,
         split: 34,
+        lists: 0,
         zoom: false,
         hide_lists: false,
         collapsed: HashSet::new(),
@@ -2038,10 +2043,11 @@ fn preview_area(area: Rect, app: &App) -> Rect {
         let sidebar = if app.hide_lists {
             0
         } else if body.width >= 150 {
-            25
+            25u16
         } else {
             21
-        };
+        }
+        .saturating_add_signed(app.lists);
         return Layout::horizontal([
             Constraint::Length(sidebar),
             Constraint::Percentage(app.split),
@@ -2495,10 +2501,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 Constraint::Length(if app.hide_lists {
                     0
                 } else if rows[1].width >= 150 {
-                    25
+                    25u16
                 } else {
                     21
-                }),
+                }
+                .saturating_add_signed(app.lists)),
                 Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
@@ -2508,10 +2515,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 Constraint::Length(if app.hide_lists {
                     0
                 } else if rows[1].width < 55 {
-                    17
+                    17u16
                 } else {
                     25
-                }),
+                }
+                .saturating_add_signed(app.lists)),
                 Constraint::Min(0),
             ])
             .split(rows[1])
@@ -3078,6 +3086,7 @@ mod tests {
             preview_cursor: 0,
             preview_width: 60,
             split: 34,
+            lists: 0,
             zoom: false,
             hide_lists: false,
             collapsed: HashSet::new(),
