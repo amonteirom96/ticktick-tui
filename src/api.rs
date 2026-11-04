@@ -322,14 +322,21 @@ impl Api {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let stamp = crate::sidebar::today(data).format("%Y%m%d").to_string();
+        let today = crate::sidebar::today(data);
+        let stamp = today.format("%Y%m%d").to_string();
+        // The API uses an exclusive upper bound; equal dates return no check-ins.
+        let end = today
+            .succ_opt()
+            .context("Data de hábito inválida")?
+            .format("%Y%m%d")
+            .to_string();
         let mut records = Vec::new();
         for chunk in ids.chunks(50) {
             let mut url = reqwest::Url::parse("https://api.ticktick.com/open/v1/habit/checkins")?;
             url.query_pairs_mut()
                 .append_pair("habitIds", &chunk.join(","))
                 .append_pair("from", &stamp)
-                .append_pair("to", &stamp);
+                .append_pair("to", &end);
             let value = self.request(
                 Method::GET,
                 &format!("/habit/checkins?{}", url.query().unwrap()),
@@ -531,6 +538,65 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn habit_refresh_includes_today_with_exclusive_end() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut data = Snapshot {
+            time_zone: Some("America/Recife".into()),
+            habits: vec![json!({"id": "h", "goal": 1.0})],
+            ..Default::default()
+        };
+        let today = crate::sidebar::today(&data);
+        let server = std::thread::spawn(move || {
+            // Repeat the refresh to ensure completion survives subsequent reads.
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buf = [0; 8192];
+                let n = socket.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                assert_eq!(url.path(), "/open/v1/habit/checkins");
+                let query = url
+                    .query_pairs()
+                    .into_owned()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(query["habitIds"], "h");
+                assert_eq!(query["from"], today.format("%Y%m%d").to_string());
+                assert_eq!(
+                    query["to"],
+                    today.succ_opt().unwrap().format("%Y%m%d").to_string()
+                );
+                let body = json!([{"habitId": "h", "checkins": [{
+                    "stamp": today.format("%Y%m%d").to_string().parse::<i32>().unwrap(),
+                    "value": 1.0, "goal": 1.0
+                }]}])
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{addr}/open/v1");
+        for _ in 0..2 {
+            data.habit_checkins = api.habit_checkins(&data).unwrap();
+            assert!(crate::wellness::habit_done(&data, &data.habits[0]));
+        }
+        server.join().unwrap();
+    }
     use super::*;
     #[test]
     fn ancestry_resolves_active_and_completed_parents_and_cycles() {
