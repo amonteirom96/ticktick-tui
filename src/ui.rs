@@ -2762,15 +2762,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         }
     }
     f.render_widget(
-        Paragraph::new(format!(
-            " {}{}",
-            if app.busy {
-                "◌ Sincronizando com TickTick · "
-            } else {
-                ""
-            },
-            app.message
-        ))
+        Paragraph::new(if app.busy {
+            " ◌ Sincronizando com TickTick…".to_owned()
+        } else {
+            format!(" {}", app.message)
+        })
         .style(Style::default().fg(muted)),
         rows[2],
     );
