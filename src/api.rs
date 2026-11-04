@@ -108,14 +108,28 @@ impl Api {
         })
     }
     fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut req = self
-            .client
-            .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token);
-        if let Some(body) = body {
-            req = req.json(&body);
-        }
-        let response = req.send().context("Cannot reach TickTick")?;
+        let mut attempt = 0;
+        let response = loop {
+            let mut req = self
+                .client
+                .request(method.clone(), format!("{}{path}", self.base))
+                .bearer_auth(&self.token);
+            if let Some(body) = &body {
+                req = req.json(body);
+            }
+            let response = req.send().context("Cannot reach TickTick")?;
+            // Rate limited: wait (Retry-After or exponential) and retry a few times.
+            if response.status().as_u16() != 429 || attempt == 3 {
+                break response;
+            }
+            let wait = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()?.parse().ok())
+                .unwrap_or(2u64 << attempt);
+            std::thread::sleep(Duration::from_secs(wait.min(30)));
+            attempt += 1;
+        };
         let status = response.status();
         if !status.is_success() {
             bail!(
@@ -264,29 +278,66 @@ impl Api {
         Ok(result)
     }
     pub fn habit_checkins(&self, data: &Snapshot) -> Result<Vec<Value>> {
-        let ids = data.habits.iter().filter_map(|h| h["id"].as_str()).collect::<Vec<_>>();
-        if ids.is_empty() { return Ok(vec![]); }
+        let ids = data
+            .habits
+            .iter()
+            .filter_map(|h| h["id"].as_str())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
         let stamp = crate::sidebar::today(data).format("%Y%m%d").to_string();
         let mut records = Vec::new();
         for chunk in ids.chunks(50) {
             let mut url = reqwest::Url::parse("https://api.ticktick.com/open/v1/habit/checkins")?;
-            url.query_pairs_mut().append_pair("habitIds", &chunk.join(","))
-                .append_pair("from", &stamp).append_pair("to", &stamp);
-            let value = self.request(Method::GET, &format!("/habit/checkins?{}", url.query().unwrap()), None)?;
-            records.extend(value.as_array().context("Resposta de check-in inválida")?.iter().cloned());
+            url.query_pairs_mut()
+                .append_pair("habitIds", &chunk.join(","))
+                .append_pair("from", &stamp)
+                .append_pair("to", &stamp);
+            let value = self.request(
+                Method::GET,
+                &format!("/habit/checkins?{}", url.query().unwrap()),
+                None,
+            )?;
+            records.extend(
+                value
+                    .as_array()
+                    .context("Resposta de check-in inválida")?
+                    .iter()
+                    .cloned(),
+            );
         }
         Ok(records)
     }
     /// Upserts the day's check-in; `value` 0 undoes a completion.
-    pub fn check_habit(&self, id: &str, day: chrono::NaiveDate, goal: f64, value: f64) -> Result<()> {
-        anyhow::ensure!(!id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'), "ID de hábito inválido");
+    pub fn check_habit(
+        &self,
+        id: &str,
+        day: chrono::NaiveDate,
+        goal: f64,
+        value: f64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "ID de hábito inválido"
+        );
         anyhow::ensure!(goal.is_finite() && goal > 0.0, "Meta de hábito inválida");
-        anyhow::ensure!(value.is_finite() && value >= 0.0, "Valor de hábito inválido");
+        anyhow::ensure!(
+            value.is_finite() && value >= 0.0,
+            "Valor de hábito inválido"
+        );
         let stamp = day.format("%Y%m%d").to_string().parse::<i32>()?;
         let time = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
-        self.request(Method::POST, &format!("/habit/{id}/checkin"), Some(json!({
-            "stamp": stamp, "value": value, "goal": goal, "time": time, "opTime": time
-        })))?;
+        self.request(
+            Method::POST,
+            &format!("/habit/{id}/checkin"),
+            Some(json!({
+                "stamp": stamp, "value": value, "goal": goal, "time": time, "opTime": time
+            })),
+        )?;
         Ok(())
     }
     /// Optional endpoints are not available for every Open API account.

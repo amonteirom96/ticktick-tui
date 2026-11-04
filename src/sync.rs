@@ -11,7 +11,12 @@ use std::{
 pub enum Job {
     Refresh,
     /// `value` equal to `goal` completes the habit; 0 undoes it.
-    CheckHabit { id: String, day: chrono::NaiveDate, goal: f64, value: f64 },
+    CheckHabit {
+        id: String,
+        day: chrono::NaiveDate,
+        goal: f64,
+        value: f64,
+    },
     Report(chrono::NaiveDate),
     Create(Task),
     Patch {
@@ -211,18 +216,38 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
         let mut history_available = true;
         // Keep confirmed writes visible while TickTick's list index catches up.
         let mut unindexed = Vec::<(Job, std::time::Instant)>::new();
-        while let Ok(original) = rx.recv() {
+        let mut queue = std::collections::VecDeque::new();
+        loop {
+            queue.extend(rx.try_iter());
+            let Some(original) = queue.pop_front().or_else(|| rx.recv().ok()) else {
+                break;
+            };
             let mut job = original.clone();
             for (old, new) in &aliases {
                 remap(&mut job, old, new);
             }
-            if let Job::CheckHabit { ref id, day, goal, value } = job {
+            if let Job::CheckHabit {
+                ref id,
+                day,
+                goal,
+                value,
+            } = job
+            {
                 match api.check_habit(id, day, goal, value) {
                     Ok(()) => {
                         crate::wellness::record_checkin(&mut known, id, day, goal, value);
-                        let mut message = if value > 0.0 { "Hábito concluído · salvo no TickTick" } else { "Hábito desmarcado · salvo no TickTick" }.to_string();
-                        if let Some(warning) = cache(&known) { message.push_str(&format!(" · {warning}")); }
-                        if out.send(Event::Data(known.clone(), message)).is_err() { break; }
+                        let mut message = if value > 0.0 {
+                            "Hábito concluído · salvo no TickTick"
+                        } else {
+                            "Hábito desmarcado · salvo no TickTick"
+                        }
+                        .to_string();
+                        if let Some(warning) = cache(&known) {
+                            message.push_str(&format!(" · {warning}"));
+                        }
+                        if out.send(Event::Data(known.clone(), message)).is_err() {
+                            break;
+                        }
                     }
                     Err(error) => {
                         let _ = out.send(Event::Error { message: format!("Não foi possível {} o hábito: {error}. Use r para conferir antes de tentar novamente.", if value > 0.0 { "concluir" } else { "desmarcar" }), mutation: false });
@@ -289,8 +314,12 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                 unindexed.push((actual.clone(), std::time::Instant::now()));
             }
             let mut message = String::from("Sincronizado com TickTick");
-            match api.snapshot() {
-                Ok(mut data) => {
+            // More writes queued (e.g. reorder burst): skip the full refetch until the last one.
+            queue.extend(rx.try_iter());
+            let busy = mutation && !queue.is_empty();
+            match (!busy).then(|| api.snapshot()) {
+                None => {}
+                Some(Ok(mut data)) => {
                     data.user_name = known.user_name.clone();
                     if !profile_checked {
                         data.user_name = api.profile_name();
@@ -365,10 +394,10 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                         message = known.warnings.join(" · ");
                     }
                 }
-                Err(e) if mutation => {
+                Some(Err(e)) if mutation => {
                     message = format!("Salvo no TickTick; atualização da lista falhou: {e}")
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     let _ = out.send(Event::Error {
                         message: format!("Falha na sincronização: {e}"),
                         mutation: false,

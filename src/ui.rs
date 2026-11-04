@@ -159,6 +159,17 @@ impl App {
             parent_id: parent,
             ..Default::default()
         };
+        if let Some(id) = task.parent_id.as_ref() {
+            self.collapsed.remove(id);
+        }
+        self.open_list(&project);
+        let id = task.id.clone();
+        self.send(Job::Create(task));
+        self.selected = self.visible().iter().position(|t| t.id == id).unwrap_or(0);
+        self.preview_cursor = 0;
+    }
+    /// Selects the sidebar list `project` (Inbox if it has no entry), expanding its group.
+    fn open_list(&mut self, project: &str) {
         self.query.clear();
         if let Some(group) = self
             .data
@@ -169,23 +180,16 @@ impl App {
         {
             self.collapsed.remove(&format!("group:{group}"));
         }
-        if let Some(id) = task.parent_id.as_ref() {
-            self.collapsed.remove(id);
-        }
         self.project = self
             .sidebar()
             .iter()
-            .position(|e| e.view == View::Project(project.clone()))
+            .position(|e| e.view == View::Project(project.to_owned()))
             .unwrap_or_else(|| {
                 self.sidebar()
                     .iter()
                     .position(|e| e.view == View::Inbox)
                     .unwrap_or(0)
             });
-        let id = task.id.clone();
-        self.send(Job::Create(task));
-        self.selected = self.visible().iter().position(|t| t.id == id).unwrap_or(0);
-        self.preview_cursor = 0;
     }
     /// Tasks of the current view in TickTick's manual order.
     fn view_tasks(&self) -> Vec<&Task> {
@@ -270,6 +274,48 @@ impl App {
                 (last, first)
             };
         }
+    }
+    /// `L`: subtask of the sibling above; `H`: up one level. "" parentId = root.
+    fn reparent(&mut self, indent: bool) {
+        let rows = self.tree();
+        let Some(row) = rows.get(self.selected) else {
+            return;
+        };
+        let (mut task, depth) = (row.task.clone(), row.depth);
+        let mut above = rows[..self.selected].iter().rev();
+        let parent = if indent {
+            above
+                .take_while(|r| r.depth >= depth)
+                .find(|r| r.depth == depth)
+                .map(|r| r.task.id.clone())
+        } else {
+            above.find(|r| r.depth < depth).map(|r| {
+                r.task
+                    .parent_id
+                    .clone()
+                    .filter(|_| depth > 1)
+                    .unwrap_or_default()
+            })
+        };
+        drop(rows);
+        let Some(parent) = parent else {
+            self.message = if indent {
+                "Nenhuma tarefa acima no mesmo nível."
+            } else {
+                "Já está no primeiro nível."
+            }
+            .into();
+            return;
+        };
+        self.collapsed.remove(&parent);
+        task.parent_id = Some(parent);
+        let id = task.id.clone();
+        self.update(task);
+        self.selected = self
+            .visible()
+            .iter()
+            .position(|t| t.id == id)
+            .unwrap_or(self.selected);
     }
     fn visible(&self) -> Vec<&Task> {
         self.tree().into_iter().map(|r| r.task).collect()
@@ -550,6 +596,17 @@ impl App {
                 if open {
                     // Reveal ancestors, then select the child without imposing a depth limit.
                     self.collapsed.clear();
+                    // Not in this view (e.g. undated child under Today): jump to its own list.
+                    if !self.visible().iter().any(|t| t.id == id)
+                        && let Some(p) = self
+                            .data
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == id)
+                            .map(|t| t.project_id.clone())
+                    {
+                        self.open_list(&p);
+                    }
                     if let Some(i) = self.visible().iter().position(|t| t.id == id) {
                         self.selected = i;
                         self.preview_cursor = 0;
@@ -720,16 +777,20 @@ impl App {
         }
     }
     fn send(&mut self, job: Job) {
-        if matches!(
-            self.view(),
-            View::Report | View::Habits | View::Focus
-        ) && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
+        if matches!(self.view(), View::Report | View::Habits | View::Focus)
+            && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
         {
             self.message = "Relatório · visualização das atividades concluídas".into();
             return;
         }
         if self.demo {
-            if let Job::CheckHabit { ref id, day, goal, value } = job {
+            if let Job::CheckHabit {
+                ref id,
+                day,
+                goal,
+                value,
+            } = job
+            {
                 crate::wellness::record_checkin(&mut self.data, id, day, goal, value);
             }
             sync::apply(&mut self.data, &job);
@@ -763,7 +824,8 @@ impl App {
             };
             self.clamp();
         } else {
-            self.message = if matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }) {
+            self.message = if matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
+            {
                 "Consulta indisponível; verifique sua conexão com o TickTick."
             } else {
                 "Sincronização indisponível; alteração não enviada."
@@ -869,7 +931,8 @@ impl App {
             Mode::FocusConfig if !text.is_empty() => match self.timer.set_durations(&text) {
                 Ok(()) => {
                     let (focus, short, long) = self.timer.durations();
-                    self.message = format!("Foco {focus}min · pausa {short}min · pausa longa {long}min");
+                    self.message =
+                        format!("Foco {focus}min · pausa {short}min · pausa longa {long}min");
                     self.persist_timer();
                 }
                 Err(e) => self.message = e,
@@ -1094,19 +1157,28 @@ impl App {
             }
             return false;
         }
-        if matches!(self.view(), View::Habits | View::Focus)
-            && !self.projects_focus
-        {
+        if matches!(self.view(), View::Habits | View::Focus) && !self.projects_focus {
             if self.view() == View::Habits && matches!(key.code, K::Char(' ' | 'x') | K::Enter) {
                 if self.busy {
                     self.message = "Aguarde a confirmação da sincronização.".into();
-                } else if let Some(habit) = crate::wellness::habits(&self.data).get(self.selected).map(|h| (*h).clone())
+                } else if let Some(habit) = crate::wellness::habits(&self.data)
+                    .get(self.selected)
+                    .map(|h| (*h).clone())
                     && let Some(id) = habit["id"].as_str()
                 {
                     // Space toggles: a completed habit is reset to zero for today.
                     let goal = crate::wellness::habit_goal(&habit);
-                    let value = if crate::wellness::habit_done(&self.data, &habit) { 0.0 } else { goal };
-                    self.send(Job::CheckHabit { id: id.into(), day: sidebar::today(&self.data), goal, value });
+                    let value = if crate::wellness::habit_done(&self.data, &habit) {
+                        0.0
+                    } else {
+                        goal
+                    };
+                    self.send(Job::CheckHabit {
+                        id: id.into(),
+                        day: sidebar::today(&self.data),
+                        goal,
+                        value,
+                    });
                 }
                 return false;
             }
@@ -1170,6 +1242,8 @@ impl App {
                         | 'v'
                         | 'J'
                         | 'K'
+                        | 'H'
+                        | 'L'
                         | 'f'
                         | 'z'
                 ) | K::Enter
@@ -1254,10 +1328,19 @@ impl App {
                         | 'v'
                         | 'J'
                         | 'K'
+                        | 'H'
+                        | 'L'
                 ) | K::Enter
             ) {
                 return false;
             }
+        }
+        if let K::Char(c @ '1'..='3') = key.code
+            && self.count.is_empty()
+            && self.mode != Mode::Visual
+        {
+            self.focus(c as u8 - b'1');
+            return false;
         }
         if let K::Char(c @ '1'..='9') = key.code {
             self.count.push(c);
@@ -1291,6 +1374,9 @@ impl App {
                         self.cursor_to(Action::Checklist(j));
                     }
                 }
+            }
+            K::Char('H' | 'L') if !self.projects_focus && !self.preview_focus => {
+                self.reparent(key.code == K::Char('L'))
             }
             K::Char('J' | 'K') if !self.projects_focus && self.mode == Mode::Normal => {
                 self.anchor = self.selected;
@@ -1725,9 +1811,11 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             } else if app.mode == Mode::Normal
                 && app.preview_focus
                 && app.pending != 'g'
-                && matches!(key.code, K::Char(' ') | K::Char('x') | K::Enter)
+                && (matches!(key.code, K::Char(' ') | K::Char('x') | K::Enter)
+                    || key.code == K::Char('l')
+                        && matches!(app.cursor_action(), Some(Action::Subtask(_))))
             {
-                app.preview_action(&config.theme, key.code == K::Enter);
+                app.preview_action(&config.theme, matches!(key.code, K::Enter | K::Char('l')));
             } else if app.mode == Mode::Normal && key.code == K::Char('e') {
                 if let Some(mut t) = app.task() {
                     disable_raw_mode()?;
@@ -2323,7 +2411,10 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 },
                 Style::default().fg(muted),
             ),
-            Span::styled(app.timer.header().unwrap_or_default(), Style::default().fg(accent)),
+            Span::styled(
+                app.timer.header().unwrap_or_default(),
+                Style::default().fg(accent),
+            ),
         ])),
         header[1],
     );
@@ -2428,10 +2519,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                         ),
                         Span::raw(e.name.clone()),
                         Span::styled(
-                            if matches!(
-                                e.view,
-                                View::Report | View::Habits | View::Focus
-                            ) {
+                            if matches!(e.view, View::Report | View::Habits | View::Focus) {
                                 String::new()
                             } else {
                                 format!("  {}", e.count)
@@ -2693,7 +2781,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             " ATIVIDADE  Buscar: {}   ↑/↓ escolher · Enter iniciar com ela · Esc cancelar",
             input_prompt(&app.input, app.input_cursor)
         ),
-        Mode::FocusConfig => " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into(),
+        Mode::FocusConfig => {
+            " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into()
+        }
         Mode::Due => " PRAZO  j/k escolher · Enter salvar · Tab completar · Esc cancelar".into(),
         Mode::Remind => {
             " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into()
@@ -2709,7 +2799,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             } else if app.preview_focus {
                 " PREVIEW  x marcar · o/O novo item · J/K mover · cc renomear · dd apagar · u desfazer · gs subtarefa · zh ocultar feitos · h voltar".into()
             } else {
-                " NORMAL  h/j/k/l navegar · a nova · J/K mover · m lista · D prazo · R lembrete · za recolher · ? ajuda".into()
+                " NORMAL  h/j/k/l navegar · a nova · J/K mover · H/L nível · m lista · D prazo · R lembrete · za recolher · ? ajuda".into()
             }
         }
     };
@@ -2814,7 +2904,10 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             })
             .collect::<Vec<_>>();
         if lines.is_empty() {
-            lines.push(Line::styled(" Nenhuma tarefa encontrada", Style::default().fg(muted)));
+            lines.push(Line::styled(
+                " Nenhuma tarefa encontrada",
+                Style::default().fg(muted),
+            ));
         }
         lines.push(Line::default());
         lines.push(Line::from(vec![
@@ -2862,16 +2955,18 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Zerar timer local\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\n1 / 2 / 3      Focar listas / tarefas / preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nH / L          Subir nível / virar subtarefa da de cima\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa (l também abre)\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Zerar timer local\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
     if app.quitting {
         let area = centered(f.area(), 44, 5);
         f.render_widget(Clear, area);
         f.render_widget(
-            Paragraph::new("Sincronizando… sai ao terminar.
-Ctrl-C força a saída.")
-                .style(Style::default().bg(panel).fg(fg))
-                .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
+            Paragraph::new(
+                "Sincronizando… sai ao terminar.
+Ctrl-C força a saída.",
+            )
+            .style(Style::default().bg(panel).fg(fg))
+            .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
             area,
         );
     }
@@ -3001,8 +3096,14 @@ mod tests {
     #[test]
     fn space_toggles_habit_completion() {
         let mut a = app();
-        a.data.habits = vec![serde_json::json!({"id":"h","name":"Ler","goal":1.0,"repeatRule":"RRULE:FREQ=DAILY"})];
-        a.project = a.sidebar().iter().position(|e| e.view == View::Habits).unwrap();
+        a.data.habits = vec![
+            serde_json::json!({"id":"h","name":"Ler","goal":1.0,"repeatRule":"RRULE:FREQ=DAILY"}),
+        ];
+        a.project = a
+            .sidebar()
+            .iter()
+            .position(|e| e.view == View::Habits)
+            .unwrap();
         a.projects_focus = false;
         let habit = a.data.habits[0].clone();
         press(&mut a, ' ');
@@ -3013,7 +3114,11 @@ mod tests {
     #[test]
     fn focus_picks_activity_and_durations() {
         let mut a = app();
-        a.project = a.sidebar().iter().position(|e| e.view == View::Focus).unwrap();
+        a.project = a
+            .sidebar()
+            .iter()
+            .position(|e| e.view == View::Focus)
+            .unwrap();
         a.projects_focus = false;
         let title = a.data.tasks[3].title.clone();
         press(&mut a, 't');
@@ -3022,7 +3127,10 @@ mod tests {
             press(&mut a, c);
         }
         let backend = ratatui::backend::TestBackend::new(100, 30);
-        Terminal::new(backend).unwrap().draw(|f| draw(f, &a, &Config::default())).unwrap();
+        Terminal::new(backend)
+            .unwrap()
+            .draw(|f| draw(f, &a, &Config::default()))
+            .unwrap();
         a.key(KeyEvent::from(K::Enter));
         assert_eq!(a.timer.task().map(|t| t.title.clone()), Some(title));
         press(&mut a, 'c');
@@ -3033,6 +3141,26 @@ mod tests {
         press(&mut a, 't');
         a.key(KeyEvent::from(K::Enter)); // Empty query: first choice is free focus.
         assert!(a.timer.task().is_none());
+    }
+    #[test]
+    fn opening_subtask_hidden_in_view_jumps_to_its_list() {
+        let mut a = app();
+        a.data.tasks[0].due_date = Some("2000-01-01T00:00:00.000+0000".into());
+        a.data.tasks[1].parent_id = Some("0".into());
+        a.project = a
+            .sidebar()
+            .iter()
+            .position(|e| e.view == View::Today)
+            .unwrap();
+        assert_eq!(a.visible().len(), 1);
+        a.preview_cursor = a
+            .preview(&config::Theme::default())
+            .iter()
+            .position(|r| r.action == Some(Action::Subtask("1".into())))
+            .unwrap();
+        a.preview_action(&config::Theme::default(), true);
+        assert_eq!(a.view(), View::Project("p".into()));
+        assert_eq!(a.task().map(|t| t.id), Some("1".into()));
     }
     #[test]
     fn vim_counts_boundaries_and_project_focus() {
@@ -3052,6 +3180,30 @@ mod tests {
         press(&mut a, 'l');
         press(&mut a, 'k');
         assert_eq!(a.selected, 0);
+    }
+    #[test]
+    fn shift_l_nests_under_sibling_above_and_shift_h_unnests() {
+        let mut a = app();
+        for (i, t) in a.data.tasks.iter_mut().enumerate() {
+            t.sort_order = i as i64;
+        }
+        a.confirmed = a.data.clone();
+        let parent = |a: &App, id: &str| {
+            let t = a.data.tasks.iter().find(|t| t.id == id).unwrap();
+            t.parent_id.clone().filter(|p| !p.is_empty())
+        };
+        a.selected = 2;
+        press(&mut a, 'L');
+        assert_eq!(parent(&a, "2"), Some("1".into()));
+        a.selected = 3;
+        press(&mut a, 'L');
+        press(&mut a, 'L');
+        assert_eq!(parent(&a, "3"), Some("2".into()));
+        press(&mut a, 'H');
+        assert_eq!(parent(&a, "3"), Some("1".into()));
+        press(&mut a, 'H');
+        assert_eq!(parent(&a, "3"), None);
+        assert_eq!(a.task().unwrap().id, "3");
     }
     #[test]
     fn visual_mode_moves_sibling_block_with_subtasks() {

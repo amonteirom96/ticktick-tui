@@ -49,6 +49,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | Tecla | Ação |
 | --- | --- |
 | `h` / `l`, `Tab` | Focar listas / tarefas |
+| `1` / `2` / `3` | Focar listas / tarefas / preview |
 | `j` / `k`, `5j` / `5k` | Navegar, com contagem opcional |
 | `gg` / `G` | Primeiro / último item |
 | `Ctrl-d` / `Ctrl-u` | Descer / subir 10 itens |
