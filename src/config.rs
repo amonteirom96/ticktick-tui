@@ -24,8 +24,8 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background: "#1b2029".into(),
-            panel: "#232833".into(),
+            background: "#20242c".into(),
+            panel: "#20242c".into(),
             border: "#42485a".into(),
             heading: "#e6edf3".into(),
             code: "#5dbbc1".into(),
@@ -33,7 +33,7 @@ impl Default for Theme {
             foreground: "#c9d1d9".into(),
             muted: "#8b949e".into(),
             accent: "#79c0ff".into(),
-            selection: "#263449".into(),
+            selection: "#33435a".into(),
             danger: "#ff7b72".into(),
             success: "#7ee787".into(),
         }
@@ -43,6 +43,7 @@ impl Default for Theme {
 #[serde(default)]
 pub struct Config {
     pub sync_seconds: u64,
+    pub user_name: Option<String>,
     pub theme_file: Option<String>,
     pub theme: Theme,
 }
@@ -50,6 +51,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             sync_seconds: 60,
+            user_name: None,
             theme_file: None,
             theme: Theme::default(),
         }

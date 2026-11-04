@@ -14,13 +14,13 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
-use unicode_width::UnicodeWidthStr;
 use std::{
     collections::{HashSet, VecDeque},
     io,
     sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthStr;
 
 #[derive(PartialEq)]
 enum Mode {
@@ -39,13 +39,20 @@ enum Mode {
     Help,
     Token,
     Visual,
+    /// Picks the task tracked by the focus timer.
+    FocusTask,
+    /// Edits the pomodoro focus / break / long break minutes.
+    FocusConfig,
 }
 struct App {
+    timer: crate::wellness::Timer,
     data: Snapshot,
     confirmed: Snapshot,
     pending_jobs: VecDeque<Job>,
     in_flight: usize,
     project: usize,
+    report_day: chrono::NaiveDate,
+    report_loading: std::collections::HashMap<chrono::NaiveDate, usize>,
     selected: usize,
     /// Fixed end of the visual selection; `selected` is the moving end.
     anchor: usize,
@@ -83,6 +90,14 @@ struct App {
     rx: Option<Receiver<sync::Event>>,
 }
 impl App {
+    fn persist_timer(&mut self) {
+        if !self.demo
+            && let Err(error) = self.timer.save()
+        {
+            self.message = format!("Timer em memória; falha ao salvar estado local: {error}");
+        }
+    }
+
     fn sidebar(&self) -> Vec<sidebar::Entry> {
         sidebar::entries(&self.data, &self.collapsed)
     }
@@ -90,7 +105,7 @@ impl App {
         self.sidebar()
             .get(self.project)
             .map(|e| e.view.clone())
-            .unwrap_or(View::All)
+            .unwrap_or(View::Today)
     }
     fn replay(&mut self) {
         self.data = self.confirmed.clone();
@@ -188,13 +203,19 @@ impl App {
     /// Visual selection as an inclusive row range.
     fn range(&self) -> (usize, usize) {
         let last = self.visible().len().saturating_sub(1);
-        (self.anchor.min(self.selected).min(last), self.anchor.max(self.selected).min(last))
+        (
+            self.anchor.min(self.selected).min(last),
+            self.anchor.max(self.selected).min(last),
+        )
     }
     /// Moves the selected siblings `delta` places, reusing the siblings' own sortOrder values.
     fn shift(&mut self, delta: isize) {
         let (lo, hi) = self.range();
         let rows = self.tree();
-        let Some(depth) = rows.get(lo..=hi).and_then(|r| r.iter().map(|r| r.depth).min()) else {
+        let Some(depth) = rows
+            .get(lo..=hi)
+            .and_then(|r| r.iter().map(|r| r.depth).min())
+        else {
             return;
         };
         // Shallowest rows of a contiguous range are siblings; their subtasks follow them.
@@ -207,19 +228,29 @@ impl App {
         let mut siblings = self
             .view_tasks()
             .into_iter()
-            .filter(|t| t.parent_id == block[0].parent_id && t.project_id == block[0].project_id)
+            .filter(|t| t.parent_id == block[0].parent_id)
             .cloned()
             .collect::<Vec<_>>();
-        let start = siblings.iter().position(|t| t.id == block[0].id).unwrap_or(0);
-        if siblings[start..].iter().take(block.len()).map(|t| &t.id).ne(block.iter().map(|t| &t.id)) {
-            self.message = "Selecione tarefas da mesma lista para mover.".into();
+        let start = siblings
+            .iter()
+            .position(|t| t.id == block[0].id)
+            .unwrap_or(0);
+        if siblings[start..]
+            .iter()
+            .take(block.len())
+            .map(|t| &t.id)
+            .ne(block.iter().map(|t| &t.id))
+        {
+            self.message = "Selecione tarefas do mesmo nível para mover.".into();
             return;
         }
         let mut orders = siblings.iter().map(|t| t.sort_order).collect::<Vec<_>>();
         for i in 1..orders.len() {
             orders[i] = orders[i].max(orders[i - 1].saturating_add(1));
         }
-        let moved = siblings.drain(start..start + block.len()).collect::<Vec<_>>();
+        let moved = siblings
+            .drain(start..start + block.len())
+            .collect::<Vec<_>>();
         let at = start.saturating_add_signed(delta).min(siblings.len());
         siblings.splice(at..at, moved);
         for (mut t, order) in siblings.into_iter().zip(orders) {
@@ -231,8 +262,11 @@ impl App {
         let visible = self.visible();
         let pos = |id: &str| visible.iter().position(|t| t.id == id);
         if let (Some(first), Some(last)) = (pos(&block[0].id), pos(&block[block.len() - 1].id)) {
-            (self.anchor, self.selected) =
-                if self.selected >= self.anchor { (first, last) } else { (last, first) };
+            (self.anchor, self.selected) = if self.selected >= self.anchor {
+                (first, last)
+            } else {
+                (last, first)
+            };
         }
     }
     fn visible(&self) -> Vec<&Task> {
@@ -240,10 +274,24 @@ impl App {
     }
     fn preview(&self, theme: &config::Theme) -> Vec<preview::Row> {
         self.task()
-            .map(|t| preview::document(&t, &self.data, theme, self.preview_width, self.hide_done))
+            .map(|t| {
+                if self.view() == View::Report {
+                    let mut data = self.data.clone();
+                    data.tasks = self.report_tasks().into_iter().cloned().collect();
+                    preview::document(&t, &data, theme, self.preview_width, false)
+                } else {
+                    preview::document(&t, &self.data, theme, self.preview_width, self.hide_done)
+                }
+            })
             .unwrap_or_default()
     }
     fn focus(&mut self, pane: u8) {
+        if pane == 2
+            && self.view() == View::Report
+            && (self.task().is_none() || self.report_loading.contains_key(&self.report_day))
+        {
+            return;
+        }
         let entering = pane == 2 && !self.preview_focus;
         self.projects_focus = pane == 0;
         self.preview_focus = pane == 2;
@@ -252,7 +300,10 @@ impl App {
         if self.preview_focus {
             self.details = true;
         }
-        if entering && let Some(&i) = self.open_boxes().first() {
+        if entering
+            && self.view() != View::Report
+            && let Some(&i) = self.open_boxes().first()
+        {
             self.preview_cursor = i;
         }
     }
@@ -276,21 +327,31 @@ impl App {
     fn jump(&mut self, delta: isize) {
         let rows = self.preview(&config::Theme::default());
         for _ in 0..delta.unsigned_abs() {
-            let here = rows.get(self.preview_cursor).and_then(|r| r.action.as_ref());
+            let here = rows
+                .get(self.preview_cursor)
+                .and_then(|r| r.action.as_ref());
             // Wrapped rows repeat their action, so skip rows of the current entry.
             let other = |r: &&preview::Row| r.action.is_some() && r.action.as_ref() != here;
             let found = if delta > 0 {
-                rows.iter().skip(self.preview_cursor + 1).position(|r| other(&r)).map(|i| self.preview_cursor + 1 + i)
+                rows.iter()
+                    .skip(self.preview_cursor + 1)
+                    .position(|r| other(&r))
+                    .map(|i| self.preview_cursor + 1 + i)
             } else {
-                rows[..self.preview_cursor.min(rows.len())].iter().rposition(|r| other(&r)).map(|mut i| {
-                    while i > 0 && rows[i - 1].action == rows[i].action {
-                        i -= 1;
-                    }
-                    i
-                })
+                rows[..self.preview_cursor.min(rows.len())]
+                    .iter()
+                    .rposition(|r| other(&r))
+                    .map(|mut i| {
+                        while i > 0 && rows[i - 1].action == rows[i].action {
+                            i -= 1;
+                        }
+                        i
+                    })
             };
             self.preview_cursor = found.unwrap_or_else(|| {
-                self.preview_cursor.saturating_add_signed(delta.signum()).min(rows.len().saturating_sub(1))
+                self.preview_cursor
+                    .saturating_add_signed(delta.signum())
+                    .min(rows.len().saturating_sub(1))
             });
         }
     }
@@ -336,16 +397,23 @@ impl App {
             let Some(sub) = self.data.tasks.iter().find(|s| s.id == id).cloned() else {
                 return;
             };
-            let has_children = self.data.tasks.iter().any(|c| c.parent_id.as_deref() == Some(&id));
+            let has_children = self
+                .data
+                .tasks
+                .iter()
+                .any(|c| c.parent_id.as_deref() == Some(&id));
             if !sub.content.trim().is_empty() || !sub.items.is_empty() || has_children {
-                self.message = "Subtarefa com conteúdo, checklist ou filhas; não convertida.".into();
+                self.message =
+                    "Subtarefa com conteúdo, checklist ou filhas; não convertida.".into();
                 return;
             }
             t.items.push(new_item(&sub.title, false));
             renumber(&mut t.items);
             self.update(t);
             self.send(Job::Delete(sub));
-            self.cursor_to(Action::Checklist(self.task().map_or(0, |t| t.items.len() - 1)));
+            self.cursor_to(Action::Checklist(
+                self.task().map_or(0, |t| t.items.len() - 1),
+            ));
             return;
         }
         let Some(title) = preview::label(&t, &action) else {
@@ -367,23 +435,41 @@ impl App {
     fn open_link(&mut self) {
         let rows = self.preview(&config::Theme::default());
         let rows = if self.preview_focus {
-            rows.get(self.preview_cursor..=self.preview_cursor).unwrap_or_default()
+            rows.get(self.preview_cursor..=self.preview_cursor)
+                .unwrap_or_default()
         } else {
             &rows[..]
         };
         let url = rows.iter().find_map(|r| {
             r.link.clone().or_else(|| {
-                let text = r.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-                text.split_whitespace().find(|w| w.starts_with("http")).map(str::to_owned)
+                let text = r
+                    .line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>();
+                text.split_whitespace()
+                    .find(|w| w.starts_with("http"))
+                    .map(str::to_owned)
             })
         });
         // Only web/mail links: `open file:///…` would launch arbitrary local apps.
-        self.message = match url.filter(|u| ["http://", "https://", "mailto:"].iter().any(|p| u.starts_with(p))) {
-            Some(url) => match std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
-                .arg(&url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+        self.message = match url.filter(|u| {
+            ["http://", "https://", "mailto:"]
+                .iter()
+                .any(|p| u.starts_with(p))
+        }) {
+            Some(url) => match std::process::Command::new(if cfg!(target_os = "macos") {
+                "open"
+            } else if cfg!(windows) {
+                "explorer.exe"
+            } else {
+                "xdg-open"
+            })
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             {
                 Ok(_) => format!("Abrindo {url}"),
                 Err(e) => format!("Não foi possível abrir o link: {e}"),
@@ -397,7 +483,10 @@ impl App {
             let items = text
                 .lines()
                 .filter_map(|l| {
-                    let l = l.trim().trim_start_matches(['-', '*', '+', '•']).trim_start();
+                    let l = l
+                        .trim()
+                        .trim_start_matches(['-', '*', '+', '•'])
+                        .trim_start();
                     let (done, l) = match l.get(..3) {
                         Some("[ ]") => (false, &l[3..]),
                         Some("[x]" | "[X]") => (true, &l[3..]),
@@ -413,7 +502,10 @@ impl App {
                 return;
             }
         }
-        if matches!(self.mode, Mode::Normal | Mode::Visual | Mode::Help | Mode::Delete | Mode::Token) {
+        if matches!(
+            self.mode,
+            Mode::Normal | Mode::Visual | Mode::Help | Mode::Delete | Mode::Token
+        ) {
             return;
         }
         for c in text.trim().chars() {
@@ -498,6 +590,46 @@ impl App {
             .filter(|(_, name)| name.to_lowercase().contains(&query))
             .collect()
     }
+    /// Open tasks matching `query` for the focus picker; `None` is free focus.
+    fn focus_choices(&self, query: &str) -> Vec<Option<crate::wellness::FocusTask>> {
+        let query = query.to_lowercase();
+        let today = sidebar::today(&self.data);
+        let mut tasks = self
+            .data
+            .tasks
+            .iter()
+            .filter(|t| t.status == 0 && t.title.to_lowercase().contains(&query))
+            .collect::<Vec<_>>();
+        // Overdue and today's tasks first, then the rest in list order.
+        tasks.sort_by_key(|t| {
+            !t.due_date
+                .as_deref()
+                .and_then(|d| sidebar::date(d, t, &self.data))
+                .is_some_and(|d| d <= today)
+        });
+        query
+            .is_empty()
+            .then_some(None)
+            .into_iter()
+            .chain(tasks.into_iter().map(|t| {
+                Some(crate::wellness::FocusTask {
+                    id: t.id.clone(),
+                    title: t.title.clone(),
+                })
+            }))
+            .collect()
+    }
+    fn project_name(&self, id: &str) -> String {
+        if self.data.inbox_id.as_deref() == Some(id) {
+            return "Inbox".into();
+        }
+        self.data
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
     fn options(&self) -> &'static [(&'static str, &'static str)] {
         match self.mode {
             Mode::Due => &DUE,
@@ -516,9 +648,39 @@ impl App {
     }
     /// Preview entry under the cursor. Row layout does not depend on colors.
     fn cursor_action(&self) -> Option<Action> {
-        self.preview(&config::Theme::default()).get(self.preview_cursor)?.action.clone()
+        self.preview(&config::Theme::default())
+            .get(self.preview_cursor)?
+            .action
+            .clone()
+    }
+    fn report_tasks(&self) -> Vec<&Task> {
+        let mut tasks = self
+            .data
+            .completed
+            .iter()
+            .filter(|t| {
+                t.extra
+                    .get("completedTime")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|v| sidebar::date(v, &Task::default(), &self.data))
+                    == Some(self.report_day)
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|t| {
+            t.extra
+                .get("completedTime")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        });
+        tasks
     }
     fn task(&self) -> Option<Task> {
+        if self.view() == View::Report {
+            let tasks = self.report_tasks();
+            return tasks
+                .get(self.selected.min(tasks.len().saturating_sub(1)))
+                .map(|t| (*t).clone());
+        }
         self.visible().get(self.selected).map(|t| (*t).clone())
     }
     fn replace_snapshot(&mut self, data: Snapshot) {
@@ -538,10 +700,36 @@ impl App {
     }
     fn clamp(&mut self) {
         self.project = self.project.min(self.sidebar().len().saturating_sub(1));
-        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
+        let count = if matches!(self.view(), View::Habits | View::Focus) {
+            crate::wellness::row_count(&self.view(), &self.data, &self.timer)
+        } else if self.view() == View::Report {
+            self.report_tasks().len()
+        } else {
+            self.visible().len()
+        };
+        self.selected = self.selected.min(count.saturating_sub(1));
+    }
+    fn finish_report(&mut self, day: chrono::NaiveDate) {
+        if let Some(count) = self.report_loading.get_mut(&day) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.report_loading.remove(&day);
+            }
+        }
     }
     fn send(&mut self, job: Job) {
+        if matches!(
+            self.view(),
+            View::Report | View::Habits | View::Focus
+        ) && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
+        {
+            self.message = "Relatório · visualização das atividades concluídas".into();
+            return;
+        }
         if self.demo {
+            if let Job::CheckHabit { ref id, day, goal, value } = job {
+                crate::wellness::record_checkin(&mut self.data, id, day, goal, value);
+            }
             sync::apply(&mut self.data, &job);
             self.confirmed = self.data.clone();
             self.message = "Demonstração · alteração apenas local".into();
@@ -556,16 +744,29 @@ impl App {
             .as_ref()
             .is_some_and(|tx| tx.send(job.clone()).is_ok())
         {
-            if !matches!(job, Job::Refresh) {
+            if !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }) {
                 self.pending_jobs.push_back(job.clone());
                 sync::apply(&mut self.data, &job);
             }
+            if let Job::Report(day) = &job {
+                *self.report_loading.entry(*day).or_default() += 1;
+            }
             self.in_flight += 1;
             self.busy = true;
-            self.message = format!("Salvando… {} operação(ões)", self.in_flight);
+            self.message = match &job {
+                Job::Report(day) => format!("Consultando relatório de {}…", day.format("%d/%m/%Y")),
+                Job::Refresh => "Sincronizando com TickTick…".into(),
+                Job::CheckHabit { .. } => "Registrando hábito no TickTick…".into(),
+                _ => format!("Salvando… {} operação(ões)", self.pending_jobs.len()),
+            };
             self.clamp();
         } else {
-            self.message = "Sincronização indisponível; alteração não enviada.".into();
+            self.message = if matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }) {
+                "Consulta indisponível; verifique sua conexão com o TickTick."
+            } else {
+                "Sincronização indisponível; alteração não enviada."
+            }
+            .into();
         }
     }
     fn movement(&mut self, delta: isize) {
@@ -577,7 +778,13 @@ impl App {
         let max = if self.projects_focus {
             self.sidebar().len().saturating_sub(1)
         } else {
-            self.visible().len().saturating_sub(1)
+            if matches!(self.view(), View::Habits | View::Focus) {
+                crate::wellness::row_count(&self.view(), &self.data, &self.timer).saturating_sub(1)
+            } else if self.view() == View::Report {
+                self.report_tasks().len().saturating_sub(1)
+            } else {
+                self.visible().len().saturating_sub(1)
+            }
         };
         let index = if self.projects_focus {
             &mut self.project
@@ -587,6 +794,9 @@ impl App {
         *index = index.saturating_add_signed(delta).min(max);
         if self.projects_focus {
             self.selected = 0;
+            if self.view() == View::Report {
+                self.send(Job::Report(self.report_day));
+            }
         }
     }
     fn submit(&mut self) -> bool {
@@ -640,6 +850,28 @@ impl App {
                     self.update(t);
                 }
             }
+            Mode::FocusTask => {
+                let choices = self.focus_choices(&text);
+                match choices.get(self.pick.min(choices.len().saturating_sub(1))) {
+                    Some(task) => {
+                        self.message = match task {
+                            Some(t) => format!("Atividade do foco: {}", t.title),
+                            None => "Foco livre".into(),
+                        };
+                        self.timer.set_task(task.clone());
+                        self.persist_timer();
+                    }
+                    None => self.message = format!("Nenhuma tarefa encontrada: {text}"),
+                }
+            }
+            Mode::FocusConfig if !text.is_empty() => match self.timer.set_durations(&text) {
+                Ok(()) => {
+                    let (focus, short, long) = self.timer.durations();
+                    self.message = format!("Foco {focus}min · pausa {short}min · pausa longa {long}min");
+                    self.persist_timer();
+                }
+                Err(e) => self.message = e,
+            },
             Mode::Move if !text.is_empty() => {
                 if let Some(t) = self.target.take() {
                     match self.lists(&text).into_iter().next() {
@@ -678,6 +910,22 @@ impl App {
                 }
             }
             Mode::Command => match text.as_str() {
+                value if value.starts_with("report ") => {
+                    match chrono::NaiveDate::parse_from_str(value[7..].trim(), "%Y-%m-%d") {
+                        Ok(day) if day <= sidebar::today(&self.data) => {
+                            self.report_day = day;
+                            self.project = self
+                                .sidebar()
+                                .iter()
+                                .position(|e| e.view == View::Report)
+                                .unwrap_or(3);
+                            self.selected = 0;
+                            self.send(Job::Report(day));
+                        }
+                        _ => self.message = "Use :report AAAA-MM-DD com uma data até hoje.".into(),
+                    }
+                }
+
                 value if value.starts_with("theme ") => {
                     self.theme_request = Some(value[6..].trim().into())
                 }
@@ -793,10 +1041,31 @@ impl App {
                 _ => (),
             }
         }
+        if self.mode == Mode::FocusTask {
+            let ctrl = key.modifiers.contains(M::CONTROL);
+            let step = match key.code {
+                K::Down | K::Tab => 1,
+                K::Up | K::BackTab => -1,
+                K::Char('n') if ctrl => 1,
+                K::Char('p') if ctrl => -1,
+                _ => 0,
+            };
+            let len = self.focus_choices(&self.input).len().max(1) as isize;
+            if step != 0 {
+                self.pick = (self.pick as isize + step).rem_euclid(len) as usize;
+                return false;
+            }
+            if !matches!(key.code, K::Enter | K::Esc) {
+                self.pick = 0; // The filter changed, so restart from the best match.
+            }
+        }
         if self.mode == Mode::Visual
             && !matches!(
                 key.code,
-                K::Char('v' | 'j' | 'k' | 'J' | 'K' | 'g' | 'G' | '0'..='9') | K::Up | K::Down | K::Esc
+                K::Char('v' | 'j' | 'k' | 'J' | 'K' | 'g' | 'G' | '0'..='9')
+                    | K::Up
+                    | K::Down
+                    | K::Esc
             )
         {
             return false;
@@ -823,6 +1092,171 @@ impl App {
             }
             return false;
         }
+        if matches!(self.view(), View::Habits | View::Focus)
+            && !self.projects_focus
+        {
+            if self.view() == View::Habits && matches!(key.code, K::Char(' ' | 'x') | K::Enter) {
+                if self.busy {
+                    self.message = "Aguarde a confirmação da sincronização.".into();
+                } else if let Some(habit) = crate::wellness::habits(&self.data).get(self.selected).map(|h| (*h).clone())
+                    && let Some(id) = habit["id"].as_str()
+                {
+                    // Space toggles: a completed habit is reset to zero for today.
+                    let goal = crate::wellness::habit_goal(&habit);
+                    let value = if crate::wellness::habit_done(&self.data, &habit) { 0.0 } else { goal };
+                    self.send(Job::CheckHabit { id: id.into(), day: sidebar::today(&self.data), goal, value });
+                }
+                return false;
+            }
+            if matches!(self.view(), View::Focus) {
+                match key.code {
+                    K::Char(' ') | K::Enter => {
+                        self.timer.toggle(self.timer.is_pomodoro());
+                        self.persist_timer();
+                        return false;
+                    }
+                    K::Char('p' | 'w') => {
+                        if self.timer.select_mode(key.code == K::Char('p')) {
+                            self.selected = 0;
+                            self.persist_timer();
+                        } else {
+                            self.message = "Pause o timer antes de trocar de modo.".into();
+                        }
+                        return false;
+                    }
+                    K::Char('s') => {
+                        self.timer.reset(self.timer.is_pomodoro());
+                        self.persist_timer();
+                        return false;
+                    }
+                    K::Char('n') if self.timer.is_pomodoro() => {
+                        self.timer.advance();
+                        self.persist_timer();
+                        return false;
+                    }
+                    K::Char('t') => {
+                        self.mode = Mode::FocusTask;
+                        self.pick = 0;
+                        self.input.clear();
+                        self.input_cursor = 0;
+                        return false;
+                    }
+                    K::Char('c') => {
+                        let (focus, short, long) = self.timer.durations();
+                        self.mode = Mode::FocusConfig;
+                        self.input = format!("{focus} {short} {long}");
+                        self.input_cursor = self.input.chars().count();
+                        return false;
+                    }
+                    _ => (),
+                }
+            }
+            if matches!(
+                key.code,
+                K::Char(
+                    'a' | 'i'
+                        | 'o'
+                        | 'A'
+                        | 'x'
+                        | 'd'
+                        | 'c'
+                        | 'p'
+                        | 'm'
+                        | 'D'
+                        | 'R'
+                        | 'e'
+                        | 'v'
+                        | 'J'
+                        | 'K'
+                        | 'f'
+                        | 'z'
+                ) | K::Enter
+                    | K::Char(' ')
+            ) {
+                return false;
+            }
+        }
+        if self.view() == View::Report {
+            if self.preview_focus {
+                match key.code {
+                    K::Char('h') | K::Left | K::Esc => {
+                        self.focus(1);
+                        return false;
+                    }
+                    K::Char('j') | K::Down => {
+                        self.preview_cursor = self.preview_cursor.saturating_add(1);
+                        return false;
+                    }
+                    K::Char('k') | K::Up => {
+                        self.preview_cursor = self.preview_cursor.saturating_sub(1);
+                        return false;
+                    }
+                    _ => (),
+                }
+            }
+            if matches!(key.code, K::Char('l') | K::Right | K::Enter) && !self.projects_focus {
+                if self.task().is_some() && !self.report_loading.contains_key(&self.report_day) {
+                    self.focus(2);
+                    self.preview_cursor = 0;
+                }
+                return false;
+            }
+            let day = match key.code {
+                K::Char('[') => self.report_day.pred_opt(),
+                K::Char(']') => self
+                    .report_day
+                    .succ_opt()
+                    .filter(|d| *d <= sidebar::today(&self.data)),
+                K::Char('t') => Some(sidebar::today(&self.data)),
+                _ => None,
+            };
+            if let Some(day) = day {
+                self.report_day = day;
+                self.selected = 0;
+                self.preview_cursor = 0;
+                self.focus(1);
+                self.send(Job::Report(day));
+                return false;
+            }
+            if !self.projects_focus
+                && !self.preview_focus
+                && matches!(key.code, K::Char('j' | 'k') | K::Down | K::Up)
+            {
+                self.selected = if matches!(key.code, K::Char('j') | K::Down) {
+                    self.selected.saturating_add(1)
+                } else {
+                    self.selected.saturating_sub(1)
+                };
+                self.clamp();
+                self.preview_cursor = 0;
+                return false;
+            }
+            if matches!(key.code, K::Char('O' | 'u')) && !key.modifiers.contains(M::CONTROL) {
+                return false;
+            }
+            if matches!(
+                key.code,
+                K::Char(
+                    'a' | 'i'
+                        | 'o'
+                        | 'A'
+                        | 'x'
+                        | ' '
+                        | 'd'
+                        | 'c'
+                        | 'p'
+                        | 'm'
+                        | 'D'
+                        | 'R'
+                        | 'e'
+                        | 'v'
+                        | 'J'
+                        | 'K'
+                ) | K::Enter
+            ) {
+                return false;
+            }
+        }
         if let K::Char(c @ '1'..='9') = key.code {
             self.count.push(c);
             return false;
@@ -840,8 +1274,14 @@ impl App {
             K::Char('J') if self.mode == Mode::Visual => self.shift(n as isize),
             K::Char('K') if self.mode == Mode::Visual => self.shift(-(n as isize)),
             K::Char('J' | 'K') if self.preview_focus => {
-                if let (Some(mut t), Some(Action::Checklist(i))) = (self.task(), self.cursor_action()) {
-                    let j = if key.code == K::Char('J') { i + 1 } else { i.wrapping_sub(1) };
+                if let (Some(mut t), Some(Action::Checklist(i))) =
+                    (self.task(), self.cursor_action())
+                {
+                    let j = if key.code == K::Char('J') {
+                        i + 1
+                    } else {
+                        i.wrapping_sub(1)
+                    };
                     if j < t.items.len() {
                         t.items.swap(i, j);
                         renumber(&mut t.items);
@@ -852,11 +1292,20 @@ impl App {
             }
             K::Char('J' | 'K') if !self.projects_focus && self.mode == Mode::Normal => {
                 self.anchor = self.selected;
-                self.shift(if key.code == K::Char('J') { n as isize } else { -(n as isize) });
+                self.shift(if key.code == K::Char('J') {
+                    n as isize
+                } else {
+                    -(n as isize)
+                });
             }
             K::Char('h') if pending == 'z' => {
                 self.hide_done = !self.hide_done;
-                self.message = if self.hide_done { "Concluídos ocultos" } else { "Concluídos visíveis" }.into();
+                self.message = if self.hide_done {
+                    "Concluídos ocultos"
+                } else {
+                    "Concluídos visíveis"
+                }
+                .into();
             }
             K::Char('s') if pending == 'g' && self.preview_focus => self.convert(),
             K::Char('x') if pending == 'g' => self.open_link(),
@@ -969,7 +1418,12 @@ impl App {
             K::Char('c') if pending == 'c' && self.preview_focus => {
                 if let (Some(t), Some(action)) = (self.task(), self.cursor_action()) {
                     let title = match &action {
-                        Action::Subtask(id) => self.data.tasks.iter().find(|s| &s.id == id).map(|s| s.title.clone()),
+                        Action::Subtask(id) => self
+                            .data
+                            .tasks
+                            .iter()
+                            .find(|s| &s.id == id)
+                            .map(|s| s.title.clone()),
                         _ => preview::label(&t, &action),
                     };
                     if let Some(title) = title {
@@ -992,7 +1446,11 @@ impl App {
                     self.send(Job::Complete(t));
                 }
             }
-            K::Char('r') => self.send(Job::Refresh),
+            K::Char('r') => self.send(if self.view() == View::Report {
+                Job::Report(self.report_day)
+            } else {
+                Job::Refresh
+            }),
             K::Char('?') => self.mode = Mode::Help,
             K::Char('f') => {
                 let zoom = !self.zoom;
@@ -1008,7 +1466,9 @@ impl App {
             K::Char('<') => self.split = self.split.saturating_sub(5).max(15),
             K::Char('>') => self.split = (self.split + 5).min(70),
             K::Enter => self.focus(2),
-            K::Char('v') if !self.projects_focus && !self.preview_focus && self.task().is_some() => {
+            K::Char('v')
+                if !self.projects_focus && !self.preview_focus && self.task().is_some() =>
+            {
                 self.mode = Mode::Visual;
                 self.anchor = self.selected;
             }
@@ -1047,13 +1507,21 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), event::DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            event::DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
     enable_raw_mode()?;
     let _restore = Restore;
-    execute!(io::stdout(), EnterAlternateScreen, event::EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        event::EnableBracketedPaste
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let api = if !demo && api.is_none() {
         match crate::token_ui::configure(&mut terminal, &config)? {
@@ -1078,14 +1546,21 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         (None, None)
     };
     let mut app = App {
+        timer: if demo {
+            Default::default()
+        } else {
+            crate::wellness::Timer::load()
+        },
         confirmed: data.clone(),
         pending_jobs: VecDeque::new(),
         in_flight: 0,
+        report_loading: Default::default(),
+        report_day: sidebar::today(&data),
         data,
         project: 0,
         selected: 0,
         anchor: 0,
-        projects_focus: false,
+        projects_focus: true,
         preview_focus: false,
         preview_cursor: 0,
         preview_width: 60,
@@ -1129,6 +1604,11 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 app.busy = app.in_flight > 0;
                 app.last_sync = Instant::now();
                 match event {
+                    sync::Event::Report(day, d, m) => {
+                        app.finish_report(day);
+                        app.replace_snapshot(d);
+                        app.message = m;
+                    }
                     sync::Event::Data(d, m) => {
                         app.replace_snapshot(d);
                         app.message = m;
@@ -1185,6 +1665,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 app.data = Snapshot::default();
                 app.confirmed = Snapshot::default();
                 app.pending_jobs.clear();
+                app.report_loading.clear();
                 app.project = 0;
                 app.selected = 0;
                 app.query.clear();
@@ -1342,7 +1823,7 @@ fn edit(task: &Task) -> Result<Option<(String, String)>> {
     file.flush()?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or("vi".into());
+        .unwrap_or_else(|_| if cfg!(windows) { "notepad.exe" } else { "vi" }.into());
     // Execute the configured editor as a program; arguments can be supplied through an editor wrapper.
     let status = std::process::Command::new(&editor)
         .arg(file.path())
@@ -1381,6 +1862,13 @@ fn demo_data() -> Snapshot {
             Task{id:"read".into(),project_id:"personal".into(),title:"Ler um capítulo".into(),content:"### Leitura da semana\n- [ ] Separar 20 minutos\n- [ ] Fazer anotações".into(),..Default::default()}
         ],
         groups:vec![crate::api::ProjectGroup{id:"work-group".into(),name:"Trabalho".into(),sort_order:0},crate::api::ProjectGroup{id:"personal-group".into(),name:"Pessoal".into(),sort_order:1}],
+        user_name: Some("Alex".into()),
+        report_days: vec![chrono::Utc::now().with_timezone(&chrono_tz::America::Recife).date_naive()],
+        completed: ["Revisar proposta com o time", "Publicar correção", "Organizar a semana"].iter().enumerate().map(|(i, title)| Task {
+            id: format!("done-{i}"), project_id: "work".into(), title: (*title).into(), status: 2,
+            extra: serde_json::from_value(serde_json::json!({"completedTime": chrono::Utc::now().to_rfc3339()})).unwrap(),
+            ..Default::default()
+        }).collect(),
         inbox_id:Some("inbox".into()), time_zone:Some("America/Recife".into()),..Default::default()
     }
 }
@@ -1395,11 +1883,27 @@ fn body_area(area: Rect) -> Rect {
 }
 fn preview_area(area: Rect, app: &App) -> Rect {
     let body = body_area(area);
+    if matches!(app.view(), View::Habits | View::Focus) {
+        return Rect::default();
+    }
+    if app.view() == View::Report {
+        return if app.preview_focus {
+            body
+        } else {
+            Rect::default()
+        };
+    }
     if app.preview_focus && (app.zoom || body.width < 110) {
         return body;
     }
     if app.details && body.width >= 110 {
-        let sidebar = if app.hide_lists { 0 } else if body.width >= 150 { 25 } else { 21 };
+        let sidebar = if app.hide_lists {
+            0
+        } else if body.width >= 150 {
+            25
+        } else {
+            21
+        };
         return Layout::horizontal([
             Constraint::Length(sidebar),
             Constraint::Percentage(app.split),
@@ -1409,6 +1913,348 @@ fn preview_area(area: Rect, app: &App) -> Rect {
     }
     Rect::default()
 }
+pub(crate) fn report_number(value: usize) -> Vec<Line<'static>> {
+    const DIGITS: [[&str; 3]; 10] = [
+        ["█▀█", "█ █", "▀▀▀"],
+        [" ▄█", "  █", "  ▀"],
+        ["▀▀█", "█▀▀", "▀▀▀"],
+        ["▀▀█", " ▀█", "▀▀▀"],
+        ["█ █", "▀▀█", "  ▀"],
+        ["█▀▀", "▀▀█", "▀▀▀"],
+        ["█▀▀", "█▀█", "▀▀▀"],
+        ["▀▀█", "  █", "  ▀"],
+        ["█▀█", "█▀█", "▀▀▀"],
+        ["█▀█", "▀▀█", "▀▀▀"],
+    ];
+    (0..3)
+        .map(|row| {
+            Line::from(
+                value
+                    .to_string()
+                    .bytes()
+                    .map(|b| DIGITS[(b - b'0') as usize][row])
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
+        .collect()
+}
+fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
+    let success = preview::color(&theme.success);
+    let muted = preview::color(&theme.muted);
+    let accent = preview::color(&theme.accent);
+    let fg = preview::color(&theme.foreground);
+    let border = preview::color(&theme.border);
+    let shell = |title: &str| {
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .title(format!(" {title} "))
+            .title_style(Style::default().fg(muted))
+    };
+    let sections = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("‹  ", Style::default().fg(accent)),
+            Span::styled(
+                app.report_day.format("%d / %m / %Y").to_string(),
+                Style::default().fg(fg).bold(),
+            ),
+            Span::styled("  ›", Style::default().fg(accent)),
+        ]))
+        .alignment(Alignment::Center),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(
+            if app.data.report_days.contains(&app.report_day)
+                || app.report_loading.contains_key(&app.report_day)
+            {
+                "[ anterior   ] seguinte   t hoje   :report AAAA-MM-DD"
+            } else {
+                "Registros locais · histórico remoto indisponível · r tentar novamente"
+            },
+        )
+        .style(Style::default().fg(muted))
+        .alignment(Alignment::Center),
+        sections[2],
+    );
+    let loading = app.report_loading.contains_key(&app.report_day);
+    let tasks = app.report_tasks();
+    let focus = app.data.focus_days.iter().find(|v| v.day == app.report_day);
+    let has_focus = focus.is_some_and(|v| !v.totals.is_empty());
+    if loading || (tasks.is_empty() && !has_focus) {
+        let frames = ["◐", "◓", "◑", "◒"];
+        let spinner = frames[(app.last_sync.elapsed().as_millis() / 120 % 4) as usize];
+        let remote = app.data.report_days.contains(&app.report_day);
+        let (symbol, title, subtitle) = if loading {
+            (
+                spinner,
+                "Buscando suas conquistas…",
+                "Consultando o TickTick para este dia",
+            )
+        } else if remote {
+            (
+                "☀",
+                "Um dia sem conclusões registradas",
+                "Seu ritmo também tem espaço para uma pausa.",
+            )
+        } else {
+            (
+                "◌",
+                "Histórico indisponível",
+                "Não foi possível consultar este dia no TickTick. Use r para tentar novamente.",
+            )
+        };
+        let center = centered(sections[1], 76, 7);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled(symbol, Style::default().fg(accent).bold()),
+                Line::default(),
+                Line::styled(title, Style::default().fg(fg).bold()),
+                Line::default(),
+                Line::styled(subtitle, Style::default().fg(muted)),
+                Line::default(),
+                Line::styled(
+                    if loading {
+                        ""
+                    } else if focus.is_some_and(|v| v.error.is_some()) {
+                        "Tempo focado indisponível"
+                    } else {
+                        "Foco · sem sessões registradas neste dia"
+                    },
+                    Style::default().fg(muted),
+                ),
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+            center,
+        );
+        return;
+    }
+    let total = tasks.len();
+    let mut groups = std::collections::BTreeMap::<String, usize>::new();
+    let project_name = |t: &Task| {
+        app.data
+            .projects
+            .iter()
+            .find(|p| p.id == t.project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or(if app.data.inbox_id.as_ref() == Some(&t.project_id) {
+                "Inbox"
+            } else {
+                "Lista"
+            })
+    };
+    for task in &tasks {
+        *groups.entry(project_name(task).to_owned()).or_default() += 1;
+    }
+
+    let focus_columns = if area.width >= 90 {
+        3
+    } else if area.width >= 50 {
+        2
+    } else {
+        1
+    };
+    let focus_rows = focus.map_or(1, |v| v.totals.len().max(1).div_ceil(focus_columns));
+    let dashboard = Layout::vertical([
+        Constraint::Length(if area.height >= 18 { 6 } else { 3 }),
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length((focus_rows + 2).min(u16::MAX as usize) as u16),
+        Constraint::Length(4),
+    ])
+    .split(sections[1]);
+    let stats = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+        .spacing(1)
+        .split(dashboard[0]);
+    for (i, (label, value, color)) in [
+        ("CONCLUSÕES", total, success),
+        ("LISTAS", groups.len(), accent),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let block = shell(label);
+        let inner = block.inner(stats[i]);
+        f.render_widget(block, stats[i]);
+        if inner.height >= 3 && inner.width >= value.to_string().len() as u16 * 4 {
+            f.render_widget(
+                Paragraph::new(report_number(value))
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(color).bold()),
+                centered(inner, inner.width, 3),
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(value.to_string())
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(color).bold()),
+                inner,
+            );
+        }
+    }
+    let mut priorities = vec![Span::styled("Prioridades  ", Style::default().fg(muted))];
+    for (i, (priority, label, color)) in [
+        (5, "alta", preview::color(&theme.danger)),
+        (3, "média", accent),
+        (1, "baixa", success),
+        (0, "sem prioridade", muted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i > 0 {
+            priorities.push(Span::styled("  ·  ", Style::default().fg(muted)));
+        }
+        priorities.push(Span::styled(
+            format!(
+                "{} {label}",
+                tasks.iter().filter(|t| t.priority == priority).count()
+            ),
+            Style::default().fg(color),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(priorities)).alignment(Alignment::Center),
+        dashboard[1],
+    );
+    let columns = Layout::horizontal([
+        Constraint::Percentage(if area.width >= 72 { 66 } else { 100 }),
+        Constraint::Min(0),
+    ])
+    .spacing(if area.width >= 72 { 1 } else { 0 })
+    .split(dashboard[2]);
+    let selected = app.selected.min(total.saturating_sub(1));
+    let list_block = shell(&format!("✓ Conquistas  {}/{}", selected + 1, total));
+    let inner = list_block.inner(columns[0]);
+    let project_width = if inner.width >= 50 { 16 } else { 0 };
+    let title_width = inner.width.saturating_sub(project_width + 5) as usize;
+    let rows = tasks.iter().enumerate().map(|(i, t)| {
+        Row::new(vec![
+            Cell::from("✓").style(Style::default().fg(success)),
+            Cell::from(truncate(&t.title.replace(['\n', '\r'], " "), title_width)),
+            Cell::from(truncate(project_name(t), project_width as usize))
+                .style(Style::default().fg(muted)),
+        ])
+        .style(Style::default().fg(if i == selected { accent } else { fg }))
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(project_width),
+        ],
+    )
+    .column_spacing(1)
+    .block(list_block)
+    .row_highlight_style(Style::default().bg(preview::color(&theme.selection)).bold());
+    f.render_stateful_widget(
+        table,
+        columns[0],
+        &mut TableState::default().with_selected((!tasks.is_empty()).then_some(selected)),
+    );
+    if columns[1].width > 0 {
+        let block = shell("Por lista");
+        let inner = block.inner(columns[1]);
+        f.render_widget(block, columns[1]);
+        let mut groups = groups.into_iter().collect::<Vec<_>>();
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (i, (name, count)) in groups.iter().take(inner.height as usize / 3).enumerate() {
+            let y = inner.y + i as u16 * 3;
+            f.render_widget(
+                Paragraph::new(truncate(name, inner.width as usize)).style(Style::default().fg(fg)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            f.render_widget(
+                Gauge::default()
+                    .ratio(*count as f64 / total as f64)
+                    .gauge_style(
+                        Style::default()
+                            .fg(if i % 2 == 0 { success } else { accent })
+                            .bg(preview::color(&theme.code_background)),
+                    )
+                    .label(Span::styled(
+                        count.to_string(),
+                        Style::default()
+                            .fg(preview::color(&theme.panel))
+                            .bg(if i % 2 == 0 { success } else { accent })
+                            .bold(),
+                    )),
+                Rect::new(inner.x, y + 1, inner.width, 1),
+            );
+        }
+    }
+    let focus_total = focus.map_or(0, |v| v.totals.iter().map(|t| t.seconds).sum());
+    let focus_title = if has_focus {
+        format!(
+            "Tempo focado por lista · {}",
+            crate::focus::duration(focus_total)
+        )
+    } else {
+        "Tempo focado por lista".into()
+    };
+    let focus_block = shell(&focus_title);
+    let focus_inner = focus_block.inner(dashboard[3]);
+    f.render_widget(focus_block, dashboard[3]);
+    if let Some(day) = focus.filter(|d| d.error.is_none() && !d.totals.is_empty()) {
+        let cols = Layout::horizontal(vec![
+            Constraint::Ratio(1, focus_columns as u32);
+            focus_columns
+        ])
+        .spacing(2)
+        .split(focus_inner);
+        for (col, rect) in cols.iter().enumerate() {
+            let rows = day
+                .totals
+                .iter()
+                .skip(col * focus_rows)
+                .take(focus_rows)
+                .map(|t| {
+                    Row::new(vec![
+                        Cell::from(truncate(&t.label, rect.width.saturating_sub(12) as usize))
+                            .style(Style::default().fg(fg)),
+                        Cell::from(crate::focus::duration(t.seconds))
+                            .style(Style::default().fg(success).bold()),
+                    ])
+                });
+            f.render_widget(
+                Table::new(rows, [Constraint::Min(0), Constraint::Length(11)]),
+                *rect,
+            );
+        }
+    } else {
+        f.render_widget(
+            Paragraph::new(if focus.is_some_and(|d| d.error.is_some()) {
+                "Não foi possível consultar o foco · r tentar novamente"
+            } else {
+                "Nenhuma sessão de foco registrada neste dia"
+            })
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(muted)),
+            focus_inner,
+        );
+    }
+    let detail = shell("Selecionada · l / Enter ver atividade");
+    f.render_widget(
+        Paragraph::new(tasks.get(selected).map_or(
+            "Nenhuma tarefa concluída · o tempo focado também é progresso",
+            |t| t.title.as_str(),
+        ))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(fg))
+        .block(detail),
+        dashboard[4],
+    );
+}
+
 fn draw(f: &mut Frame, app: &App, c: &Config) {
     let t = &c.theme;
     let fg = preview::color(&t.foreground);
@@ -1454,7 +2300,13 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Paragraph::new(Line::from(vec![
             Span::styled(project, Style::default().fg(muted)),
             Span::styled(
-                format!("  /  {} pendentes", app.visible().len()),
+                if matches!(app.view(), View::Habits | View::Focus) {
+                    "  /  Hábitos e foco".into()
+                } else if app.view() == View::Report {
+                    "  /  Seu progresso".into()
+                } else {
+                    format!("  /  {} pendentes", app.visible().len())
+                },
                 Style::default().fg(muted),
             ),
         ])),
@@ -1462,13 +2314,15 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     );
     f.render_widget(
         Paragraph::new(Span::styled(
-            if app.demo {
-                "DEMO · local"
-            } else if app.busy {
-                "◌ Sincronizando"
-            } else {
-                "● Sincronizado"
-            },
+            app.data
+                .user_name
+                .as_deref()
+                .or(c.user_name.as_deref())
+                .unwrap_or(if app.demo {
+                    "Pessoa de exemplo"
+                } else {
+                    "Minha conta"
+                }),
             Style::default().fg(if app.busy {
                 accent
             } else {
@@ -1491,18 +2345,31 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .style(Style::default().bg(panel))
     };
     let preview = preview_area(f.area(), app);
-    let fullscreen = app.preview_focus && (app.zoom || rows[1].width < 110);
+    let fullscreen =
+        app.preview_focus && (app.view() == View::Report || app.zoom || rows[1].width < 110);
     if !fullscreen {
         let cols = if preview.width > 0 {
             Layout::horizontal([
-                Constraint::Length(if app.hide_lists { 0 } else if rows[1].width >= 150 { 25 } else { 21 }),
+                Constraint::Length(if app.hide_lists {
+                    0
+                } else if rows[1].width >= 150 {
+                    25
+                } else {
+                    21
+                }),
                 Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
             .split(rows[1])
         } else {
             Layout::horizontal([
-                Constraint::Length(if app.hide_lists { 0 } else if rows[1].width < 55 { 17 } else { 25 }),
+                Constraint::Length(if app.hide_lists {
+                    0
+                } else if rows[1].width < 55 {
+                    17
+                } else {
+                    25
+                }),
                 Constraint::Min(0),
             ])
             .split(rows[1])
@@ -1516,7 +2383,10 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     View::All => "≡ ",
                     View::Today => "◷ ",
                     View::Inbox => "▣ ",
-                    View::Upcoming => "▦ ",
+                    View::Tomorrow => "▦ ",
+                    View::Report => "★ ",
+                    View::Habits => "✓ ",
+                    View::Focus => "◴ ",
                     View::Group(id) => {
                         if app.collapsed.contains(&format!("group:{id}")) {
                             "▸ "
@@ -1527,18 +2397,41 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     View::Project(_) => "  ",
                 };
                 let selected = i == app.project;
-                let mut lines = vec![Line::from(vec![
-                    Span::styled(if selected { "▎" } else { " " }, Style::default().fg(accent)),
-                    Span::styled(
-                        format!(" {}{marker}", "  ".repeat(e.depth)),
-                        Style::default().fg(if i < 4 { accent } else { muted }),
-                    ),
-                    Span::raw(e.name.clone()),
-                    Span::styled(format!("  {}", e.count), Style::default().fg(muted)),
-                ])
-                .style(if selected { Style::default().bg(selection).fg(accent) } else { Style::default() })];
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            if selected { "▎" } else { " " },
+                            Style::default().fg(accent),
+                        ),
+                        Span::styled(
+                            format!(" {}{marker}", "  ".repeat(e.depth)),
+                            Style::default().fg(if i < 6 || e.view == View::All {
+                                accent
+                            } else {
+                                muted
+                            }),
+                        ),
+                        Span::raw(e.name.clone()),
+                        Span::styled(
+                            if matches!(
+                                e.view,
+                                View::Report | View::Habits | View::Focus
+                            ) {
+                                String::new()
+                            } else {
+                                format!("  {}", e.count)
+                            },
+                            Style::default().fg(muted),
+                        ),
+                    ])
+                    .style(if selected {
+                        Style::default().bg(selection).fg(accent)
+                    } else {
+                        Style::default()
+                    }),
+                ];
                 // The "LISTAS" header lives in item 3, so highlight only the first line by hand.
-                if i == 3 {
+                if i == 5 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
                         "  LISTAS",
@@ -1551,10 +2444,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(app.project));
         f.render_stateful_widget(
-            List::new(projects)
-                .block(
-                    block(" 1 · Listas ".into(), app.projects_focus).padding(Padding::vertical(1)),
-                ),
+            List::new(projects).block(
+                block(" 1 · Listas ".into(), app.projects_focus).padding(Padding::vertical(1)),
+            ),
             cols[0],
             &mut state,
         );
@@ -1564,6 +2456,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         // Borders, padding and the highlight symbol take 5 columns.
         let row_width = cols[1].width.saturating_sub(5) as usize;
         let visual = (app.mode == Mode::Visual).then(|| app.range());
+        let show_list = matches!(app.view(), View::Today | View::Tomorrow);
         let items = tree
             .iter()
             .enumerate()
@@ -1603,7 +2496,12 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 if row.children > 0 && app.collapsed.contains(&task.id) {
                     badges.push(pill(format!("+{}", row.children), muted));
                 }
-                if task.extra.get("reminders").and_then(|v| v.as_array()).is_some_and(|r| !r.is_empty()) {
+                if task
+                    .extra
+                    .get("reminders")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|r| !r.is_empty())
+                {
                     badges.push(pill("⏰".into(), muted));
                 }
                 let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
@@ -1614,9 +2512,22 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 {
                     badges.push(pill(label, if overdue { danger } else { accent }));
                 }
+                // Date views mix lists, so name the list (subtasks share their parent's).
+                if show_list && row.depth == 0 {
+                    let name = app.project_name(&task.project_id);
+                    if !name.is_empty() {
+                        badges.push(Span::styled(
+                            format!("  {}", truncate(&name, 16)),
+                            Style::default().fg(muted).italic(),
+                        ));
+                    }
+                }
                 let left = format!(" {indent}{branch}○ ");
                 let right: usize = badges.iter().map(Span::width).sum();
-                let title = truncate(&task.title, row_width.saturating_sub(left.width() + right + 1));
+                let title = truncate(
+                    &task.title,
+                    row_width.saturating_sub(left.width() + right + 1),
+                );
                 let pad = row_width.saturating_sub(left.width() + title.width() + right);
                 let mut line = vec![
                     Span::styled(left, Style::default().fg(muted)),
@@ -1626,7 +2537,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 line.extend(badges);
                 let item = ListItem::new(Line::from(line));
                 match visual {
-                    Some((lo, hi)) if (lo..=hi).contains(&i) => item.style(Style::default().bg(selection)),
+                    Some((lo, hi)) if (lo..=hi).contains(&i) => {
+                        item.style(Style::default().bg(selection))
+                    }
                     _ => item,
                 }
             })
@@ -1636,7 +2549,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         } else {
             Some(app.selected)
         });
-        let title = if app.query.is_empty() {
+        let title = if matches!(app.view(), View::Habits | View::Focus) {
+            format!(" {} ", project)
+        } else if app.view() == View::Report {
+            " ★ · Relatório do dia ".into()
+        } else if app.query.is_empty() {
             format!(" 2 · Tarefas  {} ", tree.len())
         } else {
             format!(" 2 · Busca /{} ", app.query)
@@ -1653,7 +2570,19 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             cols[1],
             &mut state,
         );
-        if tree.is_empty() {
+        if matches!(app.view(), View::Habits | View::Focus) {
+            crate::wellness::draw(
+                f,
+                inner,
+                &app.view(),
+                &app.data,
+                &app.timer,
+                app.selected,
+                t,
+            );
+        } else if app.view() == View::Report {
+            draw_report(f, inner, app, t);
+        } else if tree.is_empty() {
             f.render_widget(
                 Paragraph::new(if app.busy {
                     "Buscando suas tarefas…"
@@ -1661,22 +2590,27 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     "Tudo em dia.\n\nSelecione uma lista e pressione a\npara adicionar uma tarefa."
                 })
                 .style(Style::default().fg(muted))
-                .wrap(Wrap { trim: false }),
-                inner.inner(Margin::new(1, 1)),
+                .wrap(Wrap { trim: false })
+                .alignment(Alignment::Center),
+                centered(inner, 64, 5),
             );
         }
     }
     if preview.width > 0 {
         let document = app.preview(t);
         let preview_block = block(
-            format!(
-                " 3 · Preview{} ",
-                if app.preview_focus {
-                    " · j/k navegar"
-                } else {
-                    ""
-                }
-            ),
+            if app.view() == View::Report {
+                " Atividade concluída · h / Esc voltar ".into()
+            } else {
+                format!(
+                    " 3 · Preview{} ",
+                    if app.preview_focus {
+                        " · j/k navegar"
+                    } else {
+                        ""
+                    }
+                )
+            },
             app.preview_focus,
         )
         .padding(Padding::new(2, 2, 1, 1));
@@ -1700,7 +2634,16 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         }
     }
     f.render_widget(
-        Paragraph::new(format!(" {}", app.message)).style(Style::default().fg(muted)),
+        Paragraph::new(format!(
+            " {}{}",
+            if app.busy {
+                "◌ Sincronizando com TickTick · "
+            } else {
+                ""
+            },
+            app.message
+        ))
+        .style(Style::default().fg(muted)),
         rows[2],
     );
     let prompt = match app.mode {
@@ -1723,9 +2666,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Mode::Add | Mode::Subtask | Mode::Rename | Mode::ItemRename => {
             " INSERIR  Enter salvar · Esc cancelar".into()
         }
-        Mode::Item => {
-            " CHECKLIST  Enter adiciona outro · colar várias linhas · Esc termina".into()
-        }
+        Mode::Item => " CHECKLIST  Enter adiciona outro · colar várias linhas · Esc termina".into(),
         Mode::Move => {
             let names = app
                 .lists(&app.input)
@@ -1736,17 +2677,32 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             format!(
                 " MOVER  Lista: {}   → {}",
                 input_prompt(&app.input, app.input_cursor),
-                if names.is_empty() { "nenhuma lista".into() } else { names.join(" · ") }
+                if names.is_empty() {
+                    "nenhuma lista".into()
+                } else {
+                    names.join(" · ")
+                }
             )
         }
         Mode::Visual => " VISUAL  j/k estender · J/K mover · v/Esc sair".into(),
+        Mode::FocusTask => format!(
+            " ATIVIDADE  Buscar: {}   ↑/↓ escolher · Enter iniciar com ela · Esc cancelar",
+            input_prompt(&app.input, app.input_cursor)
+        ),
+        Mode::FocusConfig => " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into(),
         Mode::Due => " PRAZO  j/k escolher · Enter salvar · Tab completar · Esc cancelar".into(),
-        Mode::Remind => " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into(),
+        Mode::Remind => {
+            " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into()
+        }
         Mode::Delete => {
             " EXCLUIR  Confirmar exclusão permanente? y / qualquer tecla cancela".into()
         }
         _ => {
-            if app.preview_focus {
+            if matches!(app.view(), View::Focus) {
+                " FOCO  Space iniciar/pausar · t atividade · c tempos · n próxima fase · s zerar · p/w modo · h listas".into()
+            } else if app.view() == View::Habits {
+                " HÁBITOS  j/k rolar · Space concluir/desmarcar · h listas · r sincronizar · ? ajuda".into()
+            } else if app.preview_focus {
                 " PREVIEW  x marcar · o/O novo item · J/K mover · cc renomear · dd apagar · u desfazer · gs subtarefa · zh ocultar feitos · h voltar".into()
             } else {
                 " NORMAL  h/j/k/l navegar · a nova · J/K mover · m lista · D prazo · R lembrete · za recolher · ? ajuda".into()
@@ -1781,7 +2737,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled(
-                if due { " Outra data: " } else { " Selecionados: " },
+                if due {
+                    " Outra data: "
+                } else {
+                    " Selecionados: "
+                },
                 Style::default().fg(muted),
             ),
             Span::raw(input_prompt(&app.input, app.input_cursor)),
@@ -1796,7 +2756,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         ));
         let current = app.target.as_ref().and_then(|t| {
             let all_day = t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
-            t.due_date.as_deref().map(|d| fields::format_due(d, all_day, app.tz()))
+            t.due_date
+                .as_deref()
+                .map(|d| fields::format_due(d, all_day, app.tz()))
         });
         let title = match (due, current) {
             (true, Some(c)) => format!(" Prazo · atual {c} "),
@@ -1812,12 +2774,65 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             area,
         );
     }
+    if app.mode == Mode::FocusTask {
+        let choices = app.focus_choices(&app.input);
+        let pick = app.pick.min(choices.len().saturating_sub(1));
+        let shown = 10;
+        let first = pick.saturating_sub(shown - 1);
+        let width = f.area().width.saturating_sub(4).min(64);
+        let mut lines = choices
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(shown)
+            .map(|(i, choice)| {
+                let style = if i == pick {
+                    Style::default().bg(selection).fg(accent)
+                } else {
+                    Style::default()
+                };
+                let (title, list) = match choice {
+                    Some(t) => (
+                        t.title.replace(['\n', '\r'], " "),
+                        app.data
+                            .tasks
+                            .iter()
+                            .find(|x| x.id == t.id)
+                            .map(|x| app.project_name(&x.project_id))
+                            .unwrap_or_default(),
+                    ),
+                    None => ("○ Foco livre (sem tarefa)".into(), String::new()),
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {title} "), style),
+                    Span::styled(list, Style::default().fg(muted)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(Line::styled(" Nenhuma tarefa encontrada", Style::default().fg(muted)));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled(" Buscar: ", Style::default().fg(muted)),
+            Span::raw(input_prompt(&app.input, app.input_cursor)),
+        ]));
+        let area = centered(f.area(), width, lines.len() as u16 + 3);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(panel).fg(fg))
+                .block(block(" Atividade do foco ".into(), true).padding(Padding::new(1, 1, 1, 0))),
+            area,
+        );
+    }
     let title = match app.mode {
         Mode::Add => Some(" Nova tarefa "),
         Mode::Subtask => Some(" Subtarefa "),
         Mode::Item => Some(" Novo item "),
         Mode::ItemRename => Some(" Item "),
         Mode::Rename => Some(" Título "),
+        Mode::FocusConfig => Some(" Foco · pausa · pausa longa (minutos) "),
         _ => None,
     };
     if let Some(title) = title {
@@ -1825,7 +2840,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         let text = input_prompt(&app.input, app.input_cursor);
         let width = f.area().width.saturating_sub(4).min(72);
         let inner = width.saturating_sub(4).max(1) as usize;
-        let lines = text.lines().map(|l| l.width() / inner + 1).sum::<usize>().max(1) as u16;
+        let lines = text
+            .lines()
+            .map(|l| l.width() / inner + 1)
+            .sum::<usize>()
+            .max(1) as u16;
         let area = centered(f.area(), width, lines + 3);
         f.render_widget(Clear, area);
         f.render_widget(
@@ -1837,9 +2856,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         );
     }
     if app.mode == Mode::Help {
-        let area = centered(f.area(), 84, 35);
+        let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Zerar timer local\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
 }
 const DUE: [(&str, &str); 4] = [
@@ -1886,6 +2905,7 @@ mod tests {
     use super::*;
     fn app() -> App {
         let mut a = App {
+            timer: Default::default(),
             confirmed: Snapshot::default(),
             pending_jobs: VecDeque::new(),
             in_flight: 0,
@@ -1906,7 +2926,9 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
-            project: 0,
+            report_loading: Default::default(),
+            report_day: chrono::Local::now().date_naive(),
+            project: 6,
             selected: 0,
             anchor: 0,
             projects_focus: false,
@@ -1945,6 +2967,58 @@ mod tests {
         a.key(KeyEvent::new(K::Char(c), M::NONE));
     }
     #[test]
+    fn wellness_views_render_and_block_task_mutations() {
+        let mut a = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        for view in [View::Habits, View::Focus] {
+            a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
+            a.send(Job::Delete(a.data.tasks[0].clone()));
+            assert!(rx.try_recv().is_err());
+            for size in [(30, 10), (100, 30)] {
+                let backend = ratatui::backend::TestBackend::new(size.0, size.1);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn space_toggles_habit_completion() {
+        let mut a = app();
+        a.data.habits = vec![serde_json::json!({"id":"h","name":"Ler","goal":1.0,"repeatRule":"RRULE:FREQ=DAILY"})];
+        a.project = a.sidebar().iter().position(|e| e.view == View::Habits).unwrap();
+        a.projects_focus = false;
+        let habit = a.data.habits[0].clone();
+        press(&mut a, ' ');
+        assert!(crate::wellness::habit_done(&a.data, &habit));
+        press(&mut a, ' ');
+        assert!(!crate::wellness::habit_done(&a.data, &habit));
+    }
+    #[test]
+    fn focus_picks_activity_and_durations() {
+        let mut a = app();
+        a.project = a.sidebar().iter().position(|e| e.view == View::Focus).unwrap();
+        a.projects_focus = false;
+        let title = a.data.tasks[3].title.clone();
+        press(&mut a, 't');
+        assert!(a.mode == Mode::FocusTask);
+        for c in title.chars() {
+            press(&mut a, c);
+        }
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        Terminal::new(backend).unwrap().draw(|f| draw(f, &a, &Config::default())).unwrap();
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.timer.task().map(|t| t.title.clone()), Some(title));
+        press(&mut a, 'c');
+        assert!(a.mode == Mode::FocusConfig);
+        a.input = "45 10 30".into();
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.timer.durations(), (45, 10, 30));
+        press(&mut a, 't');
+        a.key(KeyEvent::from(K::Enter)); // Empty query: first choice is free focus.
+        assert!(a.timer.task().is_none());
+    }
+    #[test]
     fn vim_counts_boundaries_and_project_focus() {
         let mut a = app();
         press(&mut a, '5');
@@ -1957,7 +3031,7 @@ mod tests {
         assert_eq!(a.selected, 0);
         press(&mut a, 'h');
         press(&mut a, 'j');
-        assert_eq!(a.project, 1);
+        assert_eq!(a.view(), View::All);
         assert_eq!(a.selected, 0);
         press(&mut a, 'l');
         press(&mut a, 'k');
@@ -1971,7 +3045,13 @@ mod tests {
         }
         a.data.tasks[5].parent_id = Some("4".into());
         a.confirmed = a.data.clone();
-        let ids = |a: &App| a.visible().iter().take(8).map(|t| t.id.clone()).collect::<Vec<_>>();
+        let ids = |a: &App| {
+            a.visible()
+                .iter()
+                .take(8)
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>()
+        };
         a.selected = 3;
         press(&mut a, 'v');
         press(&mut a, 'j');
@@ -2021,7 +3101,14 @@ mod tests {
             a.key(KeyEvent::new(code, M::NONE));
         }
         assert!(a.mode == Mode::Normal);
-        let titles = |a: &App| a.task().unwrap().items.iter().map(|i| i.title.clone()).collect::<Vec<_>>();
+        let titles = |a: &App| {
+            a.task()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.title.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(titles(&a), ["um", "dois"]);
         a.preview_cursor = a
             .preview(&config::Theme::default())
@@ -2053,7 +3140,10 @@ mod tests {
         a.data.tasks[0].content = "- [x] alfa\n- [ ] beta\nfim".into();
         a.focus(2);
         // Entering the preview lands on the first open checkbox.
-        assert!(matches!(a.cursor_action(), Some(Action::Markdown { checked: false, .. })));
+        assert!(matches!(
+            a.cursor_action(),
+            Some(Action::Markdown { checked: false, .. })
+        ));
         typing(&mut a, "cc");
         a.key(KeyEvent::new(K::Char('u'), M::CONTROL));
         typing(&mut a, "gama\r");
@@ -2063,7 +3153,14 @@ mod tests {
         typing(&mut a, "u");
         assert_eq!(a.task().unwrap().content, "- [x] alfa\n- [ ] gama\nfim");
 
-        let titles = |a: &App| a.task().unwrap().items.iter().map(|i| i.title.clone()).collect::<Vec<_>>();
+        let titles = |a: &App| {
+            a.task()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.title.clone())
+                .collect::<Vec<_>>()
+        };
         typing(&mut a, "a");
         a.paste("- [ ] um\n- [x] três\n");
         typing(&mut a, "\x1b");
@@ -2075,12 +3172,21 @@ mod tests {
         assert_eq!(titles(&a), ["dois", "um", "três"]);
         assert_eq!(a.task().unwrap().items[0].extra["sortOrder"], 0);
         typing(&mut a, "zh");
-        assert!(!a.preview(&config::Theme::default()).iter().any(|r| r.action == Some(Action::Checklist(2))));
+        assert!(
+            !a.preview(&config::Theme::default())
+                .iter()
+                .any(|r| r.action == Some(Action::Checklist(2)))
+        );
         a.cursor_to(Action::Checklist(0));
         typing(&mut a, "gs");
         assert_eq!(titles(&a), ["um", "três"]);
         assert_eq!(a.task().unwrap().id, "0");
-        assert!(a.data.tasks.iter().any(|t| t.parent_id.as_deref() == Some("0") && t.title == "dois"));
+        assert!(
+            a.data
+                .tasks
+                .iter()
+                .any(|t| t.parent_id.as_deref() == Some("0") && t.title == "dois")
+        );
     }
     #[test]
     fn j_k_jump_between_checkboxes_and_shift_k_moves_task_without_visual() {
@@ -2090,7 +3196,10 @@ mod tests {
         }
         a.data.tasks[0].content = "texto\n\n- [ ] um\n\nmais texto\n\n- [ ] dois\n\nfim".into();
         a.focus(2);
-        let label = |a: &App| a.cursor_action().and_then(|x| preview::label(&a.task().unwrap(), &x));
+        let label = |a: &App| {
+            a.cursor_action()
+                .and_then(|x| preview::label(&a.task().unwrap(), &x))
+        };
         assert_eq!(label(&a).as_deref(), Some("um"));
         press(&mut a, 'j');
         assert_eq!(label(&a).as_deref(), Some("dois"));
@@ -2104,6 +3213,325 @@ mod tests {
         assert_eq!(a.task().unwrap().id, "0");
         assert_eq!(a.selected, 1);
         assert!(a.mode == Mode::Normal);
+    }
+    #[test]
+    fn report_queries_do_not_show_save_status_or_queue_mutations() {
+        let mut a = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        a.demo = false;
+        let before = a.data.tasks.len();
+        a.send(Job::Report(a.report_day));
+        assert!(matches!(rx.try_recv().unwrap(), Job::Report(_)));
+        assert!(a.message.starts_with("Consultando relatório de "));
+        assert!(!a.message.contains("Salvando"));
+        assert!(a.pending_jobs.is_empty());
+        assert_eq!(a.data.tasks.len(), before);
+        assert!(a.busy);
+        a.busy = false;
+        a.send(Job::Refresh);
+        assert!(matches!(rx.try_recv().unwrap(), Job::Refresh));
+        assert_eq!(a.message, "Sincronizando com TickTick…");
+        let task = a.data.tasks[0].clone();
+        a.send(Job::Complete(task));
+        assert!(a.message.starts_with("Salvando… 1 operação"));
+        assert_eq!(a.pending_jobs.len(), 1);
+    }
+    #[test]
+    fn report_filters_dates_and_renders_small_terminals() {
+        let mut a = app();
+        a.data = demo_data();
+        a.confirmed = a.data.clone();
+        a.project = 3;
+        a.report_day = sidebar::today(&a.data);
+        a.projects_focus = false;
+        for (w, h) in [(120, 32), (40, 12), (10, 4)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            if w == 120 {
+                let buffer = terminal.backend().buffer();
+                let text = buffer
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("CONCLUSÕES"));
+                assert!(text.contains("Revisar proposta com o time"));
+                assert!(text.contains("Alex"));
+                if let Ok(path) = std::env::var("TICKTICK_REPORT_PREVIEW") {
+                    let cells = buffer.content.iter().map(|c| serde_json::json!({"text":c.symbol(), "fg":format!("{:?}",c.fg), "bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
+                    std::fs::write(
+                        path,
+                        serde_json::to_vec(
+                            &serde_json::json!({"width":w,"height":h,"cells":cells}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let today = a.report_day;
+        press(&mut a, '[');
+        assert_eq!(a.report_day, today.pred_opt().unwrap());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Histórico indisponível"));
+        assert!(!text.contains("Revisar proposta com o time"));
+        press(&mut a, 't');
+        assert_eq!(a.report_day, today);
+        press(&mut a, ']');
+        assert_eq!(a.report_day, today);
+        let before = a.data.tasks.len();
+        press(&mut a, 'x');
+        assert_eq!(a.data.tasks.len(), before);
+    }
+    #[test]
+    fn today_reorders_tasks_across_lists_and_keeps_the_selected_task() {
+        let mut a = app();
+        a.project = 0;
+        a.data.tasks.truncate(3);
+        let due = sidebar::today(&a.data)
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string();
+        for (i, t) in a.data.tasks.iter_mut().enumerate() {
+            t.due_date = Some(due.clone());
+            t.sort_order = i as i64;
+            if i == 1 {
+                t.project_id = "other".into();
+            }
+        }
+        a.confirmed = a.data.clone();
+        press(&mut a, 'J');
+        assert_eq!(
+            a.visible()
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "0", "2"]
+        );
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.task().unwrap().id, "0");
+        press(&mut a, 'K');
+        assert_eq!(
+            a.visible()
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1", "2"]
+        );
+        press(&mut a, 'm');
+        assert!(a.mode == Mode::Move);
+        assert_eq!(a.target.as_ref().unwrap().id, "0");
+    }
+    #[test]
+    fn report_preview_opens_completed_activity_without_mutating_it() {
+        let mut a = app();
+        a.data = demo_data();
+        a.data.completed[0].content = "Descrição da entrega\n\n- [x] Validar resultado".into();
+        a.data.completed[0].desc = Some("Observações finais".into());
+        a.data.completed[0].items = vec![crate::api::ChecklistItem {
+            id: "step".into(),
+            title: "Checklist concluído".into(),
+            status: 1,
+            ..Default::default()
+        }];
+        a.confirmed = a.data.clone();
+        a.project = 3;
+        a.report_day = sidebar::today(&a.data);
+        a.projects_focus = false;
+        let original = serde_json::to_value(&a.data).unwrap();
+        press(&mut a, 'l');
+        assert!(a.preview_focus);
+        for (w, h) in [(140, 40), (80, 24), (40, 12)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            if w == 140 {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                for label in [
+                    "Descrição da entrega",
+                    "Validar resultado",
+                    "Observações finais",
+                    "Checklist concluído",
+                ] {
+                    assert!(text.contains(label), "Missing {label}");
+                }
+            }
+        }
+        press(&mut a, 'j');
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.preview_cursor, 1);
+        press(&mut a, 'x');
+        assert_eq!(serde_json::to_value(&a.data).unwrap(), original);
+        press(&mut a, 'h');
+        assert!(!a.preview_focus);
+        press(&mut a, 'j');
+        assert_eq!(a.selected, 1);
+        a.key(KeyEvent::new(K::Enter, M::NONE));
+        assert_eq!(a.task().unwrap().title, "Publicar correção");
+        a.key(KeyEvent::new(K::Esc, M::NONE));
+        assert!(!a.preview_focus);
+    }
+    #[test]
+    fn report_priorities_are_separate_and_chart_counts_contrast_over_bars() {
+        let mut a = app();
+        a.data = demo_data();
+        for (task, priority) in a.data.completed.iter_mut().zip([5, 3, 1]) {
+            task.priority = priority;
+        }
+        a.project = 3;
+        a.report_day = sidebar::today(&a.data);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for label in ["1 alta", "1 média", "1 baixa", "0 sem prioridade"] {
+            assert!(text.contains(label));
+        }
+        assert!(!text.contains("PRIORIDADE ALTA"));
+        let row = buffer
+            .content
+            .chunks(140)
+            .find(|row| {
+                row.iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+                    .contains("████")
+            })
+            .unwrap();
+        let last_bar = row.iter().rposition(|c| c.symbol() == "█").unwrap();
+        let count = row.iter().rposition(|c| c.symbol() == "3").unwrap();
+        assert!(count < last_bar);
+        assert_eq!(
+            row[count].fg,
+            preview::color(&config::Theme::default().panel)
+        );
+        assert_ne!(row[count].fg, row[count].bg);
+    }
+    #[test]
+    fn report_shows_focus_per_list_even_without_completed_tasks() {
+        let mut a = app();
+        a.data = demo_data();
+        a.data.completed.clear();
+        a.project = 3;
+        a.report_day = sidebar::today(&a.data);
+        a.data.focus_days.push(crate::focus::FocusDay {
+            day: a.report_day,
+            totals: vec![
+                crate::focus::FocusTotal {
+                    project_id: Some("work".into()),
+                    label: "Expin".into(),
+                    seconds: 5400,
+                },
+                crate::focus::FocusTotal {
+                    project_id: None,
+                    label: "Foco livre".into(),
+                    seconds: 1800,
+                },
+            ],
+            error: None,
+        });
+        for (w, h) in [(140, 40), (80, 24), (40, 12)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            if w == 140 {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                for label in [
+                    "Tempo focado por lista",
+                    "Expin",
+                    "1h 30min",
+                    "Foco livre",
+                    "30min",
+                ] {
+                    assert!(text.contains(label), "Missing {label}");
+                }
+                assert!(!text.contains("Um dia sem conclusões registradas"));
+            }
+        }
+        a.report_day = a.report_day.pred_opt().unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!text.contains("1h 30min"));
+    }
+    #[test]
+    fn report_loading_is_scoped_to_date_and_empty_state_is_centered() {
+        let mut a = app();
+        a.data = demo_data();
+        a.project = 3;
+        a.report_day = sidebar::today(&a.data);
+        let today = a.report_day;
+        let yesterday = today.pred_opt().unwrap();
+        a.report_loading.insert(today, 1);
+        a.report_loading.insert(yesterday, 1);
+        a.finish_report(yesterday);
+        assert!(a.report_loading.contains_key(&today));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Buscando suas conquistas"));
+        assert!(!text.contains("Revisar proposta com o time"));
+        a.finish_report(today);
+        a.report_day = yesterday;
+        a.data.report_days.push(yesterday);
+        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Um dia sem conclusões registradas"));
+        let y = (0..40)
+            .find(|y| {
+                buffer.content[y * 140..(y + 1) * 140]
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+                    .contains("Um dia sem conclusões registradas")
+            })
+            .unwrap();
+        let x = buffer.content[y * 140..(y + 1) * 140]
+            .iter()
+            .position(|c| c.symbol() == "U")
+            .unwrap();
+        assert!(y > 10); // Centered vertically, below the header.
+        assert!(x > 35); // Centered horizontally, beyond the sidebar edge.
     }
     #[test]
     fn small_terminal_and_help_render() {

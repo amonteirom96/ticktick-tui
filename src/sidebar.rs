@@ -5,7 +5,10 @@ pub enum View {
     All,
     Today,
     Inbox,
-    Upcoming,
+    Tomorrow,
+    Report,
+    Habits,
+    Focus,
     Group(String),
     Project(String),
 }
@@ -22,7 +25,7 @@ pub fn today(data: &Snapshot) -> NaiveDate {
         .map(|tz| Utc::now().with_timezone(&tz).date_naive())
         .unwrap_or_else(|| Local::now().date_naive())
 }
-fn date(value: &str, task: &Task, data: &Snapshot) -> Option<NaiveDate> {
+pub fn date(value: &str, task: &Task, data: &Snapshot) -> Option<NaiveDate> {
     if task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true) {
         return NaiveDate::parse_from_str(value.get(..10)?, "%Y-%m-%d").ok();
     }
@@ -43,6 +46,7 @@ pub fn matches(view: &View, t: &Task, data: &Snapshot) -> bool {
 pub fn matches_on(view: &View, t: &Task, data: &Snapshot, today: NaiveDate) -> bool {
     match view {
         View::All => true,
+        View::Report | View::Habits | View::Focus => false,
         View::Project(id) => &t.project_id == id,
         View::Inbox => {
             data.inbox_id.as_ref().is_some_and(|id| id == &t.project_id) || t.project_id == "inbox"
@@ -51,7 +55,7 @@ pub fn matches_on(view: &View, t: &Task, data: &Snapshot, today: NaiveDate) -> b
             .projects
             .iter()
             .any(|p| p.id == t.project_id && p.group_id.as_ref() == Some(id)),
-        View::Today | View::Upcoming => {
+        View::Today | View::Tomorrow => {
             let due = t.due_date.as_deref().and_then(|s| date(s, t, data));
             let start = t
                 .extra
@@ -64,7 +68,7 @@ pub fn matches_on(view: &View, t: &Task, data: &Snapshot, today: NaiveDate) -> b
                 [due, start]
                     .into_iter()
                     .flatten()
-                    .any(|d| d > today && d <= today + chrono::Duration::days(7))
+                    .any(|d| d == today + chrono::Duration::days(1))
             }
         }
     }
@@ -84,10 +88,12 @@ pub fn entries(data: &Snapshot, collapsed: &std::collections::HashSet<String>) -
             count,
         });
     };
-    add(View::All, "Todas as tarefas".into(), 0);
     add(View::Today, "Today".into(), 0);
     add(View::Inbox, "Inbox".into(), 0);
-    add(View::Upcoming, "Próximos 7 dias".into(), 0);
+    add(View::Tomorrow, "Amanhã".into(), 0);
+    add(View::Report, "Relatório do dia".into(), 0);
+    add(View::Habits, "Hábitos".into(), 0);
+    add(View::Focus, "Foco".into(), 0);
     // Groups and root lists keep TickTick's sortOrder. Child lists retain their own order.
     let mut roots = data
         .groups
@@ -124,5 +130,45 @@ pub fn entries(data: &Snapshot, collapsed: &std::collections::HashSet<String>) -
             add(View::Project(p.id.clone()), p.name.clone(), 0);
         }
     }
+    add(View::All, "Todas as tarefas".into(), 0);
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn smart_views_order_and_tomorrow_boundaries() {
+        let data = Snapshot {
+            time_zone: Some("America/Recife".into()),
+            ..Default::default()
+        };
+        let rows = entries(&data, &Default::default());
+        assert_eq!(
+            rows.iter().map(|e| e.view.clone()).collect::<Vec<_>>(),
+            vec![
+                View::Today,
+                View::Inbox,
+                View::Tomorrow,
+                View::Report,
+                View::Habits,
+                View::Focus,
+                View::All
+            ]
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let mut task = Task {
+            due_date: Some("2026-11-05T02:30:00Z".into()),
+            ..Default::default()
+        };
+        assert!(!matches_on(&View::Tomorrow, &task, &data, today));
+        task.due_date = Some("2026-11-06T02:30:00Z".into());
+        assert!(matches_on(&View::Tomorrow, &task, &data, today));
+        task.due_date = Some("2026-11-06T03:00:00Z".into());
+        assert!(!matches_on(&View::Tomorrow, &task, &data, today));
+        task.extra
+            .insert("isAllDay".into(), serde_json::json!(true));
+        task.due_date = Some("2026-11-05T00:00:00Z".into());
+        assert!(matches_on(&View::Tomorrow, &task, &data, today));
+    }
 }

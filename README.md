@@ -79,7 +79,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `?`, `:help` | Ajuda |
 | `q`, `:q`, `Ctrl-c` | Sair |
 
-Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi`. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
+Selecione uma lista específica antes de criar tarefas: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi` em Unix e `notepad.exe` em Windows. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
 
 A interface usa modos Normal, Inserção e Comando. Não implementa todo o motor de edição do Vim (macros, registros e operadores de texto); para todos os comandos de edição, use `e` com Vim/Neovim.
 
@@ -125,3 +125,33 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo run -- demo
 ```
+
+## Downloads e releases
+
+A pipeline `.github/workflows/release.yml` testa e gera seis binários: Linux x64 e ARM64, macOS Intel e Apple Silicon, Windows x64 e ARM64. Arquivos `.tar.gz` (Unix) e `.zip` (Windows) incluem o executável, licença, documentação e temas. As releases incluem `SHA256SUMS`.
+
+Depois que o workflow estiver no GitHub, ajuste `version` no `Cargo.toml`, atualize o `Cargo.lock` e envie uma tag correspondente, por exemplo `v0.1.0`. A tag deve corresponder à versão do pacote. Todos os builds precisam passar antes da publicação automática em [Releases](https://github.com/amonteirom96/ticktick-tui/releases). A execução manual em Actions gera artefatos para testar, sem publicar release.
+
+Extraia o download correspondente ao seu sistema e arquitetura e coloque `ticktick-tui` (ou `ticktick-tui.exe`) no PATH. Não é necessário instalar Rust. Os binários Linux requerem glibc: 2.35+ em x64 e 2.39+ em ARM64; Alpine/musl não é suportado nesses pacotes. Os binários macOS e Windows não são assinados.
+
+## Today e relatório diário
+
+O aplicativo abre com foco na primeira coluna e **Today** selecionado. A ordem é Today, Inbox, Amanhã, Relatório do dia, Hábitos, Pomodoro, Stopwatch, suas listas e Todas as tarefas. Today inclui tarefas atrasadas; Amanhã considera somente a data seguinte no fuso do TickTick (ou do sistema quando indisponível). Nessas duas visões, cada tarefa mostra discretamente, à direita, o nome da lista a que pertence.
+
+O **Relatório do dia** começa na data atual e exibe cartões com contadores grandes, distribuição visual por lista e uma tabela compacta de conquistas. O título completo da conquista selecionada aparece abaixo da tabela. Estados vazios ficam centralizados; ao consultar uma data, um indicador animado aparece no centro. Use `[` para o dia anterior, `]` para o seguinte, `t` para hoje e `:report AAAA-MM-DD` para uma data específica. `j`/`k` selecionam conquistas quando a coluna central está focada. `l` ou `Enter` abre a atividade concluída com descrição e checklist; `j`/`k` rolam o preview e `h`/`Esc` volta. O resumo separa as quantidades por prioridade, e os números por lista aparecem sobre as barras com texto na cor do painel.
+
+O cliente tenta consultar `/task/completed` para a data escolhida. Esse endpoint e `/user/info` são opcionais e não têm disponibilidade garantida na Open API. Quando o histórico não está disponível ou a resposta está truncada, o relatório avisa e apresenta as conclusões confirmadas neste aplicativo, preservadas no cache. Excluir uma tarefa não conta como conclusão. Não é possível garantir a recuperação de conclusões antigas ou realizadas em outros clientes com todos os tipos de token. O relatório é uma visão local, sem criar uma lista no TickTick.
+
+O cabeçalho mostra o nome recebido do perfil; a sincronização aparece no rodapé. Se o token não permitir ler o perfil, defina `user_name = "Seu nome"` no início de `~/.config/ticktick-tui/config.toml`, antes de `[theme]`; até então será exibido “Minha conta”.
+
+Os temas incluídos usam uma superfície uniforme entre fundo e painéis, com bordas discretas e destaque na seleção. Configurações de cores personalizadas continuam tendo precedência.
+
+O painel **Tempo focado por lista** soma registros reais de Pomodoro e cronômetro na data escolhida, mesmo que as tarefas ainda não tenham sido concluídas. Mostra horas e minutos (por exemplo, `Expin · 2h 30min`). Sessões sem tarefa aparecem como “Foco livre”; tarefas cujo projeto não pôde ser identificado aparecem separadamente. Se a API falhar, o relatório informa a indisponibilidade em vez de apresentar zero. Os registros da API são convertidos de milissegundos; sessões que atravessam datas ou tarefas têm a duração efetiva distribuída proporcionalmente pelos intervalos.
+
+## Hábitos, Pomodoro e Stopwatch
+
+Logo abaixo do relatório, **Hábitos** consulta `/habit` e mostra os nomes e metas do TickTick. **Pomodoro** e **Stopwatch** consultam `/focus` para mostrar as sessões de hoje por tipo. Se o token não permitir um endpoint, a tela informa a indisponibilidade; `r` tenta novamente.
+
+Hábitos mostra apenas os programados para hoje, seguindo a `repeatRule` do TickTick (dias da semana em `BYDAY`, ou `INTERVAL` diário a partir da data de início); hábitos arquivados ou que ainda não começaram ficam ocultos. `Space` ou `x` conclui o hábito selecionado; num hábito já concluído, desmarca (envia o check-in do dia com valor 0).
+
+Na coluna central de Pomodoro e Stopwatch, `Space` ou `Enter` inicia/pausa o timer; `s` zera; `j`/`k` rola. `t` escolhe a atividade (busca entre as tarefas abertas, com as de hoje/atrasadas primeiro; a primeira opção é “Foco livre”). `c` define os tempos de foco, pausa e pausa longa em minutos (ex.: `50 10 20`; padrão `25 5 15`). Ao fim de um foco, `Space` inicia a pausa, e ao fim da pausa volta ao foco; a cada 4 focos concluídos a pausa é longa. `n` pula para a próxima fase. Há um timer local por vez. O estado (fase, tempos e atividade) é salvo em `focus-timer.json` junto ao cache e continua ao fechar e reabrir o TUI; o modo demo não persiste o timer. Não há alarme com o aplicativo fechado. Estes timers não iniciam foco nos outros dispositivos e não enviam sessões ao histórico do TickTick.

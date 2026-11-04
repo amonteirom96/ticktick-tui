@@ -1,6 +1,6 @@
 [theme]
 background = "#16161e"
-panel = "#1a1b26"
+panel = "#16161e"
 foreground = "#c0caf5"
 muted = "#939bc4"
 border = "#414868"

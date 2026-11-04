@@ -2,12 +2,14 @@ mod api;
 mod auth;
 mod config;
 mod fields;
+mod focus;
 mod preview;
 mod sidebar;
 mod sync;
 mod token_ui;
 mod tree;
 mod ui;
+mod wellness;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 #[derive(Parser)]

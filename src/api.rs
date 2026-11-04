@@ -63,6 +63,18 @@ pub struct Task {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub habit_checkins: Vec<Value>,
+    #[serde(default)]
+    pub habit_checkin_error: Option<String>,
+    #[serde(default)]
+    pub focus_records: Vec<Value>,
+    #[serde(default)]
+    pub wellness_error: Option<String>,
+    #[serde(default)]
+    pub habits: Vec<Value>,
+    #[serde(default)]
+    pub habit_error: Option<String>,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     #[serde(default)]
@@ -73,6 +85,14 @@ pub struct Snapshot {
     pub time_zone: Option<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
+    #[serde(default)]
+    pub completed: Vec<Task>,
+    #[serde(default)]
+    pub report_days: Vec<chrono::NaiveDate>,
+    #[serde(default)]
+    pub focus_days: Vec<crate::focus::FocusDay>,
 }
 pub struct Api {
     client: Client,
@@ -198,7 +218,176 @@ impl Api {
                 .cmp(&a.priority)
                 .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
         });
+        let focus_result = (|| -> Result<Vec<Value>> {
+            let (from, to) = crate::focus::bounds(crate::sidebar::today(&result), &result)?;
+            let mut records = Vec::new();
+            for kind in [0, 1] {
+                let mut url = reqwest::Url::parse("https://api.ticktick.com/open/v1/focus")?;
+                url.query_pairs_mut()
+                    .append_pair("from", &from.format("%Y-%m-%dT%H:%M:%S%z").to_string())
+                    .append_pair("to", &to.format("%Y-%m-%dT%H:%M:%S%z").to_string())
+                    .append_pair("type", &kind.to_string());
+                let value = self.request(
+                    Method::GET,
+                    &format!("/focus?{}", url.query().unwrap()),
+                    None,
+                )?;
+                let rows = value.as_array().context("Resposta de foco inválida")?;
+                for row in rows {
+                    let mut row = row.clone();
+                    row.as_object_mut()
+                        .context("Registro de foco inválido")?
+                        .insert("type".into(), json!(kind));
+                    records.push(row);
+                }
+            }
+            Ok(records)
+        })();
+        match focus_result {
+            Ok(records) => result.focus_records = records,
+            Err(e) => result.wellness_error = Some(format!("Histórico de foco indisponível: {e}")),
+        }
+        match self
+            .request(Method::GET, "/habit", None)
+            .and_then(|v| Ok(serde_json::from_value::<Vec<Value>>(v)?))
+        {
+            Ok(mut habits) => {
+                habits.sort_by_key(|h| h["sortOrder"].as_i64().unwrap_or(0));
+                result.habits = habits;
+                match self.habit_checkins(&result) {
+                    Ok(checkins) => result.habit_checkins = checkins,
+                    Err(e) => result.habit_checkin_error = Some(e.to_string()),
+                }
+            }
+            Err(e) => result.habit_error = Some(format!("Hábitos indisponíveis: {e}")),
+        }
         Ok(result)
+    }
+    pub fn habit_checkins(&self, data: &Snapshot) -> Result<Vec<Value>> {
+        let ids = data.habits.iter().filter_map(|h| h["id"].as_str()).collect::<Vec<_>>();
+        if ids.is_empty() { return Ok(vec![]); }
+        let stamp = crate::sidebar::today(data).format("%Y%m%d").to_string();
+        let mut records = Vec::new();
+        for chunk in ids.chunks(50) {
+            let mut url = reqwest::Url::parse("https://api.ticktick.com/open/v1/habit/checkins")?;
+            url.query_pairs_mut().append_pair("habitIds", &chunk.join(","))
+                .append_pair("from", &stamp).append_pair("to", &stamp);
+            let value = self.request(Method::GET, &format!("/habit/checkins?{}", url.query().unwrap()), None)?;
+            records.extend(value.as_array().context("Resposta de check-in inválida")?.iter().cloned());
+        }
+        Ok(records)
+    }
+    /// Upserts the day's check-in; `value` 0 undoes a completion.
+    pub fn check_habit(&self, id: &str, day: chrono::NaiveDate, goal: f64, value: f64) -> Result<()> {
+        anyhow::ensure!(!id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'), "ID de hábito inválido");
+        anyhow::ensure!(goal.is_finite() && goal > 0.0, "Meta de hábito inválida");
+        anyhow::ensure!(value.is_finite() && value >= 0.0, "Valor de hábito inválido");
+        let stamp = day.format("%Y%m%d").to_string().parse::<i32>()?;
+        let time = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
+        self.request(Method::POST, &format!("/habit/{id}/checkin"), Some(json!({
+            "stamp": stamp, "value": value, "goal": goal, "time": time, "opTime": time
+        })))?;
+        Ok(())
+    }
+    /// Optional endpoints are not available for every Open API account.
+    pub fn profile_name(&self) -> Option<String> {
+        let v = self.request(Method::GET, "/user/info", None).ok()?;
+        ["displayName", "name", "username"]
+            .into_iter()
+            .find_map(|key| {
+                v[key]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+            })
+    }
+    pub fn completed_on(&self, day: chrono::NaiveDate, data: &Snapshot) -> Result<Vec<Task>> {
+        let next = day.succ_opt().context("Date out of range")?;
+        let mut tasks = Vec::new();
+        use chrono::TimeZone;
+        let boundary = |date: chrono::NaiveDate| -> Result<String> {
+            let midnight = date.and_hms_opt(0, 0, 0).context("Invalid midnight")?;
+            if let Some(tz) = data
+                .time_zone
+                .as_deref()
+                .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+            {
+                Ok(tz
+                    .from_local_datetime(&midnight)
+                    .earliest()
+                    .context("Invalid local date")?
+                    .to_rfc3339())
+            } else {
+                Ok(chrono::Local
+                    .from_local_datetime(&midnight)
+                    .earliest()
+                    .context("Invalid local date")?
+                    .to_rfc3339())
+            }
+        };
+        // Treat full pages conservatively; account-specific server caps can be smaller than requested.
+        let value = self.request(
+            Method::POST,
+            "/task/completed",
+            Some(json!({
+                "startDate": boundary(day)?, "endDate": boundary(next)?
+            })),
+        )?;
+        let rows = value
+            .as_array()
+            .or_else(|| value.get("tasks").and_then(Value::as_array))
+            .context("Unexpected completed-task response")?;
+        if rows.len() >= 200 {
+            bail!("Completed-task history may be truncated");
+        }
+        for row in rows {
+            let task: Task = serde_json::from_value(row.clone())?;
+            if task.status != 2 {
+                bail!("Unexpected status in completed-task history");
+            }
+            let completed_day = task
+                .extra
+                .get("completedTime")
+                .and_then(Value::as_str)
+                .and_then(|v| crate::sidebar::date(v, &Task::default(), data))
+                .context("Missing or invalid completion time")?;
+            if completed_day == day {
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+    pub fn focus_on(
+        &self,
+        day: chrono::NaiveDate,
+        data: &Snapshot,
+    ) -> Result<Vec<crate::focus::FocusTotal>> {
+        let (from, to) = crate::focus::bounds(day, data)?;
+        let mut records = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for kind in [0, 1] {
+            let mut url = reqwest::Url::parse("https://api.ticktick.com/open/v1/focus")?;
+            url.query_pairs_mut()
+                .append_pair("from", &(from - chrono::Duration::days(1)).to_rfc3339())
+                .append_pair("to", &to.to_rfc3339())
+                .append_pair("type", &kind.to_string());
+            let value = self.request(
+                Method::GET,
+                &format!("/focus?{}", url.query().unwrap()),
+                None,
+            )?;
+            let rows = value.as_array().context("Unexpected focus response")?;
+            if rows.len() >= 200 {
+                bail!("Focus history may be truncated");
+            }
+            for row in rows {
+                let id = row["id"].as_str().context("Missing focus record id")?;
+                if seen.insert(id.to_owned()) {
+                    records.push(row.clone());
+                }
+            }
+        }
+        crate::focus::summarize(day, data, &records)
     }
     pub fn create(&self, project: &str, title: &str, parent: Option<&str>) -> Result<Task> {
         let mut body = json!({"projectId": project,"title": title});
@@ -262,6 +451,139 @@ mod tests {
         assert_eq!(out["items"], v["items"]);
         assert_eq!(out["repeatFlag"], v["repeatFlag"]);
         assert_eq!(out["title"], "Renamed");
+    }
+    #[test]
+    fn report_api_checks_timezone_and_rejects_incomplete_history() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let row = json!({"id":"t", "projectId":"p", "title":"Finished", "status":2, "completedTime":"2026-11-05T01:00:00Z"});
+            let replies = [
+                json!({"name":"Alex"}),
+                json!([row.clone()]),
+                json!([{"id":"t", "projectId":"p", "title":"Missing time", "status":2}]),
+                Value::Array(vec![row; 200]),
+            ];
+            for (i, reply) in replies.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length: "))
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                if i == 0 {
+                    assert!(text.starts_with("GET /open/v1/user/info"));
+                } else {
+                    assert!(text.starts_with("POST /open/v1/task/completed"));
+                    let body: Value =
+                        serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    assert_eq!(body["startDate"], "2026-11-04T00:00:00-03:00");
+                    assert_eq!(body["endDate"], "2026-11-05T00:00:00-03:00");
+                    assert!(body.get("from").is_none());
+                    assert!(body.get("to").is_none());
+                }
+                let body = reply.to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{addr}/open/v1");
+        assert_eq!(api.profile_name().as_deref(), Some("Alex"));
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let data = Snapshot {
+            time_zone: Some("America/Recife".into()),
+            ..Default::default()
+        };
+        assert_eq!(api.completed_on(day, &data).unwrap().len(), 1);
+        assert!(api.completed_on(day, &data).is_err());
+        assert!(api.completed_on(day, &data).is_err());
+        server.join().unwrap();
+    }
+    #[test]
+    fn focus_reads_both_timer_types_and_deduplicates_sessions() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for kind in [0, 1] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                let path = text.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                assert_eq!(url.path(), "/open/v1/focus");
+                let query = url
+                    .query_pairs()
+                    .into_owned()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(query["type"], kind.to_string());
+                assert_eq!(query["from"], "2026-11-02T03:00:00+00:00");
+                assert_eq!(query["to"], "2026-11-04T03:00:00+00:00");
+                let body=json!([{"id":"f","status":1,"duration":3600000,"startTime":"2026-11-03T12:00:00Z","endTime":"2026-11-03T13:00:00Z","tasks":[]}]).to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{addr}/open/v1");
+        let data = Snapshot {
+            time_zone: Some("America/Recife".into()),
+            ..Default::default()
+        };
+        let totals = api
+            .focus_on(chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap(), &data)
+            .unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].seconds, 3600);
+        server.join().unwrap();
     }
     #[test]
     fn http_routes_auth_and_empty_success() {

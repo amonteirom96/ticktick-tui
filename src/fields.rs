@@ -1,5 +1,7 @@
 //! Text formats for the due-date and reminder prompts.
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use serde_json::{Map, Value, json};
 
@@ -20,12 +22,15 @@ fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTi
         d if d.starts_with('+') => d[1..].parse().ok().map(|n| today + Duration::days(n)),
         d if WEEKDAYS.contains(&d) => {
             let target = WEEKDAYS.iter().position(|w| *w == d).unwrap() as i64;
-            let ahead = (target - today.weekday().num_days_from_monday() as i64 - 1).rem_euclid(7) + 1;
+            let ahead =
+                (target - today.weekday().num_days_from_monday() as i64 - 1).rem_euclid(7) + 1;
             Some(today + Duration::days(ahead))
         }
         d => NaiveDate::parse_from_str(d, "%Y-%m-%d")
             .or_else(|_| NaiveDate::parse_from_str(d, "%d/%m/%Y"))
-            .or_else(|_| NaiveDate::parse_from_str(&format!("{d}/{}", today.format("%Y")), "%d/%m/%Y"))
+            .or_else(|_| {
+                NaiveDate::parse_from_str(&format!("{d}/{}", today.format("%Y")), "%d/%m/%Y")
+            })
             .ok(),
     };
     match (date, parts.next()) {
@@ -36,13 +41,23 @@ fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTi
 
 fn to_utc(local: NaiveDateTime, tz: Option<Tz>) -> Option<DateTime<Utc>> {
     match tz {
-        Some(tz) => tz.from_local_datetime(&local).earliest().map(|d| d.to_utc()),
-        None => Local.from_local_datetime(&local).earliest().map(|d| d.to_utc()),
+        Some(tz) => tz
+            .from_local_datetime(&local)
+            .earliest()
+            .map(|d| d.to_utc()),
+        None => Local
+            .from_local_datetime(&local)
+            .earliest()
+            .map(|d| d.to_utc()),
     }
 }
 
 /// Fields for `POST /task/{id}`. Empty input clears the date.
-pub fn due_fields(input: &str, today: NaiveDate, tz: Option<Tz>) -> Result<Map<String, Value>, String> {
+pub fn due_fields(
+    input: &str,
+    today: NaiveDate,
+    tz: Option<Tz>,
+) -> Result<Map<String, Value>, String> {
     let mut fields = Map::new();
     if input.trim().is_empty() {
         fields.insert("dueDate".into(), Value::Null);
@@ -50,7 +65,8 @@ pub fn due_fields(input: &str, today: NaiveDate, tz: Option<Tz>) -> Result<Map<S
         return Ok(fields);
     }
     let (date, time) = parse_due(input, today)?;
-    let utc = to_utc(date.and_time(time.unwrap_or_default()), tz).ok_or("Horário inexistente nesse fuso")?;
+    let utc = to_utc(date.and_time(time.unwrap_or_default()), tz)
+        .ok_or("Horário inexistente nesse fuso")?;
     let value = json!(utc.format(API_FORMAT).to_string());
     fields.insert("dueDate".into(), value.clone());
     fields.insert("startDate".into(), value);
@@ -71,12 +87,21 @@ pub fn format_due(due: &str, all_day: bool, tz: Option<Tz>) -> String {
         None => parsed.with_timezone(&Local).naive_local(),
     };
     local
-        .format(if all_day { "%d/%m/%Y" } else { "%d/%m/%Y %H:%M" })
+        .format(if all_day {
+            "%d/%m/%Y"
+        } else {
+            "%d/%m/%Y %H:%M"
+        })
         .to_string()
 }
 
 /// Short label for the task list: `hoje 14:30`, `amanhã`, `sex`, `25/12`. `true` when overdue.
-pub fn relative_due(due: &str, all_day: bool, tz: Option<Tz>, today: NaiveDate) -> Option<(String, bool)> {
+pub fn relative_due(
+    due: &str,
+    all_day: bool,
+    tz: Option<Tz>,
+    today: NaiveDate,
+) -> Option<(String, bool)> {
     let parsed = DateTime::parse_from_str(due, "%Y-%m-%dT%H:%M:%S%.f%z").ok()?;
     let local = match tz {
         Some(tz) => parsed.with_timezone(&tz).naive_local(),
@@ -90,7 +115,11 @@ pub fn relative_due(due: &str, all_day: bool, tz: Option<Tz>, today: NaiveDate) 
         _ if local.year() == today.year() => local.format("%d/%m").to_string(),
         _ => local.format("%d/%m/%y").to_string(),
     };
-    let label = if all_day { day } else { format!("{day} {}", local.format("%H:%M")) };
+    let label = if all_day {
+        day
+    } else {
+        format!("{day} {}", local.format("%H:%M"))
+    };
     Some((label, days < 0))
 }
 
@@ -160,35 +189,77 @@ mod tests {
         let f = due_fields("25/12", today(), tz).unwrap();
         assert_eq!(f["dueDate"], "2026-12-25T03:00:00+0000");
         assert_eq!(f["isAllDay"], true);
-        assert_eq!(due_fields("+2", today(), tz).unwrap()["dueDate"], "2026-11-05T03:00:00+0000");
-        assert_eq!(due_fields("2027-01-10", today(), tz).unwrap()["dueDate"], "2027-01-10T03:00:00+0000");
+        assert_eq!(
+            due_fields("+2", today(), tz).unwrap()["dueDate"],
+            "2026-11-05T03:00:00+0000"
+        );
+        assert_eq!(
+            due_fields("2027-01-10", today(), tz).unwrap()["dueDate"],
+            "2027-01-10T03:00:00+0000"
+        );
         assert!(due_fields("", today(), tz).unwrap()["dueDate"].is_null());
         // today is a Tuesday: "sex" is this Friday, "ter" is next week's.
-        assert_eq!(due_fields("sex 14:30", today(), tz).unwrap()["dueDate"], "2026-11-06T17:30:00+0000");
-        assert_eq!(due_fields("ter", today(), tz).unwrap()["dueDate"], "2026-11-10T03:00:00+0000");
+        assert_eq!(
+            due_fields("sex 14:30", today(), tz).unwrap()["dueDate"],
+            "2026-11-06T17:30:00+0000"
+        );
+        assert_eq!(
+            due_fields("ter", today(), tz).unwrap()["dueDate"],
+            "2026-11-10T03:00:00+0000"
+        );
         assert!(due_fields("ontem", today(), tz).is_err());
         assert!(due_fields("hoje 25:00", today(), tz).is_err());
     }
     #[test]
     fn due_roundtrips_to_prompt_text() {
         let tz = Some(chrono_tz::America::Sao_Paulo);
-        assert_eq!(format_due("2026-11-04T17:30:00+0000", false, tz), "04/11/2026 14:30");
-        assert_eq!(format_due("2026-12-25T03:00:00.000+0000", true, tz), "25/12/2026");
+        assert_eq!(
+            format_due("2026-11-04T17:30:00+0000", false, tz),
+            "04/11/2026 14:30"
+        );
+        assert_eq!(
+            format_due("2026-12-25T03:00:00.000+0000", true, tz),
+            "25/12/2026"
+        );
     }
     #[test]
     fn relative_due_labels() {
         let tz = Some(chrono_tz::America::Sao_Paulo);
         let label = |due, all_day| relative_due(due, all_day, tz, today()).unwrap();
-        assert_eq!(label("2026-11-03T17:30:00+0000", false), ("hoje 14:30".into(), false));
-        assert_eq!(label("2026-11-04T03:00:00+0000", true), ("amanhã".into(), false));
-        assert_eq!(label("2026-11-06T03:00:00+0000", true), ("sex".into(), false));
-        assert_eq!(label("2026-11-01T03:00:00+0000", true), ("01/11".into(), true));
-        assert_eq!(label("2027-01-10T03:00:00+0000", true), ("10/01/27".into(), false));
+        assert_eq!(
+            label("2026-11-03T17:30:00+0000", false),
+            ("hoje 14:30".into(), false)
+        );
+        assert_eq!(
+            label("2026-11-04T03:00:00+0000", true),
+            ("amanhã".into(), false)
+        );
+        assert_eq!(
+            label("2026-11-06T03:00:00+0000", true),
+            ("sex".into(), false)
+        );
+        assert_eq!(
+            label("2026-11-01T03:00:00+0000", true),
+            ("01/11".into(), true)
+        );
+        assert_eq!(
+            label("2027-01-10T03:00:00+0000", true),
+            ("10/01/27".into(), false)
+        );
     }
     #[test]
     fn reminders_roundtrip() {
         let r = parse_reminders("0, 15m, 1h, 2d, TRIGGER:P0DT9H0M0S").unwrap();
-        assert_eq!(r, ["TRIGGER:PT0S", "TRIGGER:-PT15M", "TRIGGER:-PT1H", "TRIGGER:-P2D", "TRIGGER:P0DT9H0M0S"]);
+        assert_eq!(
+            r,
+            [
+                "TRIGGER:PT0S",
+                "TRIGGER:-PT15M",
+                "TRIGGER:-PT1H",
+                "TRIGGER:-P2D",
+                "TRIGGER:P0DT9H0M0S"
+            ]
+        );
         assert_eq!(format_reminders(&r), "0, 15m, 1h, 2d, TRIGGER:P0DT9H0M0S");
         assert!(parse_reminders("").unwrap().is_empty());
         assert!(parse_reminders("amanhã").is_err());

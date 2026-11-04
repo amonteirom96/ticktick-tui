@@ -269,7 +269,11 @@ fn markdown(source: &str, field: Field, theme: &Theme) -> Vec<Row> {
                 m.spans.push(Span::styled(
                     if checked { "● " } else { "○ " },
                     Style::default()
-                        .fg(color(if checked { &theme.success } else { &theme.accent }))
+                        .fg(color(if checked {
+                            &theme.success
+                        } else {
+                            &theme.accent
+                        }))
                         .bold(),
                 ));
             }
@@ -363,7 +367,13 @@ pub fn wrap(rows: Vec<Row>, width: usize) -> Vec<Row> {
     }
     result
 }
-pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_done: bool) -> Vec<Row> {
+pub fn document(
+    task: &Task,
+    data: &Snapshot,
+    theme: &Theme,
+    width: usize,
+    hide_done: bool,
+) -> Vec<Row> {
     let mut rows = vec![
         Row::text(Span::styled(
             task.title.clone(),
@@ -379,7 +389,10 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_
         .unwrap_or("");
     let field = |label: &str, value: String, fg: &str| {
         Row::text(Line::from(vec![
-            Span::styled(format!("{label:<14}"), Style::default().fg(color(&theme.muted))),
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(color(&theme.muted)),
+            ),
             Span::styled(value, Style::default().fg(color(fg))),
         ]))
     };
@@ -417,7 +430,11 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_
         .as_ref()
         .and_then(|id| data.tasks.iter().find(|t| &t.id == id))
     {
-        rows.push(field("Subtarefa de", parent.title.clone(), &theme.foreground));
+        rows.push(field(
+            "Subtarefa de",
+            parent.title.clone(),
+            &theme.foreground,
+        ));
     }
     rows.push(Row::text(""));
     rows.push(Row::text(Span::styled(
@@ -434,7 +451,10 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_
             rows.push(Row::text(""));
         }
         rows.push(Row::text(Line::from(vec![
-            Span::styled("Checklist  ", Style::default().fg(color(&theme.heading)).bold()),
+            Span::styled(
+                "Checklist  ",
+                Style::default().fg(color(&theme.heading)).bold(),
+            ),
             Span::styled(
                 format!(
                     "{}/{}",
@@ -454,7 +474,11 @@ pub fn document(task: &Task, data: &Snapshot, theme: &Theme, width: usize, hide_
                     Span::styled(
                         if item.status == 1 { "● " } else { "○ " },
                         Style::default()
-                            .fg(color(if item.status == 1 { &theme.success } else { &theme.accent }))
+                            .fg(color(if item.status == 1 {
+                                &theme.success
+                            } else {
+                                &theme.accent
+                            }))
                             .bold(),
                     ),
                     Span::styled(
@@ -513,11 +537,15 @@ fn source<'a>(task: &'a mut Task, field: &Field) -> Option<&'a mut String> {
 /// Byte ranges of a Markdown task marker's line: (line start, text start, line end).
 fn task_line(source: &str, offset: usize) -> Option<(usize, usize, usize)> {
     let bytes = source.as_bytes();
-    if !matches!(bytes.get(offset), Some(b' ' | b'x' | b'X')) || bytes.get(offset + 1) != Some(&b']') {
+    if !matches!(bytes.get(offset), Some(b' ' | b'x' | b'X'))
+        || bytes.get(offset + 1) != Some(&b']')
+    {
         return None;
     }
     let start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let end = source[offset..].find('\n').map_or(source.len(), |i| offset + i);
+    let end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |i| offset + i);
     let rest = &source[offset + 2..end];
     Some((start, end - rest.trim_start().len(), end))
 }
@@ -538,9 +566,15 @@ pub fn label(task: &Task, action: &Action) -> Option<String> {
 }
 pub fn rename(task: &mut Task, action: &Action, title: &str) -> bool {
     match action {
-        Action::Checklist(i) => task.items.get_mut(*i).map(|i| i.title = title.into()).is_some(),
+        Action::Checklist(i) => task
+            .items
+            .get_mut(*i)
+            .map(|i| i.title = title.into())
+            .is_some(),
         Action::Markdown { field, offset, .. } => source(task, field)
-            .and_then(|s| task_line(s, *offset).map(|(_, text, end)| s.replace_range(text..end, title)))
+            .and_then(|s| {
+                task_line(s, *offset).map(|(_, text, end)| s.replace_range(text..end, title))
+            })
             .is_some(),
         Action::Subtask(_) => false,
     }
@@ -555,7 +589,11 @@ pub fn remove(task: &mut Task, action: &Action) -> bool {
             .and_then(|s| {
                 let (start, _, end) = task_line(s, *offset)?;
                 // Drop the line together with one of its newlines.
-                let range = if end < s.len() { start..end + 1 } else { start.saturating_sub(1)..end };
+                let range = if end < s.len() {
+                    start..end + 1
+                } else {
+                    start.saturating_sub(1)..end
+                };
                 s.replace_range(range, "");
                 Some(())
             })

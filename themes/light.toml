@@ -1,7 +1,7 @@
 # Onemono light
 [theme]
 background = "#f0f1f3"
-panel = "#fafafa"
+panel = "#f0f1f3"
 foreground = "#383f4c"
 muted = "#686f7d"
 border = "#d1d5dc"
