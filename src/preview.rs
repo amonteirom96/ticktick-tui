@@ -519,7 +519,6 @@ pub fn document(
                 line: Line::from(vec![
                     Span::styled("○  ", Style::default().fg(color(&theme.accent))),
                     Span::raw(t.title.clone()),
-                    Span::styled("  ↵", Style::default().fg(color(&theme.muted))),
                 ]),
                 action: Some(Action::Subtask(t.id.clone())),
                 link: None,
