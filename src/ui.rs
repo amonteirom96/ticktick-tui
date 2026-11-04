@@ -2043,7 +2043,7 @@ fn preview_area(area: Rect, app: &App) -> Rect {
         } else {
             21
         }
-        .saturating_add_signed(app.lists);
+        .saturating_add_signed(if app.hide_lists { 0 } else { app.lists });
         return Layout::horizontal([
             Constraint::Length(sidebar),
             Constraint::Percentage(app.split),
@@ -2501,7 +2501,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 } else {
                     21
                 }
-                .saturating_add_signed(app.lists)),
+                .saturating_add_signed(if app.hide_lists { 0 } else { app.lists })),
                 Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
@@ -2515,7 +2515,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 } else {
                     25
                 }
-                .saturating_add_signed(app.lists)),
+                .saturating_add_signed(if app.hide_lists { 0 } else { app.lists })),
                 Constraint::Min(0),
             ])
             .split(rows[1])
@@ -3114,6 +3114,17 @@ mod tests {
     }
     fn press(a: &mut App, c: char) {
         a.key(KeyEvent::new(K::Char(c), M::NONE));
+    }
+    #[test]
+    fn b_hides_lists_after_widening_them() {
+        let area = Rect::new(0, 0, 160, 40);
+        let mut hidden = app();
+        hidden.hide_lists = true;
+        let mut a = app();
+        a.projects_focus = true;
+        press(&mut a, '>');
+        press(&mut a, 'b');
+        assert_eq!(preview_area(area, &a), preview_area(area, &hidden));
     }
     #[test]
     fn wellness_views_render_and_block_task_mutations() {
