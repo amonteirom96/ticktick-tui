@@ -903,10 +903,6 @@ impl App {
             }
             Mode::Item if !text.is_empty() && self.target.is_some() => {
                 self.insert_items(&[(text, false)]);
-                // Stay open for the next item; Enter on an empty line or Esc finishes.
-                self.input.clear();
-                self.input_cursor = 0;
-                return false;
             }
             Mode::ItemRename if !text.is_empty() => match (self.target.take(), self.item.take()) {
                 (Some(_), Some(Action::Subtask(id))) => {
@@ -2798,7 +2794,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Mode::Add | Mode::Subtask | Mode::Rename | Mode::ItemRename => {
             " INSERIR  Enter salvar · Esc cancelar".into()
         }
-        Mode::Item => " CHECKLIST  Enter adiciona outro · colar várias linhas · Esc termina".into(),
+        Mode::Item => " CHECKLIST  Enter adiciona · colar várias linhas · Esc cancela".into(),
         Mode::Move => {
             let names = app
                 .lists(&app.input)
@@ -3306,7 +3302,7 @@ mod tests {
     fn preview_adds_renames_and_deletes_checklist_items() {
         let mut a = app();
         a.focus(2);
-        for c in "aum\rdois\r\r".chars() {
+        for c in "aum\radois\r".chars() {
             let code = if c == '\r' { K::Enter } else { K::Char(c) };
             a.key(KeyEvent::new(code, M::NONE));
         }
@@ -3376,7 +3372,7 @@ mod tests {
         typing(&mut a, "\x1b");
         assert_eq!(titles(&a), ["um", "três"]);
         assert_eq!(a.task().unwrap().items[1].status, 1);
-        typing(&mut a, "Odois\r\x1b");
+        typing(&mut a, "Odois\r");
         assert_eq!(titles(&a), ["um", "dois", "três"]);
         typing(&mut a, "K");
         assert_eq!(titles(&a), ["dois", "um", "três"]);
