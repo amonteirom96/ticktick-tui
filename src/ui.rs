@@ -17,7 +17,11 @@ use ratatui::{prelude::*, widgets::*};
 use std::{
     collections::{HashSet, VecDeque},
     io,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender},
+    },
     time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthStr;
@@ -90,8 +94,8 @@ struct App {
     /// Quit requested while syncing: exit once `busy` clears.
     quitting: bool,
     demo: bool,
-    /// Open audio output; `None` when sounds are off or no device exists.
-    audio: Option<rodio::MixerDeviceSink>,
+    /// Open audio output and its "stream died" flag; `None` when sounds are off or no device exists.
+    audio: Option<(rodio::MixerDeviceSink, Arc<AtomicBool>)>,
     pending: char,
     count: String,
     details: bool,
@@ -846,8 +850,12 @@ impl App {
             }
         }
     }
-    fn play(&self, sound: &'static [u8], volume: f32) {
-        if let Some(audio) = &self.audio
+    fn play(&mut self, sound: &'static [u8], volume: f32) {
+        // Bluetooth devices drop the stream when idle; reopen it on the next sound.
+        if self.audio.as_ref().is_some_and(|(_, lost)| lost.load(Ordering::Relaxed)) {
+            self.audio = open_audio();
+        }
+        if let Some((audio, _)) = &self.audio
             && let Ok(source) = rodio::Decoder::new(std::io::Cursor::new(sound))
         {
             audio.mixer().add(rodio::Source::amplify(source, volume));
@@ -1751,6 +1759,21 @@ impl Drop for Restore {
         );
     }
 }
+fn open_audio() -> Option<(rodio::MixerDeviceSink, Arc<AtomicBool>)> {
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    let mut sink = rodio::DeviceSinkBuilder::from_default_device()
+        .and_then(|b| {
+            // rodio's 2048-frame default is rejected by macOS (max 1024).
+            b.with_buffer_size(rodio::cpal::BufferSize::Default)
+                .with_error_callback(move |_| flag.store(true, Ordering::Relaxed))
+                .open_stream()
+        })
+        .ok()?;
+    sink.log_on_drop(false);
+    Some((sink, lost))
+}
+
 pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
     if !demo {
         crate::wellness::Timer::save_status_theme(&config.theme)?;
@@ -1833,23 +1856,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         quitting: false,
         demo,
         // Opened once so each sound plays without startup latency.
-        audio: config
-            .sounds
-            .then(|| {
-                rodio::DeviceSinkBuilder::from_default_device()
-                    .and_then(|b| {
-                        // rodio's 2048-frame default is rejected by macOS (max 1024).
-                        b.with_buffer_size(rodio::cpal::BufferSize::Default)
-                            .with_error_callback(|_| {})
-                            .open_stream()
-                    })
-                    .ok()
-                    .map(|mut sink| {
-                        sink.log_on_drop(false);
-                        sink
-                    })
-            })
-            .flatten(),
+        audio: config.sounds.then(open_audio).flatten(),
         pending: '\0',
         count: String::new(),
         details: true,
