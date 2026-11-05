@@ -658,7 +658,7 @@ impl App {
                 };
                 if preview::toggle(&mut task, &action) {
                     if checking {
-                        self.play(include_bytes!("../assets/check.wav"), 0.7);
+                        self.play(include_bytes!("../assets/check.wav"), 0.5);
                     }
                     self.update(task);
                     if checking && self.open_boxes().is_empty() {
@@ -865,7 +865,7 @@ impl App {
         if matches!(job, Job::Complete(_))
             || matches!(job, Job::CheckHabit { value, .. } if value > 0.0)
         {
-            self.play(include_bytes!("../assets/check.wav"), 0.7);
+            self.play(include_bytes!("../assets/check.wav"), 0.5);
         }
         if self.demo {
             if let Job::CheckHabit {
