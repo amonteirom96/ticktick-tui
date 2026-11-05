@@ -852,7 +852,11 @@ impl App {
     }
     fn play(&mut self, sound: &'static [u8], volume: f32) {
         // Bluetooth devices drop the stream when idle; reopen it on the next sound.
-        if self.audio.as_ref().is_some_and(|(_, lost)| lost.load(Ordering::Relaxed)) {
+        if self
+            .audio
+            .as_ref()
+            .is_some_and(|(_, lost)| lost.load(Ordering::Relaxed))
+        {
             self.audio = open_audio();
         }
         if let Some((audio, _)) = &self.audio
@@ -1044,7 +1048,10 @@ impl App {
                         Ok(mut fields) => {
                             if self.pick > 0 && !text.is_empty() {
                                 let r = fields::parse_reminders(REMIND[self.pick - 1].1);
-                                fields.insert("reminders".into(), serde_json::json!(r.unwrap_or_default()));
+                                fields.insert(
+                                    "reminders".into(),
+                                    serde_json::json!(r.unwrap_or_default()),
+                                );
                             }
                             self.send(Job::Patch {
                                 id: t.id,
@@ -2085,30 +2092,58 @@ fn renumber(items: &mut [crate::api::ChecklistItem]) {
         item.extra.insert("sortOrder".into(), serde_json::json!(i));
     }
 }
-fn input_view(input: &str, cursor: usize, width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    let mut start = 0;
+// Keep one cell available for the terminal cursor, including at end of input.
+fn input_view(input: &str, cursor: usize, width: usize) -> (String, u16) {
     let chars = input.chars().collect::<Vec<_>>();
     let cursor = cursor.min(chars.len());
-    while start < cursor
-        && UnicodeWidthStr::width(chars[start..cursor].iter().collect::<String>().as_str())
-            >= width.saturating_sub(1)
+    let mut start = 0;
+    while start < cursor && chars[start..cursor].iter().collect::<String>().width() >= width.max(1)
     {
         start += 1;
     }
-    let tail = chars[start..].iter().collect::<String>();
-    input_prompt(&tail, cursor - start)
+    let offset = chars[start..cursor].iter().collect::<String>().width() as u16;
+    (chars[start..].iter().collect(), offset)
 }
-fn input_prompt(input: &str, cursor: usize) -> String {
-    let index = input
-        .char_indices()
-        .nth(cursor)
-        .map(|(i, _)| i)
-        .unwrap_or(input.len());
-    format!("{}{CURSOR}{}", &input[..index], &input[index..])
+
+fn input_line(f: &mut Frame, area: Rect, input: &str, cursor: usize) -> String {
+    let (text, offset) = input_view(input, cursor, area.width as usize);
+    if area.width > 0 && area.height > 0 {
+        f.set_cursor_position((area.x + offset, area.y));
+    }
+    text
 }
-/// Marca a posição do cursor no texto; `draw` troca pelo cursor nativo do terminal.
-const CURSOR: char = '\u{E000}';
+
+// Wrap explicitly so the displayed text and terminal cursor use identical rows.
+fn wrapped_input(input: &str, cursor: usize, width: usize) -> (String, (u16, u16)) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let width = width.max(1);
+    let mut text = String::new();
+    let (mut x, mut y, mut count) = (0, 0, 0);
+    let mut position = (0, 0);
+    for g in input.graphemes(true) {
+        let w = g.width();
+        if g != "\n" && x + w >= width && x > 0 {
+            text.push('\n');
+            x = 0;
+            y += 1;
+        }
+        if count <= cursor {
+            position = (x as u16, y as u16);
+        }
+        text.push_str(g);
+        if g == "\n" {
+            x = 0;
+            y += 1;
+        } else {
+            x += w;
+        }
+        count += g.chars().count();
+        if count <= cursor {
+            position = (x as u16, y as u16);
+        }
+    }
+    (text, position)
+}
 fn edit_input(input: &mut String, cursor: &mut usize, key: KeyEvent) {
     let mut chars = input.chars().collect::<Vec<_>>();
     *cursor = (*cursor).min(chars.len());
@@ -3015,22 +3050,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         rows[2],
     );
     let prompt = match app.mode {
-        Mode::Search => format!(
-            " /{}",
-            input_view(
-                &app.input,
-                app.input_cursor,
-                f.area().width.saturating_sub(4) as usize
-            )
-        ),
-        Mode::Command => format!(
-            " :{}",
-            input_view(
-                &app.input,
-                app.input_cursor,
-                f.area().width.saturating_sub(4) as usize
-            )
-        ),
+        Mode::Search | Mode::Command => {
+            let area = Rect::new(rows[3].x + 2, rows[3].y, rows[3].width.saturating_sub(2), rows[3].height);
+            let text = input_line(f, area, &app.input, app.input_cursor);
+            format!(" {}{text}", if app.mode == Mode::Search { "/" } else { ":" })
+        }
         Mode::Add | Mode::Subtask | Mode::Rename | Mode::ItemRename => {
             " INSERIR  Enter salvar · Esc cancelar".into()
         }
@@ -3042,9 +3066,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 .take(4)
                 .map(|(_, name)| name)
                 .collect::<Vec<_>>();
+            let area = Rect::new(rows[3].x + 14, rows[3].y, rows[3].width.saturating_sub(14), rows[3].height);
+            let text = input_line(f, area, &app.input, app.input_cursor);
             format!(
                 " MOVER  Lista: {}   → {}",
-                input_prompt(&app.input, app.input_cursor),
+                text,
                 if names.is_empty() {
                     "nenhuma lista".into()
                 } else {
@@ -3055,7 +3081,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Mode::Visual => " VISUAL  j/k estender · J/K mover · v/Esc sair".into(),
         Mode::FocusTask => format!(
             " ATIVIDADE  Buscar: {}   ↑/↓ escolher · Enter iniciar com ela · Esc cancelar",
-            input_prompt(&app.input, app.input_cursor)
+            app.input.clone()
         ),
         Mode::FocusConfig => {
             " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into()
@@ -3108,13 +3134,25 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled(" Selecionados: ", Style::default().fg(muted)),
-            Span::raw(input_prompt(&app.input, app.input_cursor)),
+            Span::raw(app.input.clone()),
         ]));
         lines.push(Line::styled(
             " ou digite: 2h, 3d",
             Style::default().fg(muted),
         ));
         let area = centered(f.area(), 44, lines.len() as u16 + 4);
+        let input_area = Rect::new(
+            area.x + 17,
+            area.y + area.height.saturating_sub(4),
+            area.width.saturating_sub(19),
+            1,
+        );
+        let text = input_line(f, input_area, &app.input, app.input_cursor);
+        if let Some(line) = lines.iter_mut().rev().nth(1) {
+            if let Some(span) = line.spans.last_mut() {
+                span.content = text.into();
+            }
+        }
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(lines)
@@ -3243,9 +3281,21 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled(" Buscar: ", Style::default().fg(muted)),
-            Span::raw(input_prompt(&app.input, app.input_cursor)),
+            Span::raw(app.input.clone()),
         ]));
         let area = centered(f.area(), width, lines.len() as u16 + 3);
+        let input_area = Rect::new(
+            area.x + 2 + 8,
+            area.y + area.height.saturating_sub(2),
+            area.width.saturating_sub(4 + 8),
+            1,
+        );
+        let text = input_line(f, input_area, &app.input, app.input_cursor);
+        if let Some(line) = lines.iter_mut().rev().nth(0) {
+            if let Some(span) = line.spans.last_mut() {
+                span.content = text.into();
+            }
+        }
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(lines)
@@ -3264,25 +3314,34 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         _ => None,
     };
     if let Some(title) = title {
-        use unicode_width::UnicodeWidthStr;
-        let text = input_prompt(&app.input, app.input_cursor);
         let width = f.area().width.saturating_sub(4).min(72);
-        let inner = width.saturating_sub(4).max(1) as usize;
-        let lines = text
-            .lines()
-            .map(|l| l.width() / inner + 1)
-            .sum::<usize>()
-            .max(1) as u16;
-        let area = centered(f.area(), width, lines + 3);
+        let (text, (x, y)) = wrapped_input(
+            &app.input,
+            app.input_cursor,
+            width.saturating_sub(4) as usize,
+        );
+        let lines = text.split('\n').count() as u16;
+        let area = centered(f.area(), width, lines.saturating_add(3));
+        let inner = Rect::new(
+            area.x + 2,
+            area.y + 1,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(2),
+        );
+        let scroll = y.saturating_sub(inner.height.saturating_sub(1));
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(text)
                 .style(Style::default().bg(panel).fg(fg))
-                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
                 .block(block(title.into(), true).padding(Padding::horizontal(1))),
             area,
         );
+        if inner.width > 0 && inner.height > 0 {
+            f.set_cursor_position((inner.x + x.min(inner.width - 1), inner.y + y - scroll));
+        }
     }
+
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
@@ -3300,12 +3359,6 @@ Ctrl-C força a saída.",
             .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
             area,
         );
-    }
-    let buf = f.buffer_mut();
-    if let Some(i) = buf.content.iter().position(|c| c.symbol() == CURSOR.to_string()) {
-        let (x, y) = buf.pos_of(i);
-        buf.content[i].set_symbol(" ");
-        f.set_cursor_position((x, y));
     }
 }
 /// Typed digits → `HH:MM`: `9` → `9:00`, `1430` → `14:30`. Empty = all day.
@@ -3351,6 +3404,20 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_cursor_tracks_scrolling_and_unicode_wrapping() {
+        assert_eq!(super::input_view("abcdef", 6, 4), ("def".into(), 3));
+        assert_eq!(super::input_view("a界b", 2, 4), ("a界b".into(), 3));
+        assert_eq!(
+            super::wrapped_input("abcd", 4, 4),
+            ("abc\nd".into(), (1, 1))
+        );
+        assert_eq!(
+            super::wrapped_input("a\n界b", 3, 5),
+            ("a\n界b".into(), (2, 1))
+        );
+    }
+
     use super::*;
     #[test]
     fn report_groups_siblings_with_parent_first() {
@@ -3518,7 +3585,10 @@ mod tests {
             tomorrow - chrono::Duration::days(1),
         );
         assert_eq!(label, Some(("amanhã 14:30".into(), false)));
-        assert_eq!(a.data.tasks[0].extra["reminders"], serde_json::json!(["TRIGGER:-PT5M"]));
+        assert_eq!(
+            a.data.tasks[0].extra["reminders"],
+            serde_json::json!(["TRIGGER:-PT5M"])
+        );
         press(&mut a, 'D');
         assert_eq!((a.cal, a.input.as_str()), (tomorrow, "1430"));
         press(&mut a, 'x');
@@ -3845,7 +3915,11 @@ mod tests {
         let mut a = app();
         a.data.tasks[0].content = "- [ ] um\n\nveja [site](https://x.com)\n\n- [ ] dois".into();
         a.focus(2);
-        let link = |a: &App| a.preview(&config::Theme::default())[a.preview_cursor].link.clone();
+        let link = |a: &App| {
+            a.preview(&config::Theme::default())[a.preview_cursor]
+                .link
+                .clone()
+        };
         press(&mut a, 'j');
         assert_eq!(link(&a).as_deref(), Some("https://x.com"));
         press(&mut a, 'j');

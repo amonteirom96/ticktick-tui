@@ -58,12 +58,15 @@ impl Form {
             self.token
                 .chars()
                 .count()
-                .min(width.saturating_sub(8) as usize),
+                .min(width.saturating_sub(14) as usize),
         );
         let text = format!(
-            "\nConecte sua conta com um API token do TickTick.\nCole o token abaixo; a entrada fica oculta.\n\nAPI token: {mask}▏\n\n{}\n\nEnter  validar e salvar    Ctrl-u  limpar    Esc  cancelar\n\nO token é salvo separado do tema, com acesso restrito.",
+            "\nConecte sua conta com um API token do TickTick.\nCole o token abaixo; a entrada fica oculta.\n\nAPI token: {mask}\n\n{}\n\nEnter  validar e salvar    Ctrl-u  limpar    Esc  cancelar\n\nO token é salvo separado do tema, com acesso restrito.",
             self.message
         );
+        if area.width >= 14 && area.height > 6 {
+            f.set_cursor_position((area.x + 12 + mask.chars().count() as u16, area.y + 5));
+        }
         f.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
