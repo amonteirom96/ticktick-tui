@@ -56,7 +56,7 @@ struct Markdown<'a> {
     /// Per open list item: whether it pushed the "done" style.
     items: Vec<bool>,
     quote: usize,
-    code: bool,
+    code: Option<(String, String)>,
     hang: usize,
     /// Cells of the table being parsed, laid out on `TagEnd::Table`.
     table: Vec<Vec<Vec<Span<'static>>>>,
@@ -99,6 +99,74 @@ impl<'a> Markdown<'a> {
         }
     }
 }
+/// Lay out code before prose wrapping so indentation and blank lines stay intact.
+fn code_block(source: &str, language: &str, theme: &Theme, width: usize) -> Vec<Row> {
+    let width = width.max(1);
+    let base = Style::default().fg(color(&theme.foreground));
+    let muted = Style::default().fg(color(&theme.muted));
+    let title = if language.is_empty() {
+        "código"
+    } else {
+        language
+    };
+    let title = title
+        .graphemes(true)
+        .scan(0, |used, g| {
+            *used += g.width();
+            (*used <= width).then_some(g)
+        })
+        .collect::<String>();
+    let mut rows = vec![Row::text(Span::styled(
+        title,
+        Style::default().fg(color(&theme.accent)).bold(),
+    ))];
+    let lines: Vec<_> = source.lines().collect();
+    let digits = lines.len().max(1).to_string().len();
+    // Omit the gutter in very narrow panes to leave space for source text.
+    let numbered = width >= digits + 8;
+    let gutter = if numbered { digits + 2 } else { 0 };
+    let content_width = width.saturating_sub(gutter).max(1);
+    for (index, line) in lines.iter().enumerate() {
+        let mut chunks = vec![String::new()];
+        let mut used = 0;
+        for g in line.graphemes(true) {
+            let expanded = if g == "\t" {
+                " ".repeat(4 - used % 4)
+            } else {
+                g.to_owned()
+            };
+            for g in expanded.graphemes(true) {
+                let size = g.width();
+                if size > content_width {
+                    continue;
+                }
+                if used + size > content_width {
+                    chunks.push(String::new());
+                    used = 0;
+                }
+                chunks.last_mut().unwrap().push_str(g);
+                used += size;
+            }
+        }
+        for (part, chunk) in chunks.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if numbered {
+                let number = if part == 0 {
+                    format!("{:>digits$}", index + 1)
+                } else {
+                    format!("{:>digits$}", "↳")
+                };
+                spans.push(Span::styled(format!("{number}  "), muted));
+            }
+            let padding = content_width.saturating_sub(chunk.width());
+            spans.push(Span::styled(chunk, base));
+            spans.push(Span::styled(" ".repeat(padding), base));
+            rows.push(Row::text(Line::from(spans)));
+        }
+    }
+    rows
+}
+
 fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row> {
     let mut m = Markdown {
         theme,
@@ -110,7 +178,7 @@ fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row>
         lists: vec![],
         items: vec![],
         quote: 0,
-        code: false,
+        code: None,
         hang: 0,
         table: vec![],
     };
@@ -172,20 +240,13 @@ fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row>
                 }
                 Tag::CodeBlock(kind) => {
                     m.blank();
-                    m.code = true;
                     let language = match kind {
-                        pulldown_cmark::CodeBlockKind::Fenced(s) => s.to_string(),
+                        pulldown_cmark::CodeBlockKind::Fenced(s) => {
+                            s.split_whitespace().next().unwrap_or("").to_owned()
+                        }
                         _ => String::new(),
                     };
-                    m.rows.push(Row::text(Span::styled(
-                        format!("╭─ {language}"),
-                        Style::default().fg(color(&theme.muted)),
-                    )));
-                    m.styles.push(
-                        Style::default()
-                            .bg(color(&theme.code_background))
-                            .fg(color(&theme.code)),
-                    );
+                    m.code = Some((language, String::new()));
                 }
                 Tag::Table(_) => m.blank(),
                 Tag::TableHead | Tag::TableRow => m.table.push(vec![]),
@@ -231,13 +292,9 @@ fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row>
                     m.blank();
                 }
                 TagEnd::CodeBlock => {
-                    m.flush();
-                    m.styles.pop();
-                    m.code = false;
-                    m.rows.push(Row::text(Span::styled(
-                        "╰─",
-                        Style::default().fg(color(&theme.muted)),
-                    )));
+                    if let Some((language, source)) = m.code.take() {
+                        m.rows.extend(code_block(&source, &language, theme, width));
+                    }
                     m.blank();
                 }
                 TagEnd::TableCell => {
@@ -282,14 +339,8 @@ fn markdown(source: &str, field: Field, theme: &Theme, width: usize) -> Vec<Row>
                 _ => (),
             },
             Event::Text(text) => {
-                if m.code {
-                    for line in text.lines() {
-                        m.spans
-                            .push(Span::styled("│ ", Style::default().fg(color(&theme.muted))));
-                        m.hang = 1;
-                        m.push(line);
-                        m.flush();
-                    }
+                if let Some((_, source)) = &mut m.code {
+                    source.push_str(&text);
                 } else {
                     m.prefix();
                     // Text right after a quote bar/marker never starts with a gap.
@@ -775,6 +826,37 @@ pub fn render(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_panel_preserves_indentation_and_fits_narrow_panes() {
+        let theme = Default::default();
+        let source = "```rust\n    let value = \"世界\";\n\n\tvalue\n```";
+        for width in [1, 3, 4, 8, 16, 40] {
+            let rows = super::wrap(
+                super::markdown(source, super::Field::Content, &theme, width),
+                width,
+            );
+            assert!(rows.iter().all(|row| row.line.width() <= width));
+        }
+        let rows = super::wrap(
+            super::markdown(source, super::Field::Content, &theme, 40),
+            40,
+        );
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(text[0].contains("rust"));
+        assert!(text[1].contains("1      let"));
+        assert!(text[2].contains("2  "));
+        assert!(text[3].contains("3      value"));
+    }
+
     #[test]
     fn wrapped_quote_keeps_bar() {
         let theme = Default::default();
