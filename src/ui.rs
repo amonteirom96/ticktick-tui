@@ -409,11 +409,13 @@ impl App {
     fn jump(&mut self, delta: isize) {
         let rows = self.preview(&config::Theme::default());
         for _ in 0..delta.unsigned_abs() {
-            let here = rows
-                .get(self.preview_cursor)
-                .and_then(|r| r.action.as_ref());
-            // Wrapped rows repeat their action, so skip rows of the current entry.
-            let other = |r: &&preview::Row| r.action.is_some() && r.action.as_ref() != here;
+            // Links are stops too, so `gx` can reach them.
+            let key = |r: &preview::Row| (r.action.clone(), r.link.clone());
+            let here = rows.get(self.preview_cursor).map(key);
+            // Wrapped rows repeat their action/link, so skip rows of the current entry.
+            let other = |r: &&preview::Row| {
+                (r.action.is_some() || r.link.is_some()) && Some(key(r)) != here
+            };
             let found = if delta > 0 {
                 rows.iter()
                     .skip(self.preview_cursor + 1)
@@ -424,7 +426,7 @@ impl App {
                     .iter()
                     .rposition(|r| other(&r))
                     .map(|mut i| {
-                        while i > 0 && rows[i - 1].action == rows[i].action {
+                        while i > 0 && key(&rows[i - 1]) == key(&rows[i]) {
                             i -= 1;
                         }
                         i
@@ -3691,6 +3693,20 @@ mod tests {
         assert_eq!(a.task().unwrap().id, "0");
         assert_eq!(a.selected, 1);
         assert!(a.mode == Mode::Normal);
+    }
+    #[test]
+    fn j_stops_on_link_rows_between_checkboxes() {
+        let mut a = app();
+        a.data.tasks[0].content = "- [ ] um\n\nveja [site](https://x.com)\n\n- [ ] dois".into();
+        a.focus(2);
+        let link = |a: &App| a.preview(&config::Theme::default())[a.preview_cursor].link.clone();
+        press(&mut a, 'j');
+        assert_eq!(link(&a).as_deref(), Some("https://x.com"));
+        press(&mut a, 'j');
+        assert_eq!(link(&a), None);
+        assert!(a.cursor_action().is_some());
+        press(&mut a, 'k');
+        assert_eq!(link(&a).as_deref(), Some("https://x.com"));
     }
     #[test]
     fn report_queries_do_not_show_save_status_or_queue_mutations() {
