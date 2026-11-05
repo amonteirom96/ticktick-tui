@@ -67,8 +67,11 @@ struct App {
     zoom: bool,
     hide_lists: bool,
     collapsed: HashSet<String>,
-    /// Highlighted option in the due/reminder pickers, or where the next checklist item goes.
+    /// Highlighted option in the reminder picker, or where the next checklist item goes.
     pick: usize,
+    /// Due-date calendar: day under the cursor and the day marked with Space.
+    cal: chrono::NaiveDate,
+    marked: Option<chrono::NaiveDate>,
     /// Preview entry being renamed with `cc`.
     item: Option<Action>,
     hide_done: bool,
@@ -730,7 +733,6 @@ impl App {
     }
     fn options(&self) -> &'static [(&'static str, &'static str)] {
         match self.mode {
-            Mode::Due => &DUE,
             Mode::Remind => &REMIND,
             _ => &[],
         }
@@ -1031,11 +1033,17 @@ impl App {
             Mode::Due => {
                 if let Some(t) = self.target.take() {
                     match fields::due_fields(&text, sidebar::today(&self.data), self.tz()) {
-                        Ok(fields) => self.send(Job::Patch {
-                            id: t.id,
-                            project: t.project_id,
-                            fields,
-                        }),
+                        Ok(mut fields) => {
+                            if self.pick > 0 && !text.is_empty() {
+                                let r = fields::parse_reminders(REMIND[self.pick - 1].1);
+                                fields.insert("reminders".into(), serde_json::json!(r.unwrap_or_default()));
+                            }
+                            self.send(Job::Patch {
+                                id: t.id,
+                                project: t.project_id,
+                                fields,
+                            })
+                        }
                         Err(e) => self.message = e,
                     }
                 }
@@ -1154,15 +1162,41 @@ impl App {
             self.mode = Mode::Normal;
             return false;
         }
-        if matches!(self.mode, Mode::Due | Mode::Remind) {
+        if self.mode == Mode::Due && key.code != K::Esc {
+            let days = match key.code {
+                K::Char('h') | K::Left => -1,
+                K::Char('l') | K::Right => 1,
+                K::Char('k') | K::Up => -7,
+                K::Char('j') | K::Down => 7,
+                _ => 0,
+            };
+            match key.code {
+                _ if days != 0 => self.cal += chrono::Duration::days(days),
+                K::Char('H') => self.cal = self.cal - chrono::Months::new(1),
+                K::Char('L') => self.cal = self.cal + chrono::Months::new(1),
+                K::Char(' ') => self.marked = (self.marked != Some(self.cal)).then_some(self.cal),
+                // pick 0 = keep reminders as they are; i > 0 = REMIND[i - 1].
+                K::Char('r') => self.pick = (self.pick + 1) % (REMIND.len() + 1),
+                K::Char(c @ '0'..='9') if self.input.len() < 4 => self.input.push(c),
+                K::Backspace => drop(self.input.pop()),
+                K::Char('x') => {
+                    self.input.clear();
+                    return self.submit();
+                }
+                K::Enter => {
+                    let day = self.marked.unwrap_or(self.cal).format("%Y-%m-%d");
+                    self.input = format!("{day} {}", due_time(&self.input));
+                    return self.submit();
+                }
+                _ => (),
+            }
+            return false;
+        }
+        if self.mode == Mode::Remind {
             let options = self.options();
-            // j/k navigate unless the user is typing a custom date ("hoje" contains a j).
-            let typing = self.mode == Mode::Due && !self.input.is_empty();
             let step = match key.code {
-                K::Down => 1,
-                K::Up => -1,
-                K::Char('j') if !typing => 1,
-                K::Char('k') if !typing => -1,
+                K::Down | K::Char('j') => 1,
+                K::Up | K::Char('k') => -1,
                 _ => 0,
             };
             if step != 0 {
@@ -1170,33 +1204,21 @@ impl App {
                 return false;
             }
             let value = options[self.pick].1;
-            match key.code {
-                K::Tab if self.mode == Mode::Due => {
-                    self.input = format!("{value} ");
-                    self.input_cursor = self.input.chars().count();
-                    return false;
+            if key.code == K::Char(' ') {
+                let mut tokens = self
+                    .input
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                match tokens.iter().position(|t| t == value) {
+                    Some(i) => drop(tokens.remove(i)),
+                    None => tokens.push(value.into()),
                 }
-                K::Enter if self.mode == Mode::Due && self.input.trim().is_empty() => {
-                    self.input = value.into();
-                    return self.submit();
-                }
-                K::Char(' ') if self.mode == Mode::Remind => {
-                    let mut tokens = self
-                        .input
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    match tokens.iter().position(|t| t == value) {
-                        Some(i) => drop(tokens.remove(i)),
-                        None => tokens.push(value.into()),
-                    }
-                    self.input = tokens.join(", ");
-                    self.input_cursor = self.input.chars().count();
-                    return false;
-                }
-                _ => (),
+                self.input = tokens.join(", ");
+                self.input_cursor = self.input.chars().count();
+                return false;
             }
         }
         if self.mode == Mode::FocusTask {
@@ -1571,7 +1593,24 @@ impl App {
             }
             K::Char('d') => self.pending = 'd',
             K::Char('m') => self.edit(Mode::Move, String::new()),
-            K::Char('D') => self.edit(Mode::Due, String::new()),
+            K::Char('D') => {
+                // "dd/mm/YYYY[ HH:MM]" → calendar on that day, time as digits.
+                let current = self
+                    .task()
+                    .and_then(|t| {
+                        let all_day =
+                            t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+                        t.due_date
+                            .as_deref()
+                            .map(|d| fields::format_due(d, all_day, self.tz()))
+                    })
+                    .unwrap_or_default();
+                self.marked =
+                    chrono::NaiveDate::parse_from_str(current.get(..10).unwrap_or(""), "%d/%m/%Y")
+                        .ok();
+                self.cal = self.marked.unwrap_or_else(|| sidebar::today(&self.data));
+                self.edit(Mode::Due, current.get(11..).unwrap_or("").replace(':', ""));
+            }
             K::Char('R') if self.task().is_some_and(|t| t.due_date.is_none()) => {
                 self.message = "Defina um prazo (D) antes do lembrete.".into()
             }
@@ -1772,6 +1811,8 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         hide_lists: false,
         collapsed: HashSet::new(),
         pick: 0,
+        cal: chrono::NaiveDate::MIN,
+        marked: None,
         item: None,
         hide_done: false,
         show_completed: false,
@@ -3012,7 +3053,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Mode::FocusConfig => {
             " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into()
         }
-        Mode::Due => " PRAZO  j/k escolher · Enter salvar · Tab completar · Esc cancelar".into(),
+        Mode::Due => {
+            " PRAZO  hjkl dia · H/L mês · Space marcar · 0-9 hora · r lembrete · x sem prazo · Enter salvar · Esc cancelar".into()
+        }
         Mode::Remind => {
             " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into()
         }
@@ -3035,18 +3078,17 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         Paragraph::new(prompt).style(Style::default().bg(selection).fg(accent)),
         rows[3],
     );
-    if matches!(app.mode, Mode::Due | Mode::Remind) {
-        let due = app.mode == Mode::Due;
+    if app.mode == Mode::Remind {
         let chosen = app.input.split(',').map(str::trim).collect::<Vec<_>>();
         let mut lines = app
             .options()
             .iter()
             .enumerate()
             .map(|(i, (label, value))| {
-                let mark = match (due, chosen.contains(value)) {
-                    (true, _) => "",
-                    (false, true) => "● ",
-                    (false, false) => "○ ",
+                let mark = if chosen.contains(value) {
+                    "● "
+                } else {
+                    "○ "
                 };
                 let style = if i == app.pick {
                     Style::default().bg(selection).fg(accent)
@@ -3058,36 +3100,90 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .collect::<Vec<_>>();
         lines.push(Line::default());
         lines.push(Line::from(vec![
-            Span::styled(
-                if due {
-                    " Outra data: "
-                } else {
-                    " Selecionados: "
-                },
-                Style::default().fg(muted),
-            ),
+            Span::styled(" Selecionados: ", Style::default().fg(muted)),
             Span::raw(input_prompt(&app.input, app.input_cursor)),
         ]));
         lines.push(Line::styled(
-            if due {
-                " ex.: 25/12 · sex 14:30 · +3 · amanhã 09:00"
-            } else {
-                " ou digite: 2h, 3d"
-            },
+            " ou digite: 2h, 3d",
             Style::default().fg(muted),
         ));
-        let current = app.target.as_ref().and_then(|t| {
-            let all_day = t.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
-            t.due_date
-                .as_deref()
-                .map(|d| fields::format_due(d, all_day, app.tz()))
-        });
-        let title = match (due, current) {
-            (true, Some(c)) => format!(" Prazo · atual {c} "),
-            (true, None) => " Prazo ".into(),
-            (false, _) => " Lembretes ".into(),
-        };
         let area = centered(f.area(), 44, lines.len() as u16 + 4);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(panel).fg(fg))
+                .block(block(" Lembretes ".into(), true).padding(Padding::new(1, 1, 1, 0))),
+            area,
+        );
+    }
+    if app.mode == Mode::Due {
+        use chrono::Datelike;
+        const MONTHS: [&str; 12] = [
+            "janeiro",
+            "fevereiro",
+            "março",
+            "abril",
+            "maio",
+            "junho",
+            "julho",
+            "agosto",
+            "setembro",
+            "outubro",
+            "novembro",
+            "dezembro",
+        ];
+        let today = sidebar::today(&app.data);
+        let first = app.cal.with_day(1).unwrap();
+        let start = first - chrono::Duration::days(first.weekday().num_days_from_monday() as i64);
+        let mut lines = vec![Line::styled(
+            "  S   T   Q   Q   S   S   D",
+            Style::default().fg(muted),
+        )];
+        for week in 0..6 {
+            let mut spans = Vec::new();
+            for d in 0..7 {
+                let day = start + chrono::Duration::days(week * 7 + d);
+                let mut style = Style::default();
+                if day.month() != app.cal.month() {
+                    style = style.fg(muted);
+                }
+                if day == today {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if Some(day) == app.marked {
+                    style = style.fg(accent).add_modifier(Modifier::BOLD);
+                }
+                if day == app.cal {
+                    style = style.bg(selection).fg(accent);
+                }
+                spans.push(Span::styled(format!("{:>3}", day.day()), style));
+                spans.push(Span::raw(" "));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::default());
+        let time = due_time(&app.input);
+        lines.push(Line::from(vec![
+            Span::styled(" Hora: ", Style::default().fg(muted)),
+            Span::raw(if time.is_empty() {
+                "dia todo".into()
+            } else {
+                time
+            }),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Lembrete: ", Style::default().fg(muted)),
+            Span::raw(match app.pick {
+                0 => "Sem lembrete",
+                i => REMIND[i - 1].0,
+            }),
+        ]));
+        let title = format!(
+            " Prazo · {} {} ",
+            MONTHS[app.cal.month0() as usize],
+            app.cal.year()
+        );
+        let area = centered(f.area(), 34, lines.len() as u16 + 4);
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(lines)
@@ -3205,12 +3301,14 @@ Ctrl-C força a saída.",
         f.set_cursor_position((x, y));
     }
 }
-const DUE: [(&str, &str); 4] = [
-    ("Hoje", "hoje"),
-    ("Amanhã", "amanhã"),
-    ("Próxima semana", "+7"),
-    ("Sem prazo", ""),
-];
+/// Typed digits → `HH:MM`: `9` → `9:00`, `1430` → `14:30`. Empty = all day.
+fn due_time(digits: &str) -> String {
+    match digits.len() {
+        0 => String::new(),
+        1 | 2 => format!("{digits}:00"),
+        n => format!("{}:{}", &digits[..n - 2], &digits[n - 2..]),
+    }
+}
 const REMIND: [(&str, &str); 6] = [
     ("No horário", "0"),
     ("5 min antes", "5m"),
@@ -3349,6 +3447,8 @@ mod tests {
             hide_lists: false,
             collapsed: HashSet::new(),
             pick: 0,
+            cal: chrono::NaiveDate::MIN,
+            marked: None,
             item: None,
             hide_done: false,
             show_completed: false,
@@ -3377,6 +3477,45 @@ mod tests {
     }
     fn press(a: &mut App, c: char) {
         a.key(KeyEvent::new(K::Char(c), M::NONE));
+    }
+    #[test]
+    fn due_calendar_marks_day_and_time() {
+        let mut a = app();
+        a.data.time_zone = Some("America/Sao_Paulo".into());
+        let tomorrow = sidebar::today(&a.data) + chrono::Duration::days(1);
+        press(&mut a, 'D');
+        assert_eq!(a.cal, sidebar::today(&a.data));
+        for c in ['l', 'l', 'h', ' ', 'L', '1', '4', '3', '0', 'r', 'r'] {
+            press(&mut a, c);
+        }
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        Terminal::new(backend)
+            .unwrap()
+            .draw(|f| draw(f, &a, &Config::default()))
+            .unwrap();
+        {
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut t = Terminal::new(backend).unwrap();
+            t.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            let buf = t.backend().buffer().clone();
+            for y in 5..25 {
+                let line: String = (30..75).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                eprintln!("{line}");
+            }
+        }
+        a.key(KeyEvent::from(K::Enter)); // Saves the marked day, not the cursor (next month).
+        let label = fields::relative_due(
+            a.data.tasks[0].due_date.as_deref().unwrap(),
+            false,
+            a.tz(),
+            tomorrow - chrono::Duration::days(1),
+        );
+        assert_eq!(label, Some(("amanhã 14:30".into(), false)));
+        assert_eq!(a.data.tasks[0].extra["reminders"], serde_json::json!(["TRIGGER:-PT5M"]));
+        press(&mut a, 'D');
+        assert_eq!((a.cal, a.input.as_str()), (tomorrow, "1430"));
+        press(&mut a, 'x');
+        assert!(a.data.tasks[0].due_date.is_none());
     }
     #[test]
     fn b_hides_lists_after_widening_them() {
