@@ -72,6 +72,7 @@ struct App {
     /// Preview entry being renamed with `cc`.
     item: Option<Action>,
     hide_done: bool,
+    show_completed: bool,
     /// Inverse patches of `update`, newest last.
     undo: Vec<Job>,
     theme_request: Option<String>,
@@ -97,10 +98,31 @@ struct App {
 }
 impl App {
     fn persist_timer(&mut self) {
-        if !self.demo
-            && let Err(error) = self.timer.save()
-        {
+        if self.demo {
+            return;
+        }
+        if let Err(error) = self.timer.save() {
             self.message = format!("Timer em memória; falha ao salvar estado local: {error}");
+            return;
+        }
+        for upload in self.timer.ready_uploads() {
+            self.timer.mark_attempted(&upload.id);
+            if let Err(error) = self.timer.save() {
+                self.message = format!("Falha ao salvar envio pendente de foco: {error}");
+                return;
+            }
+            if self
+                .tx
+                .as_ref()
+                .is_some_and(|tx| tx.send(Job::SaveFocus(upload)).is_ok())
+            {
+                self.in_flight += 1;
+                self.busy = true;
+                self.message = "Salvando sessão de foco no TickTick…".into();
+            } else {
+                self.message =
+                    "Foco pendente · reconecte e use :focus-retry após conferir o histórico".into();
+            }
         }
     }
 
@@ -204,7 +226,15 @@ impl App {
             .iter()
             .filter(|t| sidebar::matches(&view, t, &self.data))
             .collect::<Vec<_>>();
-        tasks.sort_by_key(|t| t.sort_order);
+        if self.show_completed {
+            let mut seen: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+            for task in self.data.completed.iter().rev() {
+                if sidebar::matches(&view, task, &self.data) && seen.insert(task.id.clone()) {
+                    tasks.push(task);
+                }
+            }
+        }
+        tasks.sort_by_key(|t| (t.status != 0, t.sort_order));
         tasks
     }
     fn tree(&self) -> Vec<tree::Row<'_>> {
@@ -1078,9 +1108,22 @@ impl App {
                     self.mode = Mode::Delete;
                     return false;
                 }
+                "focus-retry" => {
+                    if self.busy {
+                        self.message =
+                            "Aguarde o envio em andamento antes de tentar novamente.".into();
+                    } else {
+                        self.timer.retry_uploads();
+                        self.persist_timer();
+                    }
+                }
                 "complete" => {
                     if let Some(t) = self.task() {
-                        self.send(Job::Complete(t));
+                        self.send(if t.status == 2 {
+                            Job::Reopen(t)
+                        } else {
+                            Job::Complete(t)
+                        });
                     }
                 }
                 _ => self.message = format!("Unknown command: {text}"),
@@ -1434,6 +1477,17 @@ impl App {
                     -(n as isize)
                 });
             }
+            K::Char('h') if pending == 'z' && !self.preview_focus => {
+                self.show_completed = !self.show_completed;
+                self.clamp();
+                self.preview_cursor = 0;
+                self.message = if self.show_completed {
+                    "Concluídos disponíveis no histórico local visíveis · x / Space reabre"
+                } else {
+                    "Concluídos ocultos"
+                }
+                .into();
+            }
             K::Char('h') if pending == 'z' => {
                 self.hide_done = !self.hide_done;
                 self.message = if self.hide_done {
@@ -1579,7 +1633,11 @@ impl App {
             K::Char('c') => self.pending = 'c',
             K::Char('x') | K::Char(' ') => {
                 if let Some(t) = self.task() {
-                    self.send(Job::Complete(t));
+                    self.send(if t.status == 2 {
+                        Job::Reopen(t)
+                    } else {
+                        Job::Complete(t)
+                    });
                 }
             }
             K::Char('r') => self.send(if self.view() == View::Report {
@@ -1680,6 +1738,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
     };
+    let account = api.as_ref().map(Api::account_key);
     let (tx, rx) = if let Some(api) = api {
         let (t, r) = sync::worker(api, data.clone());
         (Some(t), Some(r))
@@ -1713,6 +1772,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         pick: 0,
         item: None,
         hide_done: false,
+        show_completed: false,
         undo: Vec::new(),
         theme_request: None,
         mode: Mode::Normal,
@@ -1754,6 +1814,15 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         tx,
         rx,
     };
+    if let Some(account) = account {
+        app.timer.bind_account(account);
+        app.persist_timer();
+        if app.timer.uncertain_uploads() > 0 {
+            app.message =
+                "Há envios de foco sem confirmação · confira o histórico antes de :focus-retry"
+                    .into();
+        }
+    }
     if !demo {
         app.send(Job::Refresh);
     }
@@ -1765,6 +1834,9 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             app.play(include_bytes!("../assets/notification.wav"), 1.0);
         }
         was_finished = finished;
+        if app.timer.finish_if_due() || !app.timer.ready_uploads().is_empty() {
+            app.persist_timer();
+        }
         loop {
             let event = app.rx.as_ref().and_then(|rx| rx.try_recv().ok());
             if let Some(event) = event {
@@ -1772,6 +1844,24 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 app.busy = app.in_flight > 0;
                 app.last_sync = Instant::now();
                 match event {
+                    sync::Event::FocusSaved { id, result } => {
+                        match result {
+                            Ok(data) => {
+                                app.timer.acknowledge(&id);
+                                app.replace_snapshot(data);
+                                app.message = "Sessão de foco salva no TickTick".into();
+                            }
+                            Err(error) => {
+                                app.message = format!(
+                                    "Envio de foco sem confirmação: {error}. Registro local preservado; confira o histórico antes de :focus-retry."
+                                )
+                            }
+                        }
+                        if let Err(error) = app.timer.save() {
+                            app.message = format!("Falha ao salvar confirmação do foco: {error}");
+                        }
+                    }
+
                     sync::Event::Report(day, d, m) => {
                         app.finish_report(day);
                         app.replace_snapshot(d);
@@ -1796,6 +1886,8 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                             for job in &mut app.pending_jobs {
                                 sync::remap(job, &local.id, &remote.id);
                             }
+                            app.timer.remap_task(&local.id, &remote.id);
+                            app.persist_timer();
                             if selected.as_deref() == Some(&local.id) {
                                 selected = Some(remote.id.clone());
                             }
@@ -1830,6 +1922,8 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
             } else if app.busy {
                 app.message = "Wait for synchronization, then use :token again.".into();
             } else if let Some(api) = crate::token_ui::configure(&mut terminal, &config)? {
+                app.timer.bind_account(api.account_key());
+                app.timer.save()?;
                 let (tx, rx) = sync::worker(api, Snapshot::default());
                 app.tx = Some(tx);
                 app.rx = Some(rx);
@@ -2923,7 +3017,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         }
         _ => {
             if matches!(app.view(), View::Focus) {
-                " FOCO  Space iniciar/pausar · t atividade · c tempos · n próxima fase · s zerar · p/w modo · h listas".into()
+                " FOCO  Space iniciar/pausar · t atividade · c tempos · n próxima fase · s encerrar/salvar · p/w modo · h listas".into()
             } else if app.view() == View::Habits {
                 " HÁBITOS  j/k rolar · Space concluir/desmarcar · h listas · r sincronizar · ? ajuda".into()
             } else if app.preview_focus {
@@ -3085,7 +3179,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\n1 / 2 / 3      Focar listas / tarefas / preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nH / L          Subir nível / virar subtarefa da de cima\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir tarefa            dd        Excluir (confirmar y)\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa (l também abre)\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Zerar timer local\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\n1 / 2 / 3      Focar listas / tarefas / preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nH / L          Subir nível / virar subtarefa da de cima\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir / reabrir tarefa            dd        Excluir (confirmar y)\nzh             Mostrar / ocultar tarefas concluídas\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa (l também abre)\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Encerrar e salvar sessão\n:focus-retry   Reenviar foco pendente após conferir histórico\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
     }
     if app.quitting {
         let area = centered(f.area(), 44, 5);
@@ -3168,6 +3262,29 @@ mod tests {
     }
 
     #[test]
+    fn list_shows_completed_and_reopens_selected_task() {
+        let mut a = app();
+        a.demo = true;
+        a.projects_focus = false;
+        a.preview_focus = false;
+        let task = a.data.tasks[0].clone();
+        a.send(Job::Complete(task.clone()));
+        assert!(!a.visible().iter().any(|t| t.id == task.id));
+        a.key(KeyEvent::new(K::Char('z'), M::NONE));
+        a.key(KeyEvent::new(K::Char('h'), M::NONE));
+        a.selected = a.visible().iter().position(|t| t.id == task.id).unwrap();
+        assert_eq!(a.task().unwrap().marker(), "✓");
+        a.key(KeyEvent::new(K::Char('x'), M::NONE));
+        assert!(
+            a.data
+                .tasks
+                .iter()
+                .any(|t| t.id == task.id && t.status == 0)
+        );
+        assert!(!a.data.completed.iter().any(|t| t.id == task.id));
+    }
+
+    #[test]
     fn notes_cannot_be_completed_or_queued() {
         let mut a = app();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3224,6 +3341,7 @@ mod tests {
             pick: 0,
             item: None,
             hide_done: false,
+            show_completed: false,
             undo: Vec::new(),
             theme_request: None,
             mode: Mode::Normal,

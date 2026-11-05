@@ -1,3 +1,5 @@
+mod upload;
+pub use upload::FocusUpload;
 use crate::{api::Snapshot, config, preview, sidebar::View};
 use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
@@ -31,19 +33,38 @@ pub struct Timer {
     short: u64,
     long: u64,
     task: Option<FocusTask>,
+    session: Option<upload::Session>,
+    uploads: Vec<FocusUpload>,
+    account: Option<String>,
 }
 impl Default for Timer {
     fn default() -> Self {
-        Self { pomodoro: true, started: None, elapsed: 0, phase: Phase::Focus, cycles: 0, focus: 25, short: 5, long: 15, task: None }
+        Self { pomodoro: true, started: None, elapsed: 0, phase: Phase::Focus, cycles: 0, focus: 25, short: 5, long: 15, task: None, session: None, uploads: Vec::new(), account: None }
     }
 }
 impl Timer {
     pub fn is_pomodoro(&self) -> bool { self.pomodoro }
     pub fn task(&self) -> Option<&FocusTask> { self.task.as_ref() }
-    pub fn set_task(&mut self, task: Option<FocusTask>) { self.task = task; }
+    pub fn set_task(&mut self, task: Option<FocusTask>) {
+        if self.task == task { return; }
+        if self.pomodoro && self.phase != Phase::Focus {
+            self.task = task;
+            return;
+        }
+        let running = self.started.is_some() && !self.finished();
+        self.finish_session();
+        self.started = None;
+        self.elapsed = 0;
+        self.task = task;
+        if running { self.toggle(self.pomodoro); }
+    }
     pub fn durations(&self) -> (u64, u64, u64) { (self.focus, self.short, self.long) }
     /// Accepts "foco pausa pausa-longa" in minutes, e.g. "50 10 20" or "50/10/20".
     pub fn set_durations(&mut self, text: &str) -> Result<(), String> {
+        self.finish_if_due();
+        if self.session.is_some() || self.started.is_some() || self.elapsed > 0 {
+            return Err("Encerre a sessão com s antes de alterar os tempos.".into());
+        }
         let values = text.split(|c: char| c.is_whitespace() || c == '/' || c == ',').filter(|s| !s.is_empty())
             .map(|s| s.parse::<u64>().ok().filter(|v| (1..=480).contains(v)))
             .collect::<Option<Vec<_>>>();
@@ -69,6 +90,7 @@ impl Timer {
     /// Moves to the next pomodoro phase, stopped. Only a completed focus counts towards the long break.
     pub fn advance(&mut self) {
         if !self.pomodoro { return; }
+        self.finish_session();
         self.phase = match self.phase {
             Phase::Focus => {
                 if self.finished() { self.cycles += 1; }
@@ -82,8 +104,10 @@ impl Timer {
     pub fn select_mode(&mut self, pomodoro: bool) -> bool {
         if self.pomodoro == pomodoro { return true; }
         if self.started.is_some() && !self.finished() { return false; }
+        self.finish_session();
         self.started = None;
         self.elapsed = 0;
+        self.phase = Phase::Focus;
         self.pomodoro = pomodoro;
         true
     }
@@ -112,11 +136,14 @@ impl Timer {
             return; // One running timer at a time.
         }
         if self.pomodoro != pomodoro {
+            self.finish_session();
             self.elapsed = 0;
+            self.phase = Phase::Focus;
             self.pomodoro = pomodoro;
         } else if self.finished() {
             // A finished phase starts the next one: focus → break → focus.
             self.advance();
+            self.begin_session();
             self.started = Some(chrono::Utc::now().timestamp());
             return;
         }
@@ -124,6 +151,7 @@ impl Timer {
             self.elapsed = self.seconds();
             self.started = None;
         } else {
+            self.begin_session();
             self.started = Some(chrono::Utc::now().timestamp());
         }
     }
@@ -138,6 +166,7 @@ impl Timer {
         if self.pomodoro != pomodoro {
             return;
         }
+        self.finish_session();
         self.started = None;
         self.elapsed = 0;
     }
@@ -359,7 +388,7 @@ fn draw_focus(f: &mut Frame, area: Rect, data: &Snapshot, timer: &Timer, selecte
     f.render_widget(Paragraph::new(Line::from(vec![
         tab("  p  Pomodoro  ", timer.pomodoro), Span::raw("  "), tab("  w  Stopwatch  ", !timer.pomodoro),
     ])).alignment(Alignment::Center), parts[0]);
-    f.render_widget(Paragraph::new("Space iniciar / pausar   t atividade   c tempos   n próxima fase   s zerar   p / w modo").alignment(Alignment::Center).style(Style::default().fg(muted)), parts[2]);
+    f.render_widget(Paragraph::new("Space iniciar / pausar   t atividade   c tempos   n próxima fase   s encerrar/salvar   p / w modo").alignment(Alignment::Center).style(Style::default().fg(muted)), parts[2]);
     let dashboard = Layout::vertical([
         Constraint::Length(if area.height >= 24 { 12 } else if area.height >= 15 { 9 } else { 5 }),
         Constraint::Length(if area.height >= 24 { 6 } else { 0 }), Constraint::Min(0),
@@ -398,7 +427,7 @@ fn draw_focus(f: &mut Frame, area: Rect, data: &Snapshot, timer: &Timer, selecte
     }
     if inner.height >= 10 {
         let (focus, short, long) = timer.durations();
-        f.render_widget(Paragraph::new(format!("Foco {focus}min · pausa {short}min · pausa longa {long}min · timer local")).alignment(Alignment::Center).style(Style::default().fg(muted)), Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
+        f.render_widget(Paragraph::new(format!("Foco {focus}min · pausa {short}min · pausa longa {long}min · {}", timer.sync_status())).alignment(Alignment::Center).style(Style::default().fg(muted)), Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
     }
     let records = records(data, timer);
     let stats = Layout::horizontal([Constraint::Ratio(1, 2); 2]).spacing(1).split(dashboard[1]);

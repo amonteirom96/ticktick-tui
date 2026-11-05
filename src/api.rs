@@ -67,7 +67,13 @@ impl Task {
     }
 
     pub fn marker(&self) -> &'static str {
-        if self.is_note() { "≡" } else { "○" }
+        if self.is_note() {
+            "≡"
+        } else if self.status == 2 {
+            "✓"
+        } else {
+            "○"
+        }
     }
 }
 
@@ -142,6 +148,15 @@ impl Api {
             token,
             base: "https://api.ticktick.com/open/v1".into(),
         })
+    }
+    pub fn account_key(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.token.hash(&mut hash);
+        format!("{:016x}", hash.finish())
+    }
+    pub fn create_focus(&self, body: &Value) -> Result<Value> {
+        self.request(Method::POST, "/focus", Some(body.clone()))
     }
     fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let mut attempt = 0;
@@ -284,7 +299,7 @@ impl Api {
                 )?;
                 let rows = value.as_array().context("Resposta de foco inválida")?;
                 for row in rows {
-                    let mut row = row.clone();
+                    let mut row = crate::focus::normalize_record(row.clone());
                     row.as_object_mut()
                         .context("Registro de foco inválido")?
                         .insert("type".into(), json!(kind));
@@ -477,7 +492,7 @@ impl Api {
             for row in rows {
                 let id = row["id"].as_str().context("Missing focus record id")?;
                 if seen.insert(id.to_owned()) {
-                    records.push(row.clone());
+                    records.push(crate::focus::normalize_record(row.clone()));
                 }
             }
         }
@@ -769,6 +784,71 @@ mod tests {
         assert_eq!(totals[0].seconds, 3600);
         server.join().unwrap();
     }
+    #[test]
+    fn create_focus_posts_seconds_task_and_accepts_empty_created_response() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (status, response) in [
+                ("200 OK", r#"{"id":"focus-1","duration":1500}"#),
+                ("201 Created", ""),
+                ("403 Forbidden", ""),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let end;
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..i]).to_lowercase();
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= i + 4 + len {
+                            end = i + 4;
+                            break;
+                        }
+                    }
+                }
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                assert!(headers.starts_with("post /open/v1/focus "));
+                assert!(headers.contains("authorization: bearer test-token"));
+                let body: Value = serde_json::from_slice(&request[end..]).unwrap();
+                assert_eq!(body["duration"], 1500);
+                assert_eq!(body["pauseDuration"], 30);
+                assert_eq!(body["taskId"], "task-1");
+                assert_eq!(body["type"], 0);
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let mut api = Api::new("test-token".into()).unwrap();
+        api.base = format!("http://{addr}/open/v1");
+        let body = json!({"type":0,"taskId":"task-1","duration":1500,"pauseDuration":30,"startTime":"2026-11-05T09:00:00+0000","endTime":"2026-11-05T09:25:30+0000"});
+        assert_eq!(api.create_focus(&body).unwrap()["id"], "focus-1");
+        assert!(api.create_focus(&body).unwrap().is_null());
+        assert!(
+            api.create_focus(&body)
+                .unwrap_err()
+                .to_string()
+                .contains("403")
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn http_routes_auth_and_empty_success() {
         use std::{

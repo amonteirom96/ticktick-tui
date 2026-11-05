@@ -10,6 +10,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Job {
     Refresh,
+    SaveFocus(crate::wellness::FocusUpload),
     /// `value` equal to `goal` completes the habit; 0 undoes it.
     CheckHabit {
         id: String,
@@ -25,6 +26,7 @@ pub enum Job {
         fields: Map<String, Value>,
     },
     Complete(Task),
+    Reopen(Task),
     Delete(Task),
     Move {
         task: Task,
@@ -32,6 +34,10 @@ pub enum Job {
     },
 }
 pub enum Event {
+    FocusSaved {
+        id: String,
+        result: Result<Snapshot, String>,
+    },
     Data(Snapshot, String),
     Report(chrono::NaiveDate, Snapshot, String),
     Applied {
@@ -48,7 +54,16 @@ pub enum Event {
 /// The same operation is used for optimistic rendering, commit and rollback replay.
 pub fn apply(data: &mut Snapshot, job: &Job) {
     match job {
-        Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
+        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
+        Job::Reopen(task) => {
+            let mut task = task.clone();
+            task.status = 0;
+            task.extra.remove("completedTime");
+            data.completed.retain(|t| t.id != task.id);
+            if !data.tasks.iter().any(|t| t.id == task.id) {
+                data.tasks.push(task);
+            }
+        }
         Job::Create(task) => {
             if !data.tasks.iter().any(|t| t.id == task.id) {
                 data.tasks.push(task.clone());
@@ -121,9 +136,11 @@ pub fn remap(job: &mut Job, old: &str, new: &str) {
         }
     };
     match job {
-        Job::Create(t) | Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
-            map_task(t)
-        }
+        Job::Create(t)
+        | Job::Reopen(t)
+        | Job::Complete(t)
+        | Job::Delete(t)
+        | Job::Move { task: t, .. } => map_task(t),
         Job::Patch { id, fields, .. } => {
             if id == old {
                 *id = new.into();
@@ -132,12 +149,12 @@ pub fn remap(job: &mut Job, old: &str, new: &str) {
                 fields.insert("parentId".into(), Value::String(new.into()));
             }
         }
-        Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
+        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
     }
 }
 fn reflected(data: &Snapshot, job: &Job) -> bool {
     match job {
-        Job::Create(t) => data.tasks.iter().any(|x| x.id == t.id),
+        Job::Create(t) | Job::Reopen(t) => data.tasks.iter().any(|x| x.id == t.id),
         Job::Complete(t) | Job::Delete(t) => !data.tasks.iter().any(|x| x.id == t.id),
         Job::Move { task, to } => data
             .tasks
@@ -147,14 +164,21 @@ fn reflected(data: &Snapshot, job: &Job) -> bool {
             let v = serde_json::to_value(t).unwrap();
             fields.iter().all(|(k, x)| v.get(k) == Some(x))
         }),
-        Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => true,
+        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => true,
     }
 }
 /// A newer patch of the same field supersedes the older one, so it is never replayed over it.
 fn track(unindexed: &mut Vec<(Job, std::time::Instant)>, job: Job) {
+    if let Job::Reopen(task) | Job::Complete(task) = &job {
+        unindexed.retain(
+            |(old, _)| !matches!(old, Job::Reopen(t) | Job::Complete(t) if t.id == task.id),
+        );
+    }
     if let Job::Patch { id, fields, .. } = &job {
         for (old, _) in unindexed.iter_mut() {
-            if let Job::Patch { id: o, fields: f, .. } = old
+            if let Job::Patch {
+                id: o, fields: f, ..
+            } = old
                 && o == id
             {
                 f.retain(|k, _| !fields.contains_key(k));
@@ -170,27 +194,66 @@ fn cache(data: &Snapshot) -> Option<String> {
         .err()
         .map(|_| "Não foi possível atualizar o cache local".into())
 }
+/// Recurring completions receive a new ID in TickTick's history. Match only
+/// the local recurring copy, with its schedule and completion instant intact.
+fn recurring_completion(local: &Task, remote: &Task) -> bool {
+    let stamp = |task: &Task| {
+        task.extra
+            .get("completedTime")
+            .and_then(Value::as_str)
+            .and_then(|v| {
+                chrono::DateTime::parse_from_rfc3339(v)
+                    .or_else(|_| chrono::DateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S%.f%z"))
+                    .ok()
+            })
+    };
+    local.id != remote.id
+        && local
+            .extra
+            .get("repeatFlag")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+        && !remote
+            .extra
+            .get("repeatFlag")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+        && local.project_id == remote.project_id
+        && local.title == remote.title
+        && local.parent_id == remote.parent_id
+        && local.due_date == remote.due_date
+        && local.extra.get("startDate") == remote.extra.get("startDate")
+        && stamp(local)
+            .zip(stamp(remote))
+            .is_some_and(|(a, b)| (a - b).num_milliseconds().unsigned_abs() <= 5_000)
+}
+
+fn merge_completed(data: &mut Snapshot, tasks: Vec<Task>, day: chrono::NaiveDate) {
+    for task in tasks {
+        // Remove both the optimistic copy and any stale duplicate already cached.
+        let previous = std::mem::take(&mut data.completed);
+        data.completed = previous
+            .into_iter()
+            .filter(|old| {
+                let old_day = old
+                    .extra
+                    .get("completedTime")
+                    .and_then(Value::as_str)
+                    .and_then(|v| crate::sidebar::date(v, &Task::default(), data));
+                !(old.id == task.id && old_day == Some(day)) && !recurring_completion(old, &task)
+            })
+            .collect();
+        data.completed.push(task);
+    }
+    if !data.report_days.contains(&day) {
+        data.report_days.push(day);
+    }
+}
+
 fn fetch_report(api: &Api, data: &mut Snapshot, day: chrono::NaiveDate) -> String {
     let message = match api.completed_on(day, data) {
         Ok(tasks) => {
-            for task in tasks {
-                let existing = data.completed.iter().position(|t| {
-                    t.id == task.id
-                        && t.extra
-                            .get("completedTime")
-                            .and_then(Value::as_str)
-                            .and_then(|v| crate::sidebar::date(v, &Task::default(), data))
-                            == Some(day)
-                });
-                if let Some(i) = existing {
-                    data.completed[i] = task;
-                } else {
-                    data.completed.push(task);
-                }
-            }
-            if !data.report_days.contains(&day) {
-                data.report_days.push(day);
-            }
+            merge_completed(data, tasks, day);
             format!(
                 "Relatório de {} atualizado · Sincronizado com TickTick",
                 day.format("%d/%m/%Y")
@@ -235,6 +298,68 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
             let Some(mut original) = queue.pop_front().or_else(|| rx.recv().ok()) else {
                 break;
             };
+            if let Job::SaveFocus(upload) = &original {
+                let mut body = upload.body.clone();
+                if let Some(id) = body["taskId"].as_str().map(str::to_owned)
+                    && let Some(remote) = aliases.get(&id)
+                {
+                    body["taskId"] = remote.clone().into();
+                }
+                let unresolved = body["taskId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("local:"));
+                let result = if unresolved {
+                    Err(anyhow::anyhow!(
+                        "A tarefa do foco ainda não foi salva no TickTick"
+                    ))
+                } else {
+                    api.create_focus(&body)
+                }
+                .map(|response| {
+                    let mut record = body.clone();
+                    record["id"] = response
+                        .get("id")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(upload.id.clone()));
+                    record["duration"] =
+                        Value::from(body["duration"].as_u64().unwrap_or(0).saturating_mul(1000));
+                    record["status"] = Value::from(1);
+                    record
+                })
+                .map_err(|e| e.to_string());
+                let result = result.map(|record| {
+                    known.focus_records.retain(|r| r["id"] != record["id"]);
+                    let first = record["startTime"]
+                        .as_str()
+                        .and_then(|v| crate::sidebar::date(v, &Task::default(), &known));
+                    let last = record["endTime"]
+                        .as_str()
+                        .and_then(|v| crate::sidebar::date(v, &Task::default(), &known));
+                    known.focus_records.push(record);
+                    for day in &mut known.focus_days {
+                        if first
+                            .zip(last)
+                            .is_some_and(|(first, last)| day.day >= first && day.day <= last)
+                        {
+                            day.error = Some(
+                                "Nova sessão salva · use r no relatório para atualizar".into(),
+                            );
+                        }
+                    }
+                    let _ = cache(&known);
+                    known.clone()
+                });
+                if out
+                    .send(Event::FocusSaved {
+                        id: upload.id.clone(),
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             // Burst of edits on one task (e.g. `p` pressed repeatedly): one request carries them all.
             let mut merged = 1;
             if let Job::Patch { id, fields, .. } = &mut original {
@@ -298,23 +423,28 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                 }
                 continue;
             }
-            let mutation = !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. });
+            let mutation = !matches!(
+                job,
+                Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }
+            );
             let unresolved = match &job {
                 Job::Create(t) => t
                     .parent_id
                     .as_deref()
                     .is_some_and(|s| s.starts_with("local:")),
                 Job::Patch { id, .. } => id.starts_with("local:"),
-                Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
+                Job::Reopen(t) | Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
                     t.id.starts_with("local:")
                 }
-                Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => false,
+                Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => false,
             };
             let result = if unresolved {
                 Err(anyhow::anyhow!("A criação da tarefa anterior falhou"))
             } else {
                 match &job {
-                    Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => Ok(job.clone()),
+                    Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => {
+                        Ok(job.clone())
+                    }
                     Job::Create(t) => api
                         .create(&t.project_id, &t.title, t.parent_id.as_deref())
                         .map(|remote| {
@@ -326,6 +456,13 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                         project,
                         fields,
                     } => api.patch(id, project, fields.clone()).map(|_| job.clone()),
+                    Job::Reopen(t) => api
+                        .patch(
+                            &t.id,
+                            &t.project_id,
+                            Map::from_iter([("status".into(), Value::from(0))]),
+                        )
+                        .map(|_| job.clone()),
                     Job::Complete(t) => api.complete(t).map(|_| job.clone()),
                     Job::Delete(t) => api.delete(t).map(|_| job.clone()),
                     Job::Move { task, to } => api.move_task(task, to).map(|_| job.clone()),
@@ -363,33 +500,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                         match api.completed_on(report_day, &data) {
                             Ok(tasks) => {
                                 history_available = true;
-                                for task in tasks {
-                                    let day = task
-                                        .extra
-                                        .get("completedTime")
-                                        .and_then(Value::as_str)
-                                        .and_then(|v| {
-                                            crate::sidebar::date(v, &Task::default(), &data)
-                                        });
-                                    let existing = data.completed.iter().position(|t| {
-                                        t.id == task.id
-                                            && t.extra
-                                                .get("completedTime")
-                                                .and_then(Value::as_str)
-                                                .and_then(|v| {
-                                                    crate::sidebar::date(v, &Task::default(), &data)
-                                                })
-                                                == day
-                                    });
-                                    if let Some(i) = existing {
-                                        data.completed[i] = task;
-                                    } else {
-                                        data.completed.push(task);
-                                    }
-                                }
-                                if !data.report_days.contains(&report_day) {
-                                    data.report_days.push(report_day);
-                                }
+                                merge_completed(&mut data, tasks, report_day);
                             }
                             Err(_) => {
                                 history_available = false;
@@ -464,6 +575,55 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recurring_history_replaces_local_copy_and_repairs_cached_duplicates() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let remote: Task = serde_json::from_value(serde_json::json!({
+            "id": "occurrence", "projectId": "finance", "title": "Pagar HRV",
+            "status": 2, "dueDate": "2026-11-05T03:00:00.000+0000",
+            "startDate": "2026-11-05T03:00:00.000+0000",
+            "completedTime": "2026-11-05T08:15:46.914+0000"
+        }))
+        .unwrap();
+        let mut local = remote.clone();
+        local.id = "series".into();
+        local
+            .extra
+            .insert("repeatFlag".into(), Value::from("RRULE:FREQ=MONTHLY"));
+        local.extra.insert(
+            "completedTime".into(),
+            Value::from("2026-11-05T08:15:47.094889+00:00"),
+        );
+        let mut other = remote.clone();
+        other.id = "another-real-occurrence".into();
+        let mut data = Snapshot {
+            time_zone: Some("America/Recife".into()),
+            completed: vec![local.clone(), remote.clone(), other.clone()],
+            ..Default::default()
+        };
+        merge_completed(&mut data, vec![remote.clone()], day);
+        assert_eq!(data.completed.len(), 2);
+        assert!(data.completed.iter().any(|t| t.id == other.id));
+        assert!(!data.completed.iter().any(|t| t.id == local.id));
+        merge_completed(&mut data, vec![remote.clone()], day);
+        assert_eq!(data.completed.len(), 2);
+        assert_eq!(data.report_days, vec![day]);
+
+        // Similar titles alone must never merge unrelated completions.
+        let mut unrelated = local.clone();
+        unrelated.project_id = "another-list".into();
+        assert!(!recurring_completion(&unrelated, &remote));
+        unrelated = local.clone();
+        unrelated.due_date = Some("2026-12-05T03:00:00.000+0000".into());
+        assert!(!recurring_completion(&unrelated, &remote));
+        unrelated = local;
+        unrelated.extra.insert(
+            "completedTime".into(),
+            Value::from("2026-11-05T09:15:47+00:00"),
+        );
+        assert!(!recurring_completion(&unrelated, &remote));
+    }
+
     #[test]
     fn completed_history_survives_cache_and_delete_does_not_reward() {
         let task = Task {

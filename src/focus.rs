@@ -47,6 +47,25 @@ fn timestamp(v: &Value, key: &str) -> Result<DateTime<Utc>> {
         .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f%z"))?
         .with_timezone(&Utc))
 }
+/// Normalize the public API's seconds to the milliseconds used by cached history.
+/// Older responses contain milliseconds; distinguish them by the wall interval.
+pub fn normalize_record(mut record: Value) -> Value {
+    if let (Ok(start), Ok(end), Some(duration)) = (
+        timestamp(&record, "startTime"),
+        timestamp(&record, "endTime"),
+        record["duration"].as_u64(),
+    ) {
+        let wall = (end - start).num_seconds().max(0) as u64;
+        if duration <= wall {
+            record["duration"] = duration.saturating_mul(1000).into();
+        }
+    }
+    if record["status"].as_i64() == Some(2) && record["endTime"].is_string() {
+        record["status"] = 1.into();
+    }
+    record
+}
+
 /// Focus duration is returned in milliseconds; relation intervals split a session between tasks.
 pub fn summarize(day: NaiveDate, data: &Snapshot, records: &[Value]) -> Result<Vec<FocusTotal>> {
     let (from, to) = bounds(day, data)?;
@@ -65,7 +84,7 @@ pub fn summarize(day: NaiveDate, data: &Snapshot, records: &[Value]) -> Result<V
             .as_u64()
             .context("Missing focus duration")?;
         let relations = record["tasks"].as_array().filter(|r| !r.is_empty());
-        let free = serde_json::json!({"startTime":record["startTime"],"endTime":record["endTime"]});
+        let free = serde_json::json!({"taskId": record["taskId"], "startTime":record["startTime"],"endTime":record["endTime"]});
         let segments: Vec<&Value> = relations
             .map(|r| r.iter().collect())
             .unwrap_or_else(|| vec![&free]);
@@ -145,6 +164,31 @@ mod tests {
     use super::*;
     use crate::api::{Project, Task};
     use serde_json::json;
+    #[test]
+    fn normalizes_public_seconds_legacy_milliseconds_and_top_level_task() {
+        let record = json!({"status":2,"taskId":"t","duration":1500,"startTime":"2026-11-03T09:00:00Z","endTime":"2026-11-03T09:25:00Z"});
+        let normalized = normalize_record(record);
+        assert_eq!(normalized["duration"], 1500000);
+        assert_eq!(normalize_record(normalized.clone())["duration"], 1500000);
+        let data = Snapshot {
+            time_zone: Some("UTC".into()),
+            tasks: vec![crate::api::Task {
+                id: "t".into(),
+                project_id: "p".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let totals = summarize(
+            NaiveDate::from_ymd_opt(2026, 11, 3).unwrap(),
+            &data,
+            &[normalized],
+        )
+        .unwrap();
+        assert_eq!(totals[0].seconds, 1500);
+        assert_eq!(totals[0].project_id.as_deref(), Some("p"));
+    }
+
     #[test]
     fn focus_uses_real_milliseconds_and_splits_tasks_and_local_days() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
