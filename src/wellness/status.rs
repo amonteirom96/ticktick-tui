@@ -1,23 +1,38 @@
-use super::{Timer, Phase, clock};
+use super::{Phase, Timer, clock};
 use crate::config;
 
 impl Timer {
     /// Share the resolved TUI theme without probing a terminal from status commands.
     pub fn save_status_theme(theme: &config::Theme) -> anyhow::Result<()> {
-        config::private_write(&config::cache_path().with_file_name("focus-theme.json"), &serde_json::to_vec(theme)?)
+        config::private_write(
+            &config::cache_path().with_file_name("focus-theme.json"),
+            &serde_json::to_vec(theme)?,
+        )
     }
     pub fn status_tmux(&self) -> anyhow::Result<String> {
-        if self.state() == "idle" { return Ok(String::new()); }
-        let theme: config::Theme = match std::fs::read(config::cache_path().with_file_name("focus-theme.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => config::Theme::default(),
-            Err(e) => return Err(e.into()),
+        if self.state() == "idle" {
+            return Ok(String::new());
+        }
+        let theme: config::Theme =
+            match std::fs::read(config::cache_path().with_file_name("focus-theme.json")) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => config::Theme::default(),
+                Err(e) => return Err(e.into()),
+            };
+        let color = if self.finished() || (self.pomodoro && self.phase != Phase::Focus) {
+            &theme.success
+        } else {
+            &theme.accent
         };
-        let color = if self.finished() || (self.pomodoro && self.phase != Phase::Focus) { &theme.success } else { &theme.accent };
         // Canonicalize validated colors before embedding tmux format syntax.
-        let color: ratatui::style::Color = color.parse().map_err(|_| anyhow::anyhow!("Invalid timer theme color"))?;
+        let color: ratatui::style::Color = color
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid timer theme color"))?;
         let elapsed = self.seconds();
-        Ok(format!("#[fg={color}]{}#[default]", clock(self.target().map_or(elapsed, |t| t.saturating_sub(elapsed)))))
+        Ok(format!(
+            "#[fg={color}]{}#[default]",
+            clock(self.target().map_or(elapsed, |t| t.saturating_sub(elapsed)))
+        ))
     }
 
     /// Read-only access for integrations. Missing state is idle; invalid state is an error.

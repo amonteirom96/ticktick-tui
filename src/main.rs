@@ -59,7 +59,9 @@ fn main() -> Result<()> {
                 println!("{}", timer.status());
             } else if matches!(format, StatusFormat::Tmux) {
                 let text = timer.status_tmux()?;
-                if !text.is_empty() { println!("{text}"); }
+                if !text.is_empty() {
+                    println!("{text}");
+                }
             } else {
                 let text = timer.status_text();
                 if !text.is_empty() {
