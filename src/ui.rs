@@ -2055,8 +2055,10 @@ fn input_prompt(input: &str, cursor: usize) -> String {
         .nth(cursor)
         .map(|(i, _)| i)
         .unwrap_or(input.len());
-    format!("{}█{}", &input[..index], &input[index..])
+    format!("{}{CURSOR}{}", &input[..index], &input[index..])
 }
+/// Marca a posição do cursor no texto; `draw` troca pelo cursor nativo do terminal.
+const CURSOR: char = '\u{E000}';
 fn edit_input(input: &mut String, cursor: &mut usize, key: KeyEvent) {
     let mut chars = input.chars().collect::<Vec<_>>();
     *cursor = (*cursor).min(chars.len());
@@ -3193,6 +3195,12 @@ Ctrl-C força a saída.",
             .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
             area,
         );
+    }
+    let buf = f.buffer_mut();
+    if let Some(i) = buf.content.iter().position(|c| c.symbol() == CURSOR.to_string()) {
+        let (x, y) = buf.pos_of(i);
+        buf.content[i].set_symbol(" ");
+        f.set_cursor_position((x, y));
     }
 }
 const DUE: [(&str, &str); 4] = [
