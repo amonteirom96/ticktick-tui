@@ -664,11 +664,17 @@ impl App {
                     Action::Subtask(_) => false,
                 };
                 if preview::toggle(&mut task, &action) {
-                    if checking {
+                    // Último item do checklist marcado conclui a tarefa (send toca o som).
+                    let finish = checking
+                        && matches!(action, Action::Checklist(_))
+                        && task.items.iter().all(|i| i.status == 1);
+                    if checking && !finish {
                         self.play(include_bytes!("../assets/check.wav"), 0.5);
                     }
-                    self.update(task);
-                    if checking && self.open_boxes().is_empty() {
+                    self.update(task.clone());
+                    if finish {
+                        self.send(Job::Complete(task));
+                    } else if checking && self.open_boxes().is_empty() {
                         self.message = "Tudo marcado ✓ · h depois x conclui a tarefa".into();
                     }
                 }
@@ -1948,6 +1954,10 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                             }
                             app.timer.remap_task(&local.id, &remote.id);
                             app.persist_timer();
+                            // Modal opened before the create was confirmed (e.g. D right after a).
+                            if let Some(t) = app.target.as_mut().filter(|t| t.id == local.id) {
+                                t.id = remote.id.clone();
+                            }
                             if selected.as_deref() == Some(&local.id) {
                                 selected = Some(remote.id.clone());
                             }
@@ -3826,6 +3836,23 @@ mod tests {
         press(&mut a, 'd');
         press(&mut a, 'd');
         assert_eq!(titles(&a), ["um"]);
+    }
+    #[test]
+    fn checking_last_checklist_item_completes_task() {
+        use crate::api::ChecklistItem;
+        let mut a = app();
+        a.data.tasks[0].items = vec![
+            ChecklistItem {
+                status: 1,
+                ..Default::default()
+            },
+            ChecklistItem::default(),
+        ];
+        let id = a.data.tasks[0].id.clone();
+        a.focus(2);
+        a.cursor_to(Action::Checklist(1));
+        a.preview_action(&config::Theme::default(), false);
+        assert!(!a.data.tasks.iter().any(|t| t.id == id && t.status == 0));
     }
     #[test]
     fn preview_vim_editing_of_checkboxes_and_checklist() {
