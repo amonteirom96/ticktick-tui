@@ -594,26 +594,16 @@ pub fn document(
         if rows.last().is_some_and(|r| r.line.width() > 0) {
             rows.push(Row::text(""));
         }
-        rows.push(Row::text(Line::from(vec![Span::styled(
-            "CHECKLIST  ",
-            Style::default().fg(color(&theme.muted)).bold(),
-        )])));
-        let done = task.items.iter().filter(|i| i.status == 1).count();
-        let filled = done * 20 / task.items.len();
         rows.push(Row::text(Line::from(vec![
             Span::styled(
-                "━".repeat(filled),
-                Style::default().fg(color(&theme.success)),
-            ),
-            Span::styled(
-                "━".repeat(20 - filled),
-                Style::default().fg(color(&theme.border)),
+                "CHECKLIST  ",
+                Style::default().fg(color(&theme.muted)).bold(),
             ),
             Span::styled(
                 format!(
-                    "  {done}/{} · {}%",
-                    task.items.len(),
-                    done * 100 / task.items.len()
+                    "{}/{}",
+                    task.items.iter().filter(|i| i.status == 1).count(),
+                    task.items.len()
                 ),
                 Style::default().fg(color(&theme.muted)),
             ),
