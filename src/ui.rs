@@ -2935,8 +2935,17 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                     format!(" {indent}{branch}{} ", task.marker())
                 };
                 let right: usize = badges.iter().map(Span::width).sum();
+                let list_mark = matches!(app.view(), View::Today | View::Tomorrow | View::All)
+                    .then(|| app.data.projects.iter().find(|p| p.id == task.project_id))
+                    .flatten()
+                    .and_then(|p| {
+                        unicode_segmentation::UnicodeSegmentation::graphemes(p.name.as_str(), true)
+                            .next()
+                    })
+                    .map(|g| format!("{g} "))
+                    .unwrap_or_default();
                 let title = truncate(
-                    &task.title,
+                    &format!("{list_mark}{}", task.title),
                     row_width.saturating_sub(left.width() + right + 1),
                 );
                 let pad = row_width.saturating_sub(left.width() + title.width() + right);
