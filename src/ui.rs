@@ -1651,6 +1651,21 @@ impl App {
         {
             return false;
         }
+        if self.mode == Mode::Search && key.modifiers.contains(M::CONTROL) {
+            match key.code {
+                K::Char('j' | 'k') => {
+                    self.movement(if key.code == K::Char('j') { 1 } else { -1 });
+                    return false;
+                }
+                K::Char('l') if self.global_search => {
+                    self.mode = Mode::Normal;
+                    self.input.clear();
+                    self.open_search_result();
+                    return false;
+                }
+                _ => (),
+            }
+        }
         if !matches!(self.mode, Mode::Normal | Mode::Visual) {
             match key.code {
                 K::Esc => {

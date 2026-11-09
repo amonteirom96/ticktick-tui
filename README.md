@@ -66,7 +66,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `R` | Lembretes: `Space` marca as opções, ou digite `2h`, `3d` |
 | `za` / `zo` / `zc` | Recolher / expandir pasta (em Listas) ou subtarefas |
 | `/` | Filtrar títulos somente na lista atual; Enter aplica, Esc cancela/limpa |
-| `ff` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `/` filtra localmente os resultados exibidos (Esc cancela a edição), `o` abre o resultado selecionado na tela principal, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
+| `ff` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `/` filtra localmente os resultados exibidos (Esc cancela a edição), `o` abre o resultado selecionado na tela principal, `Ctrl-j`/`Ctrl-k` navegam e `Ctrl-l` abre o selecionado mesmo durante a digitação, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
 | `fl` | Abrir seletor de telas e listas (Today, Inbox, Tomorrow, Daily report, Habits, Focus e listas): digite para filtrar, ↑/↓ ou Tab para escolher, Enter abre, Esc cancela |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
