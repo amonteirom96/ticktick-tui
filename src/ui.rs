@@ -2799,6 +2799,7 @@ fn preview_area(area: Rect, app: &App) -> Rect {
             Constraint::Percentage(app.split),
             Constraint::Min(40),
         ])
+        .spacing(1)
         .split(body)[2];
     }
     Rect::default()
@@ -3467,6 +3468,18 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
     f.render_widget(Paragraph::new(Line::from(spans)), rows[2]);
 }
 
+/// Soften a saved selection when keyboard focus is in another panel.
+fn panel_selection(theme: &config::Theme, focused: bool) -> Color {
+    let selection = preview::color(&theme.selection);
+    match selection {
+        Color::Rgb(r, g, b) if !focused => {
+            let lighten = |channel: u8| (channel as u16 + (255 - channel as u16) * 2 / 5) as u8;
+            Color::Rgb(lighten(r), lighten(g), lighten(b))
+        }
+        _ => selection,
+    }
+}
+
 fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     let t = &c.theme;
     let fg = preview::color(&t.foreground);
@@ -3556,15 +3569,19 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     );
     let block = |title: String, active: bool| {
         Block::bordered()
-            .border_type(BorderType::Rounded)
-            .title(title)
-            .title_style(
-                Style::default()
-                    .fg(if active { accent } else { muted })
-                    .bold(),
-            )
+            .border_type(if active {
+                BorderType::Thick
+            } else {
+                BorderType::Rounded
+            })
+            .title(if active {
+                format!("{title}◂ Focus ")
+            } else {
+                title
+            })
+            .title_style(Style::default().fg(if active { accent } else { fg }).bold())
             .border_style(Style::default().fg(if active { accent } else { border }))
-            .style(Style::default().bg(panel))
+            .style(Style::default().bg(panel).fg(fg))
     };
     let preview = preview_area(f.area(), app);
     let fullscreen =
@@ -3589,6 +3606,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 Constraint::Percentage(app.split),
                 Constraint::Min(40),
             ])
+            .spacing(1)
             .split(rows[1])
         } else {
             Layout::horizontal([
@@ -3608,8 +3626,11 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 ),
                 Constraint::Min(0),
             ])
+            .spacing(1)
             .split(rows[1])
         };
+        let lists_selection = panel_selection(t, app.projects_focus);
+        let tasks_selection = panel_selection(t, !app.projects_focus && !app.preview_focus);
         let entries = app.sidebar();
         let projects = entries
             .iter()
@@ -3636,7 +3657,11 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 let mut lines = vec![
                     Line::from(vec![
                         Span::styled(
-                            if selected { "▎" } else { " " },
+                            if selected && app.projects_focus {
+                                "▸"
+                            } else {
+                                " "
+                            },
                             Style::default().fg(accent),
                         ),
                         Span::styled(
@@ -3647,23 +3672,37 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                                 muted
                             }),
                         ),
-                        Span::raw(e.name.clone()),
                         Span::styled(
-                            if matches!(e.view, View::Report | View::Habits | View::Focus) {
-                                String::new()
-                            } else {
-                                format!("  {}", e.count)
+                            {
+                                let count = if matches!(
+                                    e.view,
+                                    View::Report | View::Habits | View::Focus | View::Group(_)
+                                ) {
+                                    String::new()
+                                } else {
+                                    e.count.to_string()
+                                };
+                                let width =
+                                    cols[0].width.saturating_sub(6 + 2 * e.depth as u16) as usize;
+                                let name =
+                                    truncate(&e.name, width.saturating_sub(count.width() + 1));
+                                let gap = width.saturating_sub(name.width() + count.width());
+                                format!("{name}{}{count}", " ".repeat(gap))
                             },
-                            Style::default().fg(muted),
+                            if selected {
+                                Style::default().fg(accent).bold()
+                            } else {
+                                Style::default().fg(fg)
+                            },
                         ),
                     ])
                     .style(if selected {
-                        Style::default().bg(selection).fg(accent)
+                        Style::default().bg(lists_selection).fg(accent)
                     } else {
                         Style::default()
                     }),
                 ];
-                // The "LISTS" header lives in item 3, so highlight only the first line by hand.
+                // Keep the section label outside the selected row's highlight.
                 if i == 5 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
@@ -3690,22 +3729,50 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let row_width = cols[1].width.saturating_sub(5) as usize;
         let visual = (app.mode == Mode::Visual).then(|| app.range());
         let mut previous_context = String::new();
+        let mut next_at_depth = Vec::<usize>::new();
+        let mut has_sibling = vec![false; tree.len()];
+        for (i, row) in tree.iter().enumerate().rev() {
+            while next_at_depth
+                .last()
+                .is_some_and(|&next| tree[next].depth > row.depth)
+            {
+                next_at_depth.pop();
+            }
+            has_sibling[i] = next_at_depth
+                .last()
+                .is_some_and(|&next| tree[next].depth == row.depth);
+            next_at_depth.push(i);
+        }
+        let mut ancestor_siblings = Vec::new();
         let items = tree
             .iter()
             .enumerate()
             .map(|(i, row)| {
                 let task = row.task;
-                // Cap visual indentation to available space, never the actual tree depth.
-                let indent =
-                    "  ".repeat(row.depth.min(cols[1].width.saturating_sub(20) as usize / 2));
+                let depth = row.depth.min(cols[1].width.saturating_sub(20) as usize / 2);
+                ancestor_siblings.resize(row.depth + 1, false);
+                ancestor_siblings[row.depth] = has_sibling[i];
+                let mut indent = String::new();
+                for level in 1..depth {
+                    indent.push_str(if ancestor_siblings[level] {
+                        "│  "
+                    } else {
+                        "   "
+                    });
+                }
+                let connector = if row.depth == 0 {
+                    ""
+                } else if has_sibling[i] {
+                    "├─ "
+                } else {
+                    "└─ "
+                };
                 let branch = if row.children > 0 {
                     if app.collapsed.contains(&task.id) {
                         "▸ "
                     } else {
                         "▾ "
                     }
-                } else if row.depth > 0 {
-                    "└ "
                 } else {
                     ""
                 };
@@ -3751,29 +3818,63 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 let left = if row.depth == 0 && !context.is_empty() {
                     format!("   {} ", task.marker())
                 } else {
-                    format!(" {indent}{branch}{} ", task.marker())
+                    format!(
+                        " {}{indent}{connector}{branch}{} ",
+                        if row.depth > 0 { "  " } else { "" },
+                        task.marker()
+                    )
                 };
-                let right: usize = badges.iter().map(Span::width).sum();
-                let list_mark = matches!(app.view(), View::Today | View::Tomorrow | View::All)
-                    .then(|| app.data.projects.iter().find(|p| p.id == task.project_id))
-                    .flatten()
-                    .and_then(|p| {
-                        unicode_segmentation::UnicodeSegmentation::graphemes(p.name.as_str(), true)
-                            .next()
-                    })
-                    .map(|g| format!("{g} "))
-                    .unwrap_or_default();
+                let selected = i == app.selected;
                 let title = truncate(
-                    &format!("{list_mark}{}", task.title),
-                    row_width.saturating_sub(left.width() + right + 1),
+                    &task.title.replace(['\n', '\r'], " "),
+                    row_width.saturating_sub(left.width()),
                 );
-                let pad = row_width.saturating_sub(left.width() + title.width() + right);
-                let mut line = vec![
-                    Span::styled(left, Style::default().fg(muted)),
-                    Span::raw(title),
-                    Span::raw(" ".repeat(pad)),
+                let line = vec![
+                    Span::styled(
+                        left.clone(),
+                        Style::default().fg(if task.status == 2 {
+                            preview::color(&t.success)
+                        } else {
+                            muted
+                        }),
+                    ),
+                    Span::styled(
+                        title,
+                        if selected {
+                            Style::default().fg(accent).bold()
+                        } else {
+                            Style::default().fg(fg)
+                        },
+                    ),
                 ];
-                line.extend(badges);
+                let has_metadata = row.depth == 0 || !badges.is_empty();
+                let badge_width: usize = badges.iter().map(Span::width).sum();
+                let metadata_indent = if row.depth > 0 {
+                    let guide = if has_sibling[i] { "│  " } else { "   " };
+                    let prefix = format!("   {indent}{guide}");
+                    format!(
+                        "{prefix}{}",
+                        " ".repeat(left.width().saturating_sub(prefix.width()))
+                    )
+                } else {
+                    " ".repeat(left.width())
+                };
+                let mut metadata = vec![Span::styled(
+                    format!(
+                        "{}{}",
+                        metadata_indent,
+                        truncate(
+                            &if row.depth == 0 {
+                                app.project_name(&task.project_id)
+                            } else {
+                                String::new()
+                            },
+                            row_width.saturating_sub(left.width() + badge_width)
+                        )
+                    ),
+                    Style::default().fg(muted),
+                )];
+                metadata.extend(badges);
                 let mut lines = Vec::new();
                 if show_context {
                     lines.push(Line::styled(
@@ -3783,10 +3884,18 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 }
                 previous_context = context;
                 lines.push(Line::from(line));
+                if cols[1].height >= 12 {
+                    if has_metadata {
+                        lines.push(Line::from(metadata));
+                    }
+                    if !tree.get(i + 1).is_some_and(|next| next.depth > 0) {
+                        lines.push(Line::default());
+                    }
+                }
                 let item = ListItem::new(lines);
                 match visual {
                     Some((lo, hi)) if (lo..=hi).contains(&i) => {
-                        item.style(Style::default().bg(selection))
+                        item.style(Style::default().bg(tasks_selection))
                     }
                     _ => item,
                 }
@@ -3808,22 +3917,53 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         } else if app.view() == View::Report {
             " ★ · Daily report ".into()
         } else if app.query.is_empty() {
-            format!(" 2 · {project}  {} ", tree.len())
+            format!(" 2 · {project} ")
         } else {
             format!(" 2 · Search /{} ", app.query)
         };
-        let taskblock = block(title, !app.projects_focus && !app.preview_focus)
-            .padding(Padding::new(1, 1, 1, 0));
+        let mut taskblock = block(title, !app.projects_focus && !app.preview_focus)
+            .padding(Padding::new(0, 1, 1, 0));
+        if !matches!(app.view(), View::Report | View::Habits | View::Focus) {
+            taskblock = taskblock.title_bottom(
+                Line::styled(
+                    format!(" {} activities ", tree.len()),
+                    Style::default().fg(muted),
+                )
+                .right_aligned(),
+            );
+        }
         let inner = taskblock.inner(cols[1]);
+        let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
         f.render_stateful_widget(
             List::new(items)
                 .block(taskblock)
-                .highlight_style(Style::default().bg(selection))
-                .highlight_symbol("▎")
+                .highlight_style(Style::default().bg(tasks_selection))
+                .highlight_symbol(if !app.projects_focus && !app.preview_focus {
+                    "█"
+                } else {
+                    " "
+                })
                 .repeat_highlight_symbol(true),
             cols[1],
             &mut state,
         );
+        if !app.projects_focus && !app.preview_focus && inner.width > 0 {
+            let offset = state.offset();
+            if app.selected >= offset {
+                let top: usize = item_heights
+                    .iter()
+                    .skip(offset)
+                    .take(app.selected - offset)
+                    .sum();
+                let height = item_heights.get(app.selected).copied().unwrap_or(0);
+                for y in top..top.saturating_add(height).min(inner.height as usize) {
+                    f.render_widget(
+                        Paragraph::new("█").style(Style::default().fg(accent).bg(tasks_selection)),
+                        Rect::new(inner.x, inner.y + y as u16, 1, 1),
+                    );
+                }
+            }
+        }
         if matches!(app.view(), View::Habits | View::Focus) {
             crate::wellness::draw(
                 f,
@@ -3858,24 +3998,30 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             if app.view() == View::Report {
                 " Completed activity · h / Esc to return ".into()
             } else {
-                format!(
-                    " 3 · Preview{} ",
-                    if app.preview_focus {
-                        " · j/k navigate"
-                    } else {
-                        ""
-                    }
-                )
+                " 3 · Activity details ".into()
             },
             app.preview_focus,
+        )
+        .title_bottom(
+            Line::styled(
+                if app.preview_focus {
+                    " j/k navigate · h return "
+                } else {
+                    " 3 focus "
+                },
+                Style::default().fg(muted),
+            )
+            .right_aligned(),
         )
         .padding(Padding::new(2, 2, 1, 1));
         let inner = preview_block.inner(preview);
         f.render_widget(preview_block, preview);
         if document.is_empty() {
             f.render_widget(
-                Paragraph::new("Select a task to preview.").style(Style::default().fg(muted)),
-                inner,
+                Paragraph::new("Select an activity\n\nIts details will appear here.")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(muted)),
+                centered(inner, 36, 3),
             );
         } else {
             preview::render(
