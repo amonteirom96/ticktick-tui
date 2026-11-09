@@ -3471,10 +3471,11 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
 /// Soften a saved selection when keyboard focus is in another panel.
 fn panel_selection(theme: &config::Theme, focused: bool) -> Color {
     let selection = preview::color(&theme.selection);
-    match selection {
-        Color::Rgb(r, g, b) if !focused => {
-            let lighten = |channel: u8| (channel as u16 + (255 - channel as u16) * 2 / 5) as u8;
-            Color::Rgb(lighten(r), lighten(g), lighten(b))
+    match (selection, preview::color(&theme.panel)) {
+        (Color::Rgb(r, g, b), Color::Rgb(pr, pg, pb)) if !focused => {
+            let blend =
+                |channel: u8, panel: u8| ((channel as u16 * 3 + panel as u16 * 2) / 5) as u8;
+            Color::Rgb(blend(r, pr), blend(g, pg), blend(b, pb))
         }
         _ => selection,
     }
@@ -3574,11 +3575,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             } else {
                 BorderType::Rounded
             })
-            .title(if active {
-                format!("{title}")
-            } else {
-                title
-            })
+            .title(if active { format!("{title}") } else { title })
             .title_style(Style::default().fg(if active { accent } else { fg }).bold())
             .border_style(Style::default().fg(if active { accent } else { border }))
             .style(Style::default().bg(panel).fg(fg))
