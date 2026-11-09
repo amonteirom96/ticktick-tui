@@ -66,8 +66,8 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `R` | Lembretes: `Space` marca as opções, ou digite `2h`, `3d` |
 | `za` / `zo` / `zc` | Recolher / expandir pasta (em Listas) ou subtarefas |
 | `/` | Filtrar títulos somente na lista atual; Enter aplica, Esc cancela/limpa |
-| `fs` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `o` abre o resultado selecionado na tela principal, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
-| `ee` | Abrir seletor de telas e listas (Today, Inbox, Tomorrow, Daily report, Habits, Focus e listas): digite para filtrar, ↑/↓ ou Tab para escolher, Enter abre, Esc cancela |
+| `ff` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `/` filtra localmente os resultados exibidos (Esc cancela a edição), `o` abre o resultado selecionado na tela principal, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
+| `fl` | Abrir seletor de telas e listas (Today, Inbox, Tomorrow, Daily report, Habits, Focus e listas): digite para filtrar, ↑/↓ ou Tab para escolher, Enter abre, Esc cancela |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
 | `zp` | Mostrar / ocultar preview |
@@ -180,7 +180,7 @@ Os envios de foco ficam persistidos junto ao timer e vinculados à credencial qu
 
 Referência oficial de foco: [Create Focus](https://developer.ticktick.com/docs/openapi.md#focus). A criação usa duração e pausas em segundos; o cliente normaliza leituras em segundos e respostas legadas em milissegundos para o formato do cache.
 
-A interface do TUI usa inglês em todas as telas, mensagens e atalhos. Os nomes das listas e o conteúdo das tarefas vindos do TickTick são preservados. A pesquisa geral consulta `POST /open/v1/task/search` com `status: [0, 2]`, sem limitar projetos ou datas; os resultados não dependem do histórico já carregado no TUI. Falhas aparecem no próprio modal e podem ser consultadas novamente com `fs`.
+A interface do TUI usa inglês em todas as telas, mensagens e atalhos. Os nomes das listas e o conteúdo das tarefas vindos do TickTick são preservados. A pesquisa geral consulta `POST /open/v1/task/search` com `status: [0, 2]`, sem limitar projetos ou datas; os resultados não dependem do histórico já carregado no TUI. Falhas aparecem no próprio modal e podem ser consultadas novamente com `ff`.
 
 Na pesquisa geral, após aplicar com Enter, selecione com `j`/`k` e pressione `o` para abrir a atividade na lista de origem (ou em All tasks se a lista não estiver disponível). Antes de fechar a pesquisa, o TUI carrega os detalhes completos da atividade na API. A atividade fica selecionada na lista; se estiver concluída, apenas ela é revelada temporariamente, sem ativar a exibição de todas as concluídas. Trocar de lista encerra essa revelação. Use `i` para editar e `x` ou `Space` para reabrir uma concluída. A reabertura é confirmada na API antes de ser considerada salva. O modal ocupa até 90% da largura e 85% da altura, com limites de 140 colunas e 36 linhas.
 

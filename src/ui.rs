@@ -140,6 +140,8 @@ struct App {
     opening_task: Option<u64>,
     open_error: Option<String>,
     search_was_global: bool,
+    /// `/` inside global search: `query` filters the API results locally.
+    search_filter: bool,
     target: Option<Task>,
     query: String,
     message: String,
@@ -204,6 +206,7 @@ impl App {
         self.global_search = false;
         self.search_background = None;
         self.remote_search = None;
+        self.search_filter = false;
         self.opening_task = None;
         self.open_error = None;
         self.revealed_completed = None;
@@ -495,7 +498,7 @@ impl App {
             if let Some(search) = self
                 .remote_search
                 .as_ref()
-                .filter(|s| s.query == self.query)
+                .filter(|s| self.search_filter || s.query == self.query)
             {
                 return search.tasks.iter().collect();
             }
@@ -529,7 +532,7 @@ impl App {
             && self
                 .remote_search
                 .as_ref()
-                .is_some_and(|s| s.query == self.query)
+                .is_some_and(|s| !self.search_filter && s.query == self.query)
         {
             ""
         } else {
@@ -1300,7 +1303,7 @@ impl App {
             Mode::Search => {
                 self.query = text;
                 self.selected = 0;
-                if self.global_search {
+                if self.global_search && !self.search_filter {
                     self.request_search();
                 }
             }
@@ -1652,7 +1655,10 @@ impl App {
             match key.code {
                 K::Esc => {
                     if self.mode == Mode::Search {
-                        if self.global_search {
+                        if self.search_filter {
+                            self.query = self.search_original.clone();
+                            self.clamp();
+                        } else if self.global_search {
                             self.exit_global_search();
                         } else {
                             self.query = self.search_original.clone();
@@ -1676,7 +1682,7 @@ impl App {
             }
             return false;
         }
-        if key.code == K::Char('e') && self.pending == 'e' {
+        if key.code == K::Char('l') && self.pending == 'f' {
             if self.global_search {
                 self.exit_global_search();
             }
@@ -1688,7 +1694,28 @@ impl App {
             self.count.clear();
             return false;
         }
-        if key.code == K::Char('/') || key.code == K::Char('s') && self.pending == 'f' {
+        if key.code == K::Char('/')
+            && self.global_search
+            && self.remote_search.as_ref().is_some_and(|s| !s.loading)
+        {
+            if !self.search_filter {
+                self.search_filter = true;
+                self.query.clear();
+            }
+            self.mode = Mode::Search;
+            self.search_original = self.query.clone();
+            self.input = self.query.clone();
+            self.input_cursor = self.input.chars().count();
+            self.selected = 0;
+            self.preview_cursor = 0;
+            self.focus(1);
+            return false;
+        }
+        if key.code == K::Char('/') || key.code == K::Char('f') && self.pending == 'f' {
+            if let Some(search) = self.remote_search.as_ref().filter(|_| self.search_filter) {
+                self.query = search.query.clone(); // Edit the API query, not the filter.
+            }
+            self.search_filter = false;
             if key.code != K::Char('/') && !self.global_search {
                 self.search_background = Some(SearchBackground::capture(self));
             }
@@ -1709,11 +1736,9 @@ impl App {
             self.count.clear();
             return false;
         }
-        if matches!(key.code, K::Char('e' | 'f')) {
-            if let K::Char(prefix) = key.code {
-                self.pending = prefix;
-                self.count.clear();
-            }
+        if key.code == K::Char('f') {
+            self.pending = 'f';
+            self.count.clear();
             return false;
         }
         if self.global_search && self.mode == Mode::Normal {
@@ -2304,6 +2329,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         opening_task: None,
         open_error: None,
         search_was_global: false,
+        search_filter: false,
         target: None,
         query: String::new(),
         message: if demo {
@@ -3223,11 +3249,14 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
         query_inner.height.min(1),
     ));
     f.render_widget(
-        Paragraph::new("›").style(Style::default().fg(accent).bold()),
+        Paragraph::new(if app.search_filter { "/" } else { "›" })
+            .style(Style::default().fg(accent).bold()),
         header[0],
     );
     let query = if app.mode == Mode::Search {
         input_line(f, header[1], &app.input, app.input_cursor)
+    } else if let Some(search) = app.remote_search.as_ref().filter(|_| app.search_filter) {
+        format!("{}  / {}", search.query, app.query)
     } else {
         app.query.clone()
     };
@@ -3358,21 +3387,32 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
         );
     }
     let hints: Vec<(&str, &str)> = if app.mode == Mode::Search {
-        vec![("Enter", "Search"), ("Esc", "Cancel")]
+        vec![
+            (
+                "Enter",
+                if app.search_filter {
+                    "Filter"
+                } else {
+                    "Search"
+                },
+            ),
+            ("Esc", "Cancel"),
+        ]
     } else if loading {
         vec![("q", "Cancel")]
     } else if app.open_error.is_some() {
         vec![("o", "Retry"), ("q", "Close")]
     } else if error.is_some() {
-        vec![("fs", "Retry"), ("q", "Close")]
+        vec![("ff", "Retry"), ("q", "Close")]
     } else if tasks.is_empty() {
-        vec![("fs", "Edit search"), ("q", "Close")]
+        vec![("ff", "Edit search"), ("q", "Close")]
     } else {
         vec![
             ("↑↓", "Select"),
             ("o", "Open"),
             ("Tab", "Details"),
-            ("fs", "Edit search"),
+            ("/", "Filter"),
+            ("ff", "Edit search"),
             ("q", "Close"),
         ]
     };
@@ -4176,7 +4216,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVIGATION\nh / l, Tab     Lists → tasks → preview\n1 / 2 / 3      Focus lists / tasks / preview\nj / k, 5j      Navigate with counts       gg / G    First / last\nCtrl-d / u     Scroll down / up 10 lines  Enter     Focus preview\nzp             Show / hide preview        Esc / h   Back to tasks\nF              Zoom preview               < / >     Resize columns\nb              Show / hide lists\n\nTASKS\na / o          New task                   A         New subtask\nza / zo / zc   Toggle / expand / collapse tree\ncc             Rename                     i         Edit in Vim/$EDITOR\nv + j/k        Select (v/Esc exits)       J / K     Move task/selection ↓ / ↑\nH / L          Outdent / nest under previous task\nm              Move to another list       D / R     Due date / reminders\nx / Space      Complete / reopen task     dd        Delete (confirm with y)\nzh             Show / hide completed tasks\np              Cycle priority             /         Search this list\nfs             Global search (Enter applies; o opens result; q closes)\nee             Go to view or list (filter in dialog)\n\nPREVIEW\nj / k, ] / [   Next / previous checkbox or subtask; otherwise scroll\nCtrl-d / u     Scroll text 10 lines\nSpace / x      Toggle checkbox/checklist item or complete subtask\nEnter          Toggle checkbox / open subtask (l also opens)\na / o / O      New item: end / below / above; paste multiple lines\nJ / K          Move item ↓ / ↑            u         Undo last edit\ncc / dd        Rename / delete item, checkbox or subtask\ngs             Item ↔ subtask             gx        Open link\nzh             Show / hide completed items\n\nREPORT\n[ / ]          Previous / next day        t         Today\n:report YYYY-MM-DD  Choose a date\n\nHABITS AND FOCUS\nSpace / x      Complete / reset habit\np / w          Pomodoro / Stopwatch (in Focus)\nSpace / Enter  Start / pause local timer\nt              Choose activity            c         Focus / break durations\nn              Next Pomodoro phase        s         Stop and save session\n:focus-retry   Retry pending upload after checking history\n\nCOMMANDS\n:token         Configure API token        :subtask  New subtask\n:theme dark    Dark theme                 :theme light  Light theme\n:sync / :w     Sync                       :config   Configuration path\n:noh           Clear search               :q / q    Quit\n\nPress any key to close help.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Shortcuts ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVIGATION\nh / l, Tab     Lists → tasks → preview\n1 / 2 / 3      Focus lists / tasks / preview\nj / k, 5j      Navigate with counts       gg / G    First / last\nCtrl-d / u     Scroll down / up 10 lines  Enter     Focus preview\nzp             Show / hide preview        Esc / h   Back to tasks\nF              Zoom preview               < / >     Resize columns\nb              Show / hide lists\n\nTASKS\na / o          New task                   A         New subtask\nza / zo / zc   Toggle / expand / collapse tree\ncc             Rename                     i         Edit in Vim/$EDITOR\nv + j/k        Select (v/Esc exits)       J / K     Move task/selection ↓ / ↑\nH / L          Outdent / nest under previous task\nm              Move to another list       D / R     Due date / reminders\nx / Space      Complete / reopen task     dd        Delete (confirm with y)\nzh             Show / hide completed tasks\np              Cycle priority             /         Search this list\nff             Global search (Enter applies; o opens result; q closes)\nfl             Go to view or list (filter in dialog)\n\nPREVIEW\nj / k, ] / [   Next / previous checkbox or subtask; otherwise scroll\nCtrl-d / u     Scroll text 10 lines\nSpace / x      Toggle checkbox/checklist item or complete subtask\nEnter          Toggle checkbox / open subtask (l also opens)\na / o / O      New item: end / below / above; paste multiple lines\nJ / K          Move item ↓ / ↑            u         Undo last edit\ncc / dd        Rename / delete item, checkbox or subtask\ngs             Item ↔ subtask             gx        Open link\nzh             Show / hide completed items\n\nREPORT\n[ / ]          Previous / next day        t         Today\n:report YYYY-MM-DD  Choose a date\n\nHABITS AND FOCUS\nSpace / x      Complete / reset habit\np / w          Pomodoro / Stopwatch (in Focus)\nSpace / Enter  Start / pause local timer\nt              Choose activity            c         Focus / break durations\nn              Next Pomodoro phase        s         Stop and save session\n:focus-retry   Retry pending upload after checking history\n\nCOMMANDS\n:token         Configure API token        :subtask  New subtask\n:theme dark    Dark theme                 :theme light  Light theme\n:sync / :w     Sync                       :config   Configuration path\n:noh           Clear search               :q / q    Quit\n\nPress any key to close help.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Shortcuts ".into(),true).padding(Padding::horizontal(2))),area);
     }
     if app.quitting {
         let area = centered(f.area(), 44, 5);
@@ -4424,6 +4464,7 @@ mod tests {
             opening_task: None,
             open_error: None,
             search_was_global: false,
+            search_filter: false,
             target: None,
             query: String::new(),
             message: String::new(),
@@ -4699,7 +4740,7 @@ mod tests {
                 });
                 a.focus(pane);
                 press(&mut a, 'f');
-                press(&mut a, 's');
+                press(&mut a, 'f');
                 for c in "NEEDLE".chars() {
                     press(&mut a, c);
                 }
@@ -4724,14 +4765,14 @@ mod tests {
         let mut a = app();
         let origin = a.project;
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         press(&mut a, '3');
         a.key(KeyEvent::from(K::Enter));
         let data = a.data.clone();
         a.replace_snapshot(data);
         assert_eq!(a.project, origin);
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         press(&mut a, 'X');
         a.key(KeyEvent::from(K::Esc));
         assert!(!a.global_search);
@@ -4754,17 +4795,17 @@ mod tests {
         a.collapsed.insert("group:g".into());
         for view in [View::Report, View::Habits, View::Focus] {
             a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
-            press(&mut a, 'e');
-            press(&mut a, 'e');
+            press(&mut a, 'f');
+            press(&mut a, 'l');
             assert!(a.mode == Mode::GoList);
             a.key(KeyEvent::from(K::Esc));
             assert_eq!(a.view(), view);
         }
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.key(KeyEvent::from(K::Enter));
-        press(&mut a, 'e');
-        press(&mut a, 'e');
+        press(&mut a, 'f');
+        press(&mut a, 'l');
         for c in "WORK".chars() {
             press(&mut a, c);
         }
@@ -4784,8 +4825,8 @@ mod tests {
         assert!(!a.collapsed.contains("group:g"));
         assert!(!a.global_search && a.query.is_empty());
         assert!(!a.projects_focus && !a.preview_focus);
-        press(&mut a, 'e');
-        press(&mut a, 'e');
+        press(&mut a, 'f');
+        press(&mut a, 'l');
         for c in "missing".chars() {
             press(&mut a, c);
         }
@@ -4806,8 +4847,8 @@ mod tests {
             ("all", View::All),
         ] {
             let mut a = app();
-            press(&mut a, 'e');
-            press(&mut a, 'e');
+            press(&mut a, 'f');
+            press(&mut a, 'l');
             for c in query.chars() {
                 press(&mut a, c);
             }
@@ -4852,7 +4893,7 @@ mod tests {
         ];
         a.confirmed = a.data.clone();
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.query = "Old".into();
         a.mode = Mode::Normal;
         a.remote_search = Some(RemoteSearch {
@@ -4875,11 +4916,11 @@ mod tests {
         );
         // Opening and canceling another search keeps the selected activity visible.
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.key(KeyEvent::from(K::Esc));
         assert_eq!(a.task().unwrap().id, "old");
-        press(&mut a, 'e');
-        press(&mut a, 'e');
+        press(&mut a, 'f');
+        press(&mut a, 'l');
         for c in "Other list".chars() {
             press(&mut a, c);
         }
@@ -4908,7 +4949,7 @@ mod tests {
             ..Default::default()
         };
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.query = "Remote".into();
         a.mode = Mode::Normal;
         a.remote_search = Some(RemoteSearch {
@@ -4930,7 +4971,7 @@ mod tests {
         assert!(!a.global_search && a.project == origin);
         assert!(!a.data.tasks.iter().any(|t| t.id == "remote"));
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.query = "Remote".into();
         a.mode = Mode::Normal;
         a.remote_search = Some(RemoteSearch {
@@ -5001,7 +5042,7 @@ mod tests {
         let mut a = app();
         a.demo = false;
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.mode = Mode::Normal;
         a.query = "Flights".into();
         a.remote_search = Some(RemoteSearch {
@@ -5063,7 +5104,7 @@ mod tests {
         a.collapsed.extend(["group:g".into(), "0".into()]);
         a.project = 3; // Search from the report, where tasks normally cannot be edited.
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         for c in "archive".chars() {
             press(&mut a, c);
         }
@@ -5141,7 +5182,7 @@ mod tests {
     fn opening_result_from_unlisted_project_uses_all_tasks() {
         let mut a = app();
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         a.query = "archive".into();
         a.remote_search = Some(RemoteSearch {
             id: 1,
@@ -5175,7 +5216,7 @@ mod tests {
         let origin = a.project;
         let count = a.data.tasks.len();
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         for c in "needle".chars() {
             press(&mut a, c);
         }
@@ -5208,7 +5249,7 @@ mod tests {
         assert!(!a.global_search);
         assert_eq!(a.project, origin);
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         for c in "other".chars() {
             press(&mut a, c);
         }
@@ -5259,6 +5300,47 @@ mod tests {
     }
 
     #[test]
+    fn slash_filters_global_results_locally_without_new_request() {
+        let mut a = app();
+        a.demo = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        press(&mut a, 'f');
+        press(&mut a, 'f');
+        for c in "api".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        let Job::Search { id, .. } = rx.recv().unwrap() else {
+            panic!("expected search");
+        };
+        let task = |id: &str, title: &str| Task {
+            id: id.into(),
+            project_id: "p".into(),
+            title: title.into(),
+            ..Default::default()
+        };
+        a.finish_search(id, Ok(vec![task("a", "Alpha"), task("b", "Beta")]));
+        press(&mut a, '/');
+        for c in "bet".chars() {
+            press(&mut a, c);
+        }
+        let ids = |a: &App| a.visible().iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&a), ["b"]);
+        a.key(KeyEvent::from(K::Enter));
+        assert!(rx.try_recv().is_err() && a.global_search);
+        assert_eq!(ids(&a), ["b"]);
+        press(&mut a, '/');
+        press(&mut a, 'x');
+        a.key(KeyEvent::from(K::Esc)); // Cancels the edit, keeps the modal and the filter.
+        assert!(a.global_search && a.mode == Mode::Normal);
+        assert_eq!(ids(&a), ["b"]);
+        press(&mut a, 'f');
+        press(&mut a, 'f');
+        assert_eq!(a.input, "api");
+    }
+
+    #[test]
     fn search_modal_preserves_background_and_renders_at_small_sizes() {
         let mut a = app();
         a.open_list("p");
@@ -5267,7 +5349,7 @@ mod tests {
         a.focus(2);
         let project = a.project;
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         for (w, h) in [(120, 32), (40, 12), (10, 4)] {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             terminal
@@ -5307,7 +5389,7 @@ mod tests {
             let mut a = app();
             a.open_list("p");
             press(&mut a, 'f');
-            press(&mut a, 's');
+            press(&mut a, 'f');
             press(&mut a, '3');
             if preview {
                 a.key(KeyEvent::from(K::Enter));
@@ -5333,7 +5415,7 @@ mod tests {
         let mut a = app();
         a.open_list("p");
         press(&mut a, 'f');
-        press(&mut a, 's');
+        press(&mut a, 'f');
         press(&mut a, 'Q');
         assert_eq!(a.input, "Q");
         assert!(a.global_search && a.mode == Mode::Search);
@@ -5368,7 +5450,7 @@ mod tests {
         press(&mut a, 'f');
         assert!(!a.zoom);
         assert!(a.mode == Mode::Normal);
-        press(&mut a, 's');
+        press(&mut a, 'f');
         assert!(a.mode == Mode::Search);
         assert!(a.global_search);
         assert_eq!(a.visible().len(), 2);
@@ -5382,9 +5464,9 @@ mod tests {
         assert!(a.zoom);
         press(&mut a, 'F');
         assert!(!a.zoom);
-        press(&mut a, 'e');
+        press(&mut a, 'f');
         assert!(a.mode == Mode::Normal);
-        press(&mut a, 'e');
+        press(&mut a, 'l');
         assert!(a.mode == Mode::GoList);
     }
 
