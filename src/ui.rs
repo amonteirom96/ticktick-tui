@@ -185,17 +185,42 @@ impl App {
         }
     }
     fn create(&mut self, project: String, title: String, parent: Option<String>) {
-        let task = Task {
+        let mut task = Task {
             id: format!("local:{}", uuid::Uuid::new_v4()),
             project_id: project.clone(),
             title,
             parent_id: parent,
             ..Default::default()
         };
+        if task.parent_id.is_none() {
+            let date = match self.view() {
+                View::Today => Some("hoje"),
+                View::Tomorrow => Some("amanhã"),
+                _ => None,
+            };
+            if let Some(date) = date {
+                let mut fields =
+                    match fields::due_fields(date, sidebar::today(&self.data), self.tz()) {
+                        Ok(fields) => fields,
+                        Err(error) => {
+                            self.message = error;
+                            return;
+                        }
+                    };
+                task.due_date = fields
+                    .remove("dueDate")
+                    .and_then(|v| v.as_str().map(str::to_owned));
+                task.extra.extend(fields);
+            }
+        }
         if let Some(id) = task.parent_id.as_ref() {
             self.collapsed.remove(id);
         }
-        self.open_list(&project);
+        if task.parent_id.is_none() && matches!(self.view(), View::Today | View::Tomorrow) {
+            self.query.clear();
+        } else {
+            self.open_list(&project);
+        }
         let id = task.id.clone();
         self.send(Job::Create(task));
         self.selected = self.visible().iter().position(|t| t.id == id).unwrap_or(0);
@@ -977,7 +1002,9 @@ impl App {
             Mode::Add if !text.is_empty() => {
                 let project = match self.view() {
                     View::Project(id) => Some(id),
-                    View::Inbox => Some(self.data.inbox_id.clone().unwrap_or("inbox".into())),
+                    View::Inbox | View::Today | View::Tomorrow => {
+                        Some(self.data.inbox_id.clone().unwrap_or("inbox".into()))
+                    }
                     _ => None,
                 };
                 if let Some(id) = project {
@@ -3441,6 +3468,59 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn adding_from_date_views_schedules_task_in_inbox_and_keeps_view() {
+        for inbox in [None, Some("inbox-real".to_owned())] {
+            for view in [
+                View::Today,
+                View::Tomorrow,
+                View::Inbox,
+                View::Project("p".into()),
+            ] {
+                let mut a = app();
+                let (tx, rx) = std::sync::mpsc::channel();
+                a.tx = Some(tx);
+                a.demo = false;
+                a.data.inbox_id = inbox.clone();
+                a.data.time_zone = Some("America/Recife".into());
+                a.confirmed = a.data.clone();
+                a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
+                let today = sidebar::today(&a.data);
+                a.mode = Mode::Add;
+                a.input = "Nova tarefa".into();
+                a.submit();
+                let Job::Create(task) = rx.try_recv().unwrap() else {
+                    panic!("expected task creation");
+                };
+                assert_eq!(task.title, "Nova tarefa");
+                assert!(task.parent_id.is_none());
+                let expected_project = if matches!(view, View::Project(_)) {
+                    "p"
+                } else {
+                    inbox.as_deref().unwrap_or("inbox")
+                };
+                assert_eq!(task.project_id, expected_project);
+                assert_eq!(a.view(), view);
+                assert_eq!(a.task().unwrap().id, task.id);
+                if matches!(view, View::Today | View::Tomorrow) {
+                    let expected =
+                        today + chrono::Duration::days(i64::from(view == View::Tomorrow));
+                    assert_eq!(
+                        sidebar::date(task.due_date.as_deref().unwrap(), &task, &a.data),
+                        Some(expected)
+                    );
+                    assert_eq!(task.extra["startDate"], task.due_date.as_deref().unwrap());
+                    assert_eq!(task.extra["isAllDay"], true);
+                    assert_eq!(task.extra["timeZone"], "America/Recife");
+                    assert!(sidebar::matches_on(&view, &task, &a.data, today));
+                } else {
+                    assert!(task.due_date.is_none());
+                    assert!(!task.extra.contains_key("startDate"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn report_groups_siblings_with_parent_first() {
         let mut a = app();

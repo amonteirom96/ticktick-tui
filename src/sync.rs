@@ -445,12 +445,10 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => {
                         Ok(job.clone())
                     }
-                    Job::Create(t) => api
-                        .create(&t.project_id, &t.title, t.parent_id.as_deref())
-                        .map(|remote| {
-                            aliases.insert(t.id.clone(), remote.id.clone());
-                            Job::Create(remote)
-                        }),
+                    Job::Create(t) => api.create(t).map(|remote| {
+                        aliases.insert(t.id.clone(), remote.id.clone());
+                        Job::Create(remote)
+                    }),
                     Job::Patch {
                         id,
                         project,

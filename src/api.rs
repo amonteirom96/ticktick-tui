@@ -498,9 +498,14 @@ impl Api {
         }
         crate::focus::summarize(day, data, &records)
     }
-    pub fn create(&self, project: &str, title: &str, parent: Option<&str>) -> Result<Task> {
-        let mut body = json!({"projectId": project,"title": title});
-        if let Some(parent) = parent {
+    pub fn create(&self, task: &Task) -> Result<Task> {
+        let mut body = json!(task.extra);
+        body["projectId"] = json!(task.project_id);
+        body["title"] = json!(task.title);
+        if let Some(due) = &task.due_date {
+            body["dueDate"] = json!(due);
+        }
+        if let Some(parent) = &task.parent_id {
             body["parentId"] = json!(parent);
         }
         let value = self.request(Method::POST, "/task", Some(body))?;
@@ -639,6 +644,79 @@ mod tests {
         assert_eq!(data.ancestry(&child), "FEAT - Buser Voos › Tela de viagem");
         data.completed.clear();
         assert!(data.ancestry(&child).is_empty());
+    }
+
+    #[test]
+    fn create_sends_schedule_with_task_and_omits_local_id() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            assert!(headers.starts_with("POST /open/v1/task HTTP/1.1"));
+            let len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < header_end + len {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            let mut body: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + len]).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "projectId": "inbox-real", "title": "Tomorrow task",
+                    "dueDate": "2026-11-10T03:00:00+0000", "startDate": "2026-11-10T03:00:00+0000",
+                    "isAllDay": true, "timeZone": "America/Recife"
+                })
+            );
+            body["id"] = json!("remote-id");
+            let response = body.to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{addr}/open/v1");
+        let task = Task {
+            id: "local:temporary".into(), project_id: "inbox-real".into(), title: "Tomorrow task".into(),
+            due_date: Some("2026-11-10T03:00:00+0000".into()),
+            extra: serde_json::from_value(json!({"startDate": "2026-11-10T03:00:00+0000", "isAllDay": true, "timeZone": "America/Recife"})).unwrap(),
+            ..Default::default()
+        };
+        let remote = api.create(&task).unwrap();
+        assert_eq!(remote.id, "remote-id");
+        assert_eq!(remote.due_date, task.due_date);
+        server.join().unwrap();
     }
 
     #[test]
