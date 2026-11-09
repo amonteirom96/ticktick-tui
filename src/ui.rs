@@ -3575,7 +3575,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 BorderType::Rounded
             })
             .title(if active {
-                format!("{title}◂ Focus ")
+                format!("{title}")
             } else {
                 title
             })
