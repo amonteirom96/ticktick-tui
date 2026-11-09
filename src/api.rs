@@ -159,6 +159,16 @@ impl Api {
         self.request(Method::POST, "/focus", Some(body.clone()))
     }
     fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request_with(method, path, body, None)
+    }
+    /// `timeout` overrides the client's and disables the 429 retries (fail fast).
+    fn request_with(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let mut attempt = 0;
         let response = loop {
             let mut req = self
@@ -168,9 +178,12 @@ impl Api {
             if let Some(body) = &body {
                 req = req.json(body);
             }
+            if let Some(timeout) = timeout {
+                req = req.timeout(timeout);
+            }
             let response = req.send().context("Cannot reach TickTick")?;
             // Rate limited: wait (Retry-After or exponential) and retry a few times.
-            if response.status().as_u16() != 429 || attempt == 3 {
+            if response.status().as_u16() != 429 || attempt == 3 || timeout.is_some() {
                 break response;
             }
             let wait = response
@@ -411,10 +424,11 @@ impl Api {
     pub fn search(&self, keywords: &str) -> Result<Vec<Task>> {
         let keywords = keywords.trim();
         anyhow::ensure!(!keywords.is_empty(), "Enter a search term");
-        let value = self.request(
+        let value = self.request_with(
             Method::POST,
             "/task/search",
             Some(json!({"keywords": keywords, "status": [0, 2]})),
+            Some(Duration::from_secs(3)),
         )?;
         let tasks: Vec<Task> =
             serde_json::from_value(value).context("Unexpected search response")?;

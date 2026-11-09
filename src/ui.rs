@@ -90,6 +90,8 @@ struct RemoteSearch {
     loading: bool,
     tasks: Vec<Task>,
     error: Option<String>,
+    /// TickTick failed: `tasks` holds local matches and this explains why.
+    warning: Option<String>,
 }
 struct App {
     timer: crate::wellness::Timer,
@@ -320,6 +322,7 @@ impl App {
             loading: false,
             tasks: vec![],
             error,
+            warning: None,
         });
         if query.trim().is_empty() {
             return;
@@ -351,11 +354,24 @@ impl App {
                 search.tasks = tasks;
                 search.error = None;
             }
+            // TickTick search often fails (HTTP 500/timeout): fall back to loaded tasks.
             Err(error) => {
-                search.tasks.clear();
-                search.error = Some(format!("Search failed: {error}. Use fs to retry."));
+                let query = search.query.trim().to_lowercase();
+                let mut seen = HashSet::new();
+                search.tasks = self
+                    .data
+                    .tasks
+                    .iter()
+                    .chain(self.data.completed.iter().rev())
+                    .filter(|t| t.title.to_lowercase().contains(&query) && seen.insert(&t.id))
+                    .cloned()
+                    .collect();
+                search.error = None;
+                search.warning = Some(format!("{error} · showing local results"));
             }
         }
+        // Pending first; stable, so the API/local order is kept within each group.
+        search.tasks.sort_by_key(|t| t.status != 0);
         self.selected = 0;
         self.preview_cursor = 0;
         self.clamp();
@@ -3179,7 +3195,11 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
         .or_else(|| app.remote_search.as_ref().and_then(|s| s.error.as_deref()));
     let count = if loading || error.is_some() || tasks.is_empty() {
         String::new()
-    } else if app.remote_search.is_some() {
+    } else if app
+        .remote_search
+        .as_ref()
+        .is_some_and(|s| s.warning.is_none())
+    {
         format!("{} results", tasks.len())
     } else if app.demo {
         format!("{} demo results", tasks.len())
@@ -3368,6 +3388,21 @@ fn draw_search(f: &mut Frame, app: &App, c: &Config) {
             ]
         })
         .collect::<Vec<_>>();
+    let mut spans = spans;
+    if let Some(warning) = app
+        .remote_search
+        .as_ref()
+        .and_then(|s| s.warning.as_deref())
+        && !loading
+    {
+        spans.insert(
+            0,
+            Span::styled(
+                format!("⚠ {warning}   "),
+                Style::default().fg(preview::color(&t.danger)),
+            ),
+        );
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), rows[2]);
 }
 
@@ -4826,6 +4861,7 @@ mod tests {
             loading: false,
             tasks: vec![old],
             error: None,
+            warning: None,
         });
         press(&mut a, 'o');
         assert!(!a.show_completed);
@@ -4881,6 +4917,7 @@ mod tests {
             loading: false,
             tasks: vec![summary.clone()],
             error: None,
+            warning: None,
         });
         press(&mut a, 'o');
         let Job::LoadTask { request: first, .. } = rx.recv().unwrap() else {
@@ -4902,6 +4939,7 @@ mod tests {
             loading: false,
             tasks: vec![summary],
             error: None,
+            warning: None,
         });
         press(&mut a, 'o');
         let Job::LoadTask {
@@ -4972,6 +5010,7 @@ mod tests {
             loading: true,
             tasks: vec![],
             error: None,
+            warning: None,
         });
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
         for loading in [true, false] {
@@ -5109,6 +5148,7 @@ mod tests {
             query: a.query.clone(),
             loading: false,
             error: None,
+            warning: None,
             tasks: vec![Task {
                 id: "old".into(),
                 project_id: "archived".into(),
@@ -5180,8 +5220,25 @@ mod tests {
         a.finish_search(first, Ok(vec![old_completion.clone()]));
         assert!(a.remote_search.as_ref().unwrap().loading);
         assert!(a.visible().is_empty());
-        a.finish_search(second, Err("TickTick HTTP 403".into()));
+        // TickTick failure falls back to loaded tasks, pending first.
+        for (id, status) in [("done", 2), ("open", 0)] {
+            let task = Task {
+                id: id.into(),
+                project_id: "p".into(),
+                title: format!("The other {id}"),
+                status,
+                ..Default::default()
+            };
+            if status == 2 {
+                a.data.completed.push(task);
+            } else {
+                a.data.tasks.push(task);
+            }
+        }
+        a.finish_search(second, Err("TickTick HTTP 500".into()));
         assert!(!a.remote_search.as_ref().unwrap().loading);
+        let ids: Vec<_> = a.visible().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, ["open", "done"]);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 32)).unwrap();
         terminal
             .draw(|f| draw(f, &mut a, &Config::default()))
@@ -5193,12 +5250,12 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Search failed"));
-        assert!(!text.contains("No matching tasks."));
+        assert!(text.contains("TickTick HTTP 500 · showing local results"));
+        assert!(text.contains("The other open"));
         press(&mut a, 'q');
         a.finish_search(second, Ok(vec![old_completion]));
         assert!(!a.global_search && a.remote_search.is_none());
-        assert_eq!(a.data.tasks.len(), count);
+        assert_eq!(a.data.tasks.len(), count + 1); // + local "open" fixture.
     }
 
     #[test]
