@@ -3939,7 +3939,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 .block(taskblock)
                 .highlight_style(Style::default().bg(tasks_selection))
                 .highlight_symbol(if !app.projects_focus && !app.preview_focus {
-                    "█"
+                    "▎"
                 } else {
                     " "
                 })
@@ -3958,7 +3958,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 let height = item_heights.get(app.selected).copied().unwrap_or(0);
                 for y in top..top.saturating_add(height).min(inner.height as usize) {
                     f.render_widget(
-                        Paragraph::new("█").style(Style::default().fg(accent).bg(tasks_selection)),
+                        Paragraph::new("▎").style(Style::default().fg(accent).bg(tasks_selection)),
                         Rect::new(inner.x, inner.y + y as u16, 1, 1),
                     );
                 }
