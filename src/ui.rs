@@ -26,10 +26,11 @@ use std::{
 };
 use unicode_width::UnicodeWidthStr;
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Mode {
     Normal,
     Search,
+    GoList,
     Command,
     Add,
     Subtask,
@@ -47,6 +48,48 @@ enum Mode {
     FocusTask,
     /// Edits the pomodoro focus / break / long break minutes.
     FocusConfig,
+}
+#[derive(Clone)]
+struct SearchBackground {
+    query: String,
+    selected: usize,
+    projects_focus: bool,
+    preview_focus: bool,
+    preview_cursor: usize,
+    zoom: bool,
+    hide_lists: bool,
+    revealed_completed: Option<String>,
+}
+impl SearchBackground {
+    fn capture(app: &App) -> Self {
+        Self {
+            query: app.query.clone(),
+            selected: app.selected,
+            projects_focus: app.projects_focus,
+            preview_focus: app.preview_focus,
+            preview_cursor: app.preview_cursor,
+            zoom: app.zoom,
+            hide_lists: app.hide_lists,
+            revealed_completed: app.revealed_completed.clone(),
+        }
+    }
+    fn restore(&self, app: &mut App) {
+        app.query = self.query.clone();
+        app.selected = self.selected;
+        app.projects_focus = self.projects_focus;
+        app.preview_focus = self.preview_focus;
+        app.preview_cursor = self.preview_cursor;
+        app.zoom = self.zoom;
+        app.hide_lists = self.hide_lists;
+        app.revealed_completed = self.revealed_completed.clone();
+    }
+}
+struct RemoteSearch {
+    id: u64,
+    query: String,
+    loading: bool,
+    tasks: Vec<Task>,
+    error: Option<String>,
 }
 struct App {
     timer: crate::wellness::Timer,
@@ -80,6 +123,7 @@ struct App {
     item: Option<Action>,
     hide_done: bool,
     show_completed: bool,
+    revealed_completed: Option<String>,
     /// Inverse patches of `update`, newest last.
     undo: Vec<Job>,
     theme_request: Option<String>,
@@ -87,6 +131,13 @@ struct App {
     input: String,
     input_cursor: usize,
     search_original: String,
+    global_search: bool,
+    search_background: Option<SearchBackground>,
+    search_request_id: u64,
+    remote_search: Option<RemoteSearch>,
+    opening_task: Option<u64>,
+    open_error: Option<String>,
+    search_was_global: bool,
     target: Option<Task>,
     query: String,
     message: String,
@@ -109,13 +160,13 @@ impl App {
             return;
         }
         if let Err(error) = self.timer.save() {
-            self.message = format!("Timer em memória; falha ao salvar estado local: {error}");
+            self.message = format!("Timer in memory; failed to save local state: {error}");
             return;
         }
         for upload in self.timer.ready_uploads() {
             self.timer.mark_attempted(&upload.id);
             if let Err(error) = self.timer.save() {
-                self.message = format!("Falha ao salvar envio pendente de foco: {error}");
+                self.message = format!("Failed to save pending focus upload: {error}");
                 return;
             }
             if self
@@ -125,10 +176,11 @@ impl App {
             {
                 self.in_flight += 1;
                 self.busy = true;
-                self.message = "Salvando sessão de foco no TickTick…".into();
+                self.message = "Saving focus session to TickTick…".into();
             } else {
                 self.message =
-                    "Foco pendente · reconecte e use :focus-retry após conferir o histórico".into();
+                    "Focus upload pending · reconnect and use :focus-retry after checking history"
+                        .into();
             }
         }
     }
@@ -137,10 +189,176 @@ impl App {
         sidebar::entries(&self.data, &self.collapsed)
     }
     fn view(&self) -> View {
+        if self.global_search {
+            return View::All;
+        }
         self.sidebar()
             .get(self.project)
             .map(|e| e.view.clone())
             .unwrap_or(View::Today)
+    }
+    fn clear_search(&mut self) {
+        self.query.clear();
+        self.global_search = false;
+        self.search_background = None;
+        self.remote_search = None;
+        self.opening_task = None;
+        self.open_error = None;
+        self.revealed_completed = None;
+    }
+    fn exit_global_search(&mut self) {
+        let background = self.search_background.take();
+        self.clear_search();
+        if let Some(background) = background {
+            background.restore(self);
+        } else {
+            self.focus(1);
+            self.selected = 0;
+            self.preview_cursor = 0;
+        }
+        self.pending = '\0';
+        self.count.clear();
+        self.clamp();
+    }
+    fn open_search_result(&mut self) {
+        if self.opening_task.is_some() {
+            return;
+        }
+        let Some(task) = self.task() else {
+            return;
+        };
+        if self.demo {
+            self.show_search_task(task);
+            return;
+        }
+        self.search_request_id += 1;
+        let request = self.search_request_id;
+        self.open_error = None;
+        if self.tx.as_ref().is_some_and(|tx| {
+            tx.send(Job::LoadTask {
+                request,
+                project: task.project_id,
+                id: task.id,
+            })
+            .is_ok()
+        }) {
+            self.opening_task = Some(request);
+            self.in_flight += 1;
+            self.busy = true;
+        } else {
+            self.open_error = Some("Check your TickTick connection.".into());
+        }
+    }
+    fn finish_open_task(&mut self, request: u64, result: Result<Task, String>) {
+        if !self.global_search || self.opening_task != Some(request) {
+            return;
+        }
+        self.opening_task = None;
+        match result {
+            Ok(task) => self.show_search_task(task),
+            Err(error) => self.open_error = Some(error),
+        }
+    }
+    fn show_search_task(&mut self, task: Task) {
+        self.exit_global_search();
+        sync::remember(&mut self.confirmed, &task);
+        self.replay();
+        self.open_list(&task.project_id);
+        if !sidebar::matches(&self.view(), &task, &self.data) {
+            // Results can belong to archived or otherwise unlisted projects.
+            self.project = self
+                .sidebar()
+                .iter()
+                .position(|e| e.view == View::All)
+                .unwrap_or(0);
+        }
+        self.revealed_completed = (task.status == 2).then(|| task.id.clone());
+        let mut parent = task.parent_id.clone();
+        let mut seen = HashSet::new();
+        while let Some(id) = parent.filter(|id| seen.insert(id.clone())) {
+            self.collapsed.remove(&id);
+            parent = self
+                .data
+                .tasks
+                .iter()
+                .chain(self.data.completed.iter())
+                .find(|t| t.id == id)
+                .and_then(|t| t.parent_id.clone());
+        }
+        self.focus(1);
+        self.zoom = false;
+        self.selected = self
+            .visible()
+            .iter()
+            .position(|t| t.id == task.id)
+            .unwrap_or(0);
+        self.preview_cursor = 0;
+        self.mode = Mode::Normal;
+        self.input.clear();
+        self.message = if task.status == 2 {
+            "Activity opened · i edit · x / Space reopen"
+        } else {
+            "Activity opened · i edit · x / Space complete"
+        }
+        .into();
+    }
+    fn request_search(&mut self) {
+        if self.demo {
+            return;
+        }
+        self.search_request_id += 1;
+        let id = self.search_request_id;
+        let query = self.query.clone();
+        let error = if query.trim().is_empty() {
+            Some("Enter a search term, then press Enter.".into())
+        } else {
+            None
+        };
+        self.remote_search = Some(RemoteSearch {
+            id,
+            query: query.clone(),
+            loading: false,
+            tasks: vec![],
+            error,
+        });
+        if query.trim().is_empty() {
+            return;
+        }
+        if self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Job::Search { id, query }).is_ok())
+        {
+            self.remote_search.as_mut().unwrap().loading = true;
+            self.in_flight += 1;
+            self.busy = true;
+        } else {
+            self.remote_search.as_mut().unwrap().error = Some(
+                "Search unavailable. Check your TickTick connection and retry with fs.".into(),
+            );
+        }
+    }
+    fn finish_search(&mut self, id: u64, result: Result<Vec<Task>, String>) {
+        if !self.global_search {
+            return;
+        }
+        let Some(search) = self.remote_search.as_mut().filter(|s| s.id == id) else {
+            return;
+        };
+        search.loading = false;
+        match result {
+            Ok(tasks) => {
+                search.tasks = tasks;
+                search.error = None;
+            }
+            Err(error) => {
+                search.tasks.clear();
+                search.error = Some(format!("Search failed: {error}. Use fs to retry."));
+            }
+        }
+        self.selected = 0;
+        self.preview_cursor = 0;
+        self.clamp();
     }
     fn replay(&mut self) {
         self.data = self.confirmed.clone();
@@ -150,7 +368,13 @@ impl App {
         self.clamp();
     }
     fn update(&mut self, task: Task) {
-        if let Some(before) = self.data.tasks.iter().find(|t| t.id == task.id) {
+        if let Some(before) = self
+            .data
+            .tasks
+            .iter()
+            .chain(self.data.completed.iter())
+            .find(|t| t.id == task.id)
+        {
             let old = serde_json::to_value(before).unwrap();
             let new = serde_json::to_value(&task).unwrap();
             let fields: serde_json::Map<_, _> = new
@@ -194,8 +418,8 @@ impl App {
         };
         if task.parent_id.is_none() {
             let date = match self.view() {
-                View::Today => Some("hoje"),
-                View::Tomorrow => Some("amanhã"),
+                View::Today => Some("today"),
+                View::Tomorrow => Some("tomorrow"),
                 _ => None,
             };
             if let Some(date) = date {
@@ -217,7 +441,7 @@ impl App {
             self.collapsed.remove(id);
         }
         if task.parent_id.is_none() && matches!(self.view(), View::Today | View::Tomorrow) {
-            self.query.clear();
+            self.clear_search();
         } else {
             self.open_list(&project);
         }
@@ -228,7 +452,7 @@ impl App {
     }
     /// Selects the sidebar list `project` (Inbox if it has no entry), expanding its group.
     fn open_list(&mut self, project: &str) {
-        self.query.clear();
+        self.clear_search();
         if let Some(group) = self
             .data
             .projects
@@ -251,6 +475,15 @@ impl App {
     }
     /// Tasks of the current view in TickTick's manual order.
     fn view_tasks(&self) -> Vec<&Task> {
+        if self.global_search {
+            if let Some(search) = self
+                .remote_search
+                .as_ref()
+                .filter(|s| s.query == self.query)
+            {
+                return search.tasks.iter().collect();
+            }
+        }
         let view = self.view();
         let mut tasks = self
             .data
@@ -258,10 +491,15 @@ impl App {
             .iter()
             .filter(|t| sidebar::matches(&view, t, &self.data))
             .collect::<Vec<_>>();
-        if self.show_completed {
+        if self.show_completed || self.global_search || self.revealed_completed.is_some() {
             let mut seen: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
             for task in self.data.completed.iter().rev() {
-                if sidebar::matches(&view, task, &self.data) && seen.insert(task.id.clone()) {
+                if (self.show_completed
+                    || self.global_search
+                    || self.revealed_completed.as_deref() == Some(task.id.as_str()))
+                    && sidebar::matches(&view, task, &self.data)
+                    && seen.insert(task.id.clone())
+                {
                     tasks.push(task);
                 }
             }
@@ -270,7 +508,23 @@ impl App {
         tasks
     }
     fn tree(&self) -> Vec<tree::Row<'_>> {
-        tree::rows(&self.view_tasks(), &self.collapsed, &self.query)
+        // Server search can match content as well as titles; never filter it again locally.
+        let query = if self.global_search
+            && self
+                .remote_search
+                .as_ref()
+                .is_some_and(|s| s.query == self.query)
+        {
+            ""
+        } else {
+            &self.query
+        };
+        let collapsed = if self.global_search {
+            &HashSet::new()
+        } else {
+            &self.collapsed
+        };
+        tree::rows(&self.view_tasks(), collapsed, query)
     }
     /// Visual selection as an inclusive row range.
     fn range(&self) -> (usize, usize) {
@@ -313,7 +567,7 @@ impl App {
             .map(|t| &t.id)
             .ne(block.iter().map(|t| &t.id))
         {
-            self.message = "Selecione tarefas do mesmo nível para mover.".into();
+            self.message = "Select sibling tasks to move.".into();
             return;
         }
         let mut orders = siblings.iter().map(|t| t.sort_order).collect::<Vec<_>>();
@@ -366,9 +620,9 @@ impl App {
         drop(rows);
         let Some(parent) = parent else {
             self.message = if indent {
-                "Nenhuma tarefa acima no mesmo nível."
+                "No sibling task above."
             } else {
-                "Já está no primeiro nível."
+                "Already at the top level."
             }
             .into();
             return;
@@ -499,9 +753,9 @@ impl App {
         match self.undo.pop() {
             Some(job) => {
                 self.send(job);
-                self.message = format!("Desfeito · {} restante(s)", self.undo.len());
+                self.message = format!("Undone · {} remaining", self.undo.len());
             }
-            None => self.message = "Nada para desfazer.".into(),
+            None => self.message = "Nothing to undo.".into(),
         }
     }
     /// `gs`: checklist item / Markdown task → subtask, or a plain subtask → checklist item.
@@ -520,7 +774,7 @@ impl App {
                 .any(|c| c.parent_id.as_deref() == Some(&id));
             if !sub.content.trim().is_empty() || !sub.items.is_empty() || has_children {
                 self.message =
-                    "Subtarefa com conteúdo, checklist ou filhas; não convertida.".into();
+                    "Subtask has content, a checklist or children; cannot convert.".into();
                 return;
             }
             t.items.push(new_item(&sub.title, false));
@@ -544,7 +798,7 @@ impl App {
             if let Some(i) = self.visible().iter().position(|v| v.id == parent) {
                 self.selected = i;
             }
-            self.message = "Convertido em subtarefa.".into();
+            self.message = "Converted to subtask.".into();
         }
     }
     /// `gx`: link on the cursor row (preview) or the task's first link.
@@ -587,10 +841,10 @@ impl App {
             .stderr(std::process::Stdio::null())
             .spawn()
             {
-                Ok(_) => format!("Abrindo {url}"),
-                Err(e) => format!("Não foi possível abrir o link: {e}"),
+                Ok(_) => format!("Opening {url}"),
+                Err(e) => format!("Could not open link: {e}"),
             },
-            None => "Nenhum link aqui.".into(),
+            None => "No link here.".into(),
         };
     }
     /// Bracketed paste: several lines in checklist mode become several items.
@@ -614,7 +868,7 @@ impl App {
                 .collect::<Vec<_>>();
             if items.len() > 1 {
                 self.insert_items(&items);
-                self.message = format!("{} itens adicionados", items.len());
+                self.message = format!("{} items added", items.len());
                 return;
             }
         }
@@ -653,7 +907,7 @@ impl App {
     }
     fn preview_action(&mut self, theme: &config::Theme, open: bool) {
         if self.busy {
-            self.message = "Salvando alterações anteriores…".into();
+            self.message = "Saving previous changes…".into();
         }
         let action = self
             .preview(theme)
@@ -689,8 +943,9 @@ impl App {
                     Action::Subtask(_) => false,
                 };
                 if preview::toggle(&mut task, &action) {
-                    // Último item do checklist marcado conclui a tarefa (send toca o som).
-                    let finish = checking
+                    // Completing the final checklist item completes an open task.
+                    let finish = task.status == 0
+                        && checking
                         && matches!(action, Action::Checklist(_))
                         && task.items.iter().all(|i| i.status == 1);
                     if checking && !finish {
@@ -700,7 +955,7 @@ impl App {
                     if finish {
                         self.send(Job::Complete(task));
                     } else if checking && self.open_boxes().is_empty() {
-                        self.message = "Tudo marcado ✓ · h depois x conclui a tarefa".into();
+                        self.message = "All checked ✓ · h then x completes the task".into();
                     }
                 }
             }
@@ -712,18 +967,24 @@ impl App {
     /// Inbox and lists whose name contains `query`, in sidebar order.
     fn lists(&self, query: &str) -> Vec<(String, String)> {
         let query = query.to_lowercase();
-        let inbox = self.data.inbox_id.clone();
-        inbox
-            .iter()
-            .map(|id| (id.clone(), "Inbox".to_owned()))
+        let inbox = self.data.inbox_id.clone().unwrap_or_else(|| "inbox".into());
+        std::iter::once((inbox.clone(), "Inbox".to_owned()))
             .chain(
                 self.data
                     .projects
                     .iter()
-                    .filter(|p| Some(&p.id) != inbox.as_ref())
+                    .filter(|p| p.id != inbox)
                     .map(|p| (p.id.clone(), p.name.clone())),
             )
             .filter(|(_, name)| name.to_lowercase().contains(&query))
+            .collect()
+    }
+    fn destinations(&self, query: &str) -> Vec<(View, String)> {
+        let query = query.to_lowercase();
+        sidebar::entries(&self.data, &HashSet::new())
+            .into_iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&query))
+            .map(|entry| (entry.view, entry.name))
             .collect()
     }
     /// Open tasks matching `query` for the focus picker; `None` is free focus.
@@ -848,7 +1109,11 @@ impl App {
         self.visible().get(self.selected).map(|t| (*t).clone())
     }
     fn replace_snapshot(&mut self, data: Snapshot) {
-        let view = self.view();
+        let view = self
+            .sidebar()
+            .get(self.project)
+            .map(|e| e.view.clone())
+            .unwrap_or(View::Today);
         let task_id = self.task().map(|t| t.id);
         self.confirmed = data;
         self.replay();
@@ -898,13 +1163,20 @@ impl App {
     }
     fn send(&mut self, job: Job) {
         if matches!(&job, Job::Complete(t) if t.is_note()) {
-            self.message = "Anotação · use e para editar; anotações não são concluídas".into();
+            self.message = "Note · use i to edit; notes cannot be completed".into();
             return;
         }
         if matches!(self.view(), View::Report | View::Habits | View::Focus)
-            && !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
+            && !matches!(
+                job,
+                Job::LoadTask { .. }
+                    | Job::Search { .. }
+                    | Job::Refresh
+                    | Job::Report(_)
+                    | Job::CheckHabit { .. }
+            )
         {
-            self.message = "Relatório · visualização das atividades concluídas".into();
+            self.message = "Report · viewing completed activities".into();
             return;
         }
         if matches!(job, Job::Complete(_))
@@ -924,7 +1196,7 @@ impl App {
             }
             sync::apply(&mut self.data, &job);
             self.confirmed = self.data.clone();
-            self.message = "Demonstração · alteração apenas local".into();
+            self.message = "Demo · local change only".into();
             self.clamp();
             return;
         }
@@ -936,7 +1208,14 @@ impl App {
             .as_ref()
             .is_some_and(|tx| tx.send(job.clone()).is_ok())
         {
-            if !matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }) {
+            if !matches!(
+                job,
+                Job::LoadTask { .. }
+                    | Job::Search { .. }
+                    | Job::Refresh
+                    | Job::Report(_)
+                    | Job::CheckHabit { .. }
+            ) {
                 self.pending_jobs.push_back(job.clone());
                 sync::apply(&mut self.data, &job);
             }
@@ -946,18 +1225,24 @@ impl App {
             self.in_flight += 1;
             self.busy = true;
             self.message = match &job {
-                Job::Report(day) => format!("Consultando relatório de {}…", day.format("%d/%m/%Y")),
-                Job::Refresh => "Sincronizando com TickTick…".into(),
-                Job::CheckHabit { .. } => "Registrando hábito no TickTick…".into(),
-                _ => format!("Salvando… {} operação(ões)", self.pending_jobs.len()),
+                Job::Report(day) => format!("Loading report for {}…", day.format("%d/%m/%Y")),
+                Job::Refresh => "Syncing with TickTick…".into(),
+                Job::CheckHabit { .. } => "Recording habit in TickTick…".into(),
+                _ => format!("Saving… {} operations", self.pending_jobs.len()),
             };
             self.clamp();
         } else {
-            self.message = if matches!(job, Job::Refresh | Job::Report(_) | Job::CheckHabit { .. })
-            {
-                "Consulta indisponível; verifique sua conexão com o TickTick."
+            self.message = if matches!(
+                job,
+                Job::LoadTask { .. }
+                    | Job::Search { .. }
+                    | Job::Refresh
+                    | Job::Report(_)
+                    | Job::CheckHabit { .. }
+            ) {
+                "Unable to load data; check your TickTick connection."
             } else {
-                "Sincronização indisponível; alteração não enviada."
+                "Sync unavailable; change not sent."
             }
             .into();
         }
@@ -986,6 +1271,7 @@ impl App {
         };
         *index = index.saturating_add_signed(delta).min(max);
         if self.projects_focus {
+            self.clear_search();
             self.selected = 0;
             if self.view() == View::Report {
                 self.send(Job::Report(self.report_day));
@@ -998,6 +1284,37 @@ impl App {
             Mode::Search => {
                 self.query = text;
                 self.selected = 0;
+                if self.global_search {
+                    self.request_search();
+                }
+            }
+            Mode::GoList => {
+                if let Some((view, _)) = self.destinations(&text).get(self.pick).cloned() {
+                    if self.global_search {
+                        self.exit_global_search();
+                    }
+                    self.clear_search();
+                    match &view {
+                        View::Project(id) => self.open_list(id),
+                        _ => {
+                            self.project = self
+                                .sidebar()
+                                .iter()
+                                .position(|e| e.view == view)
+                                .unwrap_or(0)
+                        }
+                    }
+                    self.selected = 0;
+                    self.preview_cursor = 0;
+                    self.zoom = false;
+                    self.focus(1);
+                    if view == View::Report {
+                        self.send(Job::Report(self.report_day));
+                    }
+                } else {
+                    self.message = "No matching view or list.".into();
+                    return false;
+                }
             }
             Mode::Add if !text.is_empty() => {
                 let project = match self.view() {
@@ -1010,7 +1327,7 @@ impl App {
                 if let Some(id) = project {
                     self.create(id, text, None);
                 } else {
-                    self.message = "Selecione uma lista ou Inbox para criar a tarefa.".into();
+                    self.message = "Select a list or Inbox to create a task.".into();
                 }
             }
             Mode::Subtask if !text.is_empty() => {
@@ -1049,20 +1366,20 @@ impl App {
                 match choices.get(self.pick.min(choices.len().saturating_sub(1))) {
                     Some(task) => {
                         self.message = match task {
-                            Some(t) => format!("Atividade do foco: {}", t.title),
-                            None => "Foco livre".into(),
+                            Some(t) => format!("Focus activity: {}", t.title),
+                            None => "Free focus".into(),
                         };
                         self.timer.set_task(task.clone());
                         self.persist_timer();
                     }
-                    None => self.message = format!("Nenhuma tarefa encontrada: {text}"),
+                    None => self.message = format!("No matching task: {text}"),
                 }
             }
             Mode::FocusConfig if !text.is_empty() => match self.timer.set_durations(&text) {
                 Ok(()) => {
                     let (focus, short, long) = self.timer.durations();
                     self.message =
-                        format!("Foco {focus}min · pausa {short}min · pausa longa {long}min");
+                        format!("Focus {focus}min · break {short}min · long break {long}min");
                     self.persist_timer();
                 }
                 Err(e) => self.message = e,
@@ -1071,10 +1388,10 @@ impl App {
                 if let Some(t) = self.target.take() {
                     match self.lists(&text).into_iter().next() {
                         Some((id, _)) if id == t.project_id => {
-                            self.message = "A tarefa já está nessa lista.".into()
+                            self.message = "Task is already in this list.".into()
                         }
                         Some((to, _)) => self.send(Job::Move { task: t, to }),
-                        None => self.message = format!("Lista não encontrada: {text}"),
+                        None => self.message = format!("List not found: {text}"),
                     }
                 }
             }
@@ -1126,7 +1443,9 @@ impl App {
                             self.selected = 0;
                             self.send(Job::Report(day));
                         }
-                        _ => self.message = "Use :report AAAA-MM-DD com uma data até hoje.".into(),
+                        _ => {
+                            self.message = "Use :report YYYY-MM-DD with a date up to today.".into()
+                        }
                     }
                 }
 
@@ -1152,7 +1471,7 @@ impl App {
                     self.mode = Mode::Help;
                     return false;
                 }
-                "noh" | "nohlsearch" => self.query.clear(),
+                "noh" | "nohlsearch" => self.clear_search(),
                 "config" => {
                     self.message = config::config_dir()
                         .join("config.toml")
@@ -1171,8 +1490,7 @@ impl App {
                 }
                 "focus-retry" => {
                     if self.busy {
-                        self.message =
-                            "Aguarde o envio em andamento antes de tentar novamente.".into();
+                        self.message = "Wait for the current upload before retrying.".into();
                     } else {
                         self.timer.retry_uploads();
                         self.persist_timer();
@@ -1272,8 +1590,8 @@ impl App {
                 return false;
             }
         }
-        if self.mode == Mode::FocusTask {
-            let ctrl = key.modifiers.contains(M::CONTROL);
+        if matches!(self.mode, Mode::FocusTask | Mode::GoList) {
+            let ctrl = self.mode == Mode::FocusTask && key.modifiers.contains(M::CONTROL);
             let step = match key.code {
                 K::Down | K::Tab => 1,
                 K::Up | K::BackTab => -1,
@@ -1281,7 +1599,12 @@ impl App {
                 K::Char('p') if ctrl => -1,
                 _ => 0,
             };
-            let len = self.focus_choices(&self.input).len().max(1) as isize;
+            let len = if self.mode == Mode::GoList {
+                self.destinations(&self.input).len()
+            } else {
+                self.focus_choices(&self.input).len()
+            }
+            .max(1) as isize;
             if step != 0 {
                 self.pick = (self.pick as isize + step).rem_euclid(len) as usize;
                 return false;
@@ -1289,6 +1612,14 @@ impl App {
             if !matches!(key.code, K::Enter | K::Esc) {
                 self.pick = 0; // The filter changed, so restart from the best match.
             }
+        }
+        if self.global_search
+            && matches!(key.code, K::Char('q' | 'Q'))
+            && matches!(self.mode, Mode::Normal | Mode::Visual)
+        {
+            self.mode = Mode::Normal;
+            self.exit_global_search();
+            return false;
         }
         if self.mode == Mode::Visual
             && !matches!(
@@ -1305,7 +1636,13 @@ impl App {
             match key.code {
                 K::Esc => {
                     if self.mode == Mode::Search {
-                        self.query = self.search_original.clone();
+                        if self.global_search {
+                            self.exit_global_search();
+                        } else {
+                            self.query = self.search_original.clone();
+                            self.global_search = self.search_was_global;
+                            self.clamp();
+                        }
                     }
                     self.mode = Mode::Normal;
                     self.input.clear();
@@ -1323,10 +1660,72 @@ impl App {
             }
             return false;
         }
+        if key.code == K::Char('e') && self.pending == 'e' {
+            if self.global_search {
+                self.exit_global_search();
+            }
+            self.mode = Mode::GoList;
+            self.input.clear();
+            self.input_cursor = 0;
+            self.pick = 0;
+            self.pending = '\0';
+            self.count.clear();
+            return false;
+        }
+        if key.code == K::Char('/') || key.code == K::Char('s') && self.pending == 'f' {
+            if key.code != K::Char('/') && !self.global_search {
+                self.search_background = Some(SearchBackground::capture(self));
+            }
+            self.remote_search = None;
+            self.opening_task = None;
+            self.open_error = None;
+            self.mode = Mode::Search;
+            self.search_original = self.query.clone();
+            self.search_was_global = self.global_search;
+            self.global_search = key.code != K::Char('/');
+            self.input = self.query.clone();
+            self.input_cursor = self.input.chars().count();
+            self.selected = 0;
+            self.preview_cursor = 0;
+            self.zoom = false;
+            self.focus(1);
+            self.pending = '\0';
+            self.count.clear();
+            return false;
+        }
+        if matches!(key.code, K::Char('e' | 'f')) {
+            if let K::Char(prefix) = key.code {
+                self.pending = prefix;
+                self.count.clear();
+            }
+            return false;
+        }
+        if self.global_search && self.mode == Mode::Normal {
+            if self.opening_task.is_some() {
+                return false;
+            }
+            match key.code {
+                K::Char('o') => self.open_search_result(),
+                K::Char('j') | K::Down => self.movement(1),
+                K::Char('k') | K::Up => self.movement(-1),
+                K::Char('h') | K::Left | K::Esc => self.focus(1),
+                K::Char('l') | K::Right | K::Enter => self.focus(2),
+                K::Tab | K::BackTab => self.focus(if self.preview_focus { 1 } else { 2 }),
+                K::Char('F') => {
+                    let zoom = !self.zoom;
+                    self.focus(2);
+                    self.zoom = zoom;
+                }
+                _ => (),
+            }
+            self.pending = '\0';
+            self.clamp();
+            return false;
+        }
         if matches!(self.view(), View::Habits | View::Focus) && !self.projects_focus {
             if self.view() == View::Habits && matches!(key.code, K::Char(' ' | 'x') | K::Enter) {
                 if self.busy {
-                    self.message = "Aguarde a confirmação da sincronização.".into();
+                    self.message = "Wait for sync confirmation.".into();
                 } else if let Some(habit) = crate::wellness::habits(&self.data)
                     .get(self.selected)
                     .map(|h| (*h).clone())
@@ -1360,7 +1759,7 @@ impl App {
                             self.selected = 0;
                             self.persist_timer();
                         } else {
-                            self.message = "Pause o timer antes de trocar de modo.".into();
+                            self.message = "Pause the timer before switching modes.".into();
                         }
                         return false;
                     }
@@ -1394,8 +1793,7 @@ impl App {
             if matches!(
                 key.code,
                 K::Char(
-                    'a' | 'i'
-                        | 'o'
+                    'a' | 'o'
                         | 'A'
                         | 'x'
                         | 'd'
@@ -1404,13 +1802,13 @@ impl App {
                         | 'm'
                         | 'D'
                         | 'R'
-                        | 'e'
+                        | 'i'
                         | 'v'
                         | 'J'
                         | 'K'
                         | 'H'
                         | 'L'
-                        | 'f'
+                        | 'F'
                         | 'z'
                 ) | K::Enter
                     | K::Char(' ')
@@ -1479,8 +1877,7 @@ impl App {
             if matches!(
                 key.code,
                 K::Char(
-                    'a' | 'i'
-                        | 'o'
+                    'a' | 'o'
                         | 'A'
                         | 'x'
                         | ' '
@@ -1490,7 +1887,7 @@ impl App {
                         | 'm'
                         | 'D'
                         | 'R'
-                        | 'e'
+                        | 'i'
                         | 'v'
                         | 'J'
                         | 'K'
@@ -1557,18 +1954,18 @@ impl App {
                 self.clamp();
                 self.preview_cursor = 0;
                 self.message = if self.show_completed {
-                    "Concluídos disponíveis no histórico local visíveis · x / Space reabre"
+                    "Showing completed tasks from local history · x / Space reopens"
                 } else {
-                    "Concluídos ocultos"
+                    "Completed tasks hidden"
                 }
                 .into();
             }
             K::Char('h') if pending == 'z' => {
                 self.hide_done = !self.hide_done;
                 self.message = if self.hide_done {
-                    "Concluídos ocultos"
+                    "Completed tasks hidden"
                 } else {
-                    "Concluídos visíveis"
+                    "Completed tasks visible"
                 }
                 .into();
             }
@@ -1599,6 +1996,7 @@ impl App {
                 if self.preview_focus {
                     self.preview_cursor = 0;
                 } else if self.projects_focus {
+                    self.clear_search();
                     self.project = 0;
                 } else {
                     self.selected = 0;
@@ -1631,7 +2029,7 @@ impl App {
                     {
                         self.update(t);
                         self.preview_cursor = self.preview_cursor.saturating_sub(1);
-                        self.message = "Item apagado · u desfaz".into();
+                        self.message = "Item deleted · u to undo".into();
                     }
                 }
                 None => (),
@@ -1663,7 +2061,7 @@ impl App {
                 self.edit(Mode::Due, current.get(11..).unwrap_or("").replace(':', ""));
             }
             K::Char('R') if self.task().is_some_and(|t| t.due_date.is_none()) => {
-                self.message = "Defina um prazo (D) antes do lembrete.".into()
+                self.message = "Set a due date (D) before adding a reminder.".into()
             }
             K::Char('R') => {
                 let reminders = self
@@ -1671,12 +2069,6 @@ impl App {
                     .and_then(|t| serde_json::from_value(t.extra.get("reminders")?.clone()).ok())
                     .map(|r: Vec<String>| fields::format_reminders(&r));
                 self.edit(Mode::Remind, reminders.unwrap_or_default());
-            }
-            K::Char('/') => {
-                self.mode = Mode::Search;
-                self.search_original = self.query.clone();
-                self.input = self.query.clone();
-                self.input_cursor = self.input.chars().count();
             }
             K::Char(':') => {
                 self.mode = Mode::Command;
@@ -1693,7 +2085,7 @@ impl App {
                 self.edit(Mode::Item, String::new());
                 self.pick = at;
             }
-            K::Char('a') | K::Char('i') | K::Char('o') => {
+            K::Char('a') | K::Char('o') => {
                 self.mode = Mode::Add;
                 self.input.clear();
             }
@@ -1738,7 +2130,7 @@ impl App {
                 Job::Refresh
             }),
             K::Char('?') => self.mode = Mode::Help,
-            K::Char('f') => {
+            K::Char('F') => {
                 let zoom = !self.zoom;
                 self.focus(2);
                 self.zoom = zoom;
@@ -1780,8 +2172,8 @@ impl App {
             K::Esc => {
                 if self.preview_focus {
                     self.focus(1);
-                } else {
-                    self.query.clear();
+                } else if !self.global_search {
+                    self.clear_search();
                 }
                 self.pending = '\0';
             }
@@ -1882,12 +2274,20 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         item: None,
         hide_done: false,
         show_completed: false,
+        revealed_completed: None,
         undo: Vec::new(),
         theme_request: None,
         mode: Mode::Normal,
         input: String::new(),
         input_cursor: 0,
         search_original: String::new(),
+        global_search: false,
+        search_background: None,
+        search_request_id: 0,
+        remote_search: None,
+        opening_task: None,
+        open_error: None,
+        search_was_global: false,
         target: None,
         query: String::new(),
         message: if demo {
@@ -1911,9 +2311,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         app.timer.bind_account(account);
         app.persist_timer();
         if app.timer.uncertain_uploads() > 0 {
-            app.message =
-                "Há envios de foco sem confirmação · confira o histórico antes de :focus-retry"
-                    .into();
+            app.message = "Unconfirmed focus uploads · check history before :focus-retry".into();
         }
     }
     if !demo {
@@ -1937,21 +2335,25 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 app.busy = app.in_flight > 0;
                 app.last_sync = Instant::now();
                 match event {
+                    sync::Event::TaskLoaded { request, result } => {
+                        app.finish_open_task(request, result)
+                    }
+                    sync::Event::Search { id, result } => app.finish_search(id, result),
                     sync::Event::FocusSaved { id, result } => {
                         match result {
                             Ok(data) => {
                                 app.timer.acknowledge(&id);
                                 app.replace_snapshot(data);
-                                app.message = "Sessão de foco salva no TickTick".into();
+                                app.message = "Focus session saved to TickTick".into();
                             }
                             Err(error) => {
                                 app.message = format!(
-                                    "Envio de foco sem confirmação: {error}. Registro local preservado; confira o histórico antes de :focus-retry."
+                                    "Focus upload unconfirmed: {error}. Local record preserved; check history before :focus-retry."
                                 )
                             }
                         }
                         if let Err(error) = app.timer.save() {
-                            app.message = format!("Falha ao salvar confirmação do foco: {error}");
+                            app.message = format!("Failed to save focus confirmation: {error}");
                         }
                     }
 
@@ -2030,7 +2432,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 app.report_loading.clear();
                 app.project = 0;
                 app.selected = 0;
-                app.query.clear();
+                app.clear_search();
                 app.target = None;
                 // Replace the prior account's cached tasks before fetching the new account.
                 config::private_write(&config::cache_path(), &serde_json::to_vec(&app.data)?)?;
@@ -2045,7 +2447,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                         crate::wellness::Timer::save_status_theme(&t)?;
                     }
                     config.theme = t;
-                    app.message = format!("Tema: {name}");
+                    app.message = format!("Theme: {name}");
                 }
                 Err(e) => app.message = e.to_string(),
             }
@@ -2063,7 +2465,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         {
             app.send(Job::Refresh);
         }
-        terminal.draw(|f| draw(f, &app, &config))?;
+        terminal.draw(|f| draw(f, &mut app, &config))?;
         let event = if event::poll(Duration::from_millis(100))? {
             Some(event::read()?)
         } else {
@@ -2083,13 +2485,14 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                 }
             } else if app.mode == Mode::Normal
                 && app.preview_focus
+                && !app.global_search
                 && app.pending != 'g'
                 && (matches!(key.code, K::Char(' ') | K::Char('x') | K::Enter)
                     || key.code == K::Char('l')
                         && matches!(app.cursor_action(), Some(Action::Subtask(_))))
             {
                 app.preview_action(&config.theme, matches!(key.code, K::Enter | K::Char('l')));
-            } else if app.mode == Mode::Normal && key.code == K::Char('e') {
+            } else if app.mode == Mode::Normal && !app.global_search && key.code == K::Char('i') {
                 if let Some(mut t) = app.task() {
                     disable_raw_mode()?;
                     execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -2099,8 +2502,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
                     terminal.clear()?;
                     match edited {
                         Ok(Some((title, content))) => {
-                            t.title = title;
-                            t.content = content;
+                            apply_editor_change(&mut t, title, content);
                             app.update(t);
                         }
                         Ok(None) => (),
@@ -2221,10 +2623,29 @@ fn edit_input(input: &mut String, cursor: &mut usize, key: KeyEvent) {
     }
     *input = chars.into_iter().collect();
 }
+fn editor_uses_description(task: &Task) -> bool {
+    task.extra.get("kind").and_then(serde_json::Value::as_str) == Some("CHECKLIST")
+        || (task.content.is_empty() && task.desc.is_some())
+}
+fn editor_body(task: &Task) -> &str {
+    if editor_uses_description(task) {
+        task.desc.as_deref().unwrap_or_default()
+    } else {
+        &task.content
+    }
+}
+fn apply_editor_change(task: &mut Task, title: String, body: String) {
+    if editor_uses_description(task) {
+        task.desc = Some(body);
+    } else {
+        task.content = body;
+    }
+    task.title = title;
+}
 fn edit(task: &Task) -> Result<Option<(String, String)>> {
     use std::io::Write;
     let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    write!(file, "{}\n\n{}", task.title, task.content)?;
+    write!(file, "{}\n\n{}", task.title, editor_body(task))?;
     file.flush()?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -2248,7 +2669,7 @@ fn edit(task: &Task) -> Result<Option<(String, String)>> {
         .unwrap_or(content)
         .trim_end()
         .to_owned();
-    if title == task.title && content == task.content {
+    if title == task.title && content == editor_body(task) {
         Ok(None)
     } else {
         Ok(Some((title.into(), content)))
@@ -2257,19 +2678,19 @@ fn edit(task: &Task) -> Result<Option<(String, String)>> {
 fn demo_data() -> Snapshot {
     use crate::api::ChecklistItem;
     Snapshot {
-        projects:vec![Project{id:"work".into(),name:"Projetos".into(),closed:false,group_id:Some("work-group".into()),..Default::default()},Project{id:"personal".into(),name:"Leitura".into(),closed:false,group_id:Some("personal-group".into()),..Default::default()}],
+        projects:vec![Project{id:"work".into(),name:"Projects".into(),closed:false,group_id:Some("work-group".into()),..Default::default()},Project{id:"personal".into(),name:"Reading".into(),closed:false,group_id:Some("personal-group".into()),..Default::default()}],
         tasks:vec![
-            Task{id:"launch".into(),project_id:"work".into(),title:"Preparar lançamento do produto".into(),priority:5,content:"## Um espaço para pensar\n\nOrganize o lançamento com **clareza**, sem sair do terminal. Cada detalhe fica junto da tarefa.\n\n### Antes de publicar\n- [x] Revisar a proposta com o time\n- [ ] Validar a experiência no celular\n- [ ] Escrever as notas de lançamento\n\n> Pequenas entregas. Progresso visível.\n\n### Referências\nLeia o [guia do projeto](https://example.com/guia) e use `cargo test` antes de publicar.\n\n```rust\nfn main() {\n    println!(\"Pronto para lançar\");\n}\n```".into(),items:vec![ChecklistItem{id:"c1".into(),title:"Aprovar identidade visual".into(),status:1,..Default::default()},ChecklistItem{id:"c2".into(),title:"Conferir métricas".into(),..Default::default()}],..Default::default()},
-            Task{id:"design".into(),project_id:"work".into(),parent_id:Some("launch".into()),title:"Revisar interface".into(),content:"### Interface\n- [ ] Conferir contraste\n- [ ] Navegar só com o teclado".into(),..Default::default()},
-            Task{id:"mobile".into(),project_id:"work".into(),parent_id:Some("design".into()),title:"Conferir versão mobile".into(),..Default::default()},
-            Task{id:"small".into(),project_id:"work".into(),parent_id:Some("mobile".into()),title:"Testar em uma tela pequena".into(),..Default::default()},
-            Task{id:"notes".into(),project_id:"work".into(),title:"Escrever notas da próxima versão".into(),content:"## Notas\nConte o que mudou e como isso ajuda quem usa o produto.".into(),priority:1,..Default::default()},
-            Task{id:"read".into(),project_id:"personal".into(),title:"Ler um capítulo".into(),content:"### Leitura da semana\n- [ ] Separar 20 minutos\n- [ ] Fazer anotações".into(),..Default::default()}
+            Task{id:"launch".into(),project_id:"work".into(),title:"Prepare product launch".into(),priority:5,content:"## A space to think\n\nPlan the launch with **clarity**, right from your terminal. Keep every detail with the task.\n\n### Before publishing\n- [x] Review the proposal with the team\n- [ ] Validate the mobile experience\n- [ ] Write the release notes\n\n> Small deliveries. Visible progress.\n\n### References\nRead the [project guide](https://example.com/guide) and run `cargo test` before publishing.\n\n```rust\nfn main() {\n    println!(\"Ready to launch\");\n}\n```".into(),items:vec![ChecklistItem{id:"c1".into(),title:"Approve visual identity".into(),status:1,..Default::default()},ChecklistItem{id:"c2".into(),title:"Check metrics".into(),..Default::default()}],..Default::default()},
+            Task{id:"design".into(),project_id:"work".into(),parent_id:Some("launch".into()),title:"Review interface".into(),content:"### Interface\n- [ ] Check contrast\n- [ ] Navigate with the keyboard only".into(),..Default::default()},
+            Task{id:"mobile".into(),project_id:"work".into(),parent_id:Some("design".into()),title:"Check mobile version".into(),..Default::default()},
+            Task{id:"small".into(),project_id:"work".into(),parent_id:Some("mobile".into()),title:"Test on a small screen".into(),..Default::default()},
+            Task{id:"notes".into(),project_id:"work".into(),title:"Write release notes".into(),content:"## Notes\nExplain what changed and how it helps people using the product.".into(),priority:1,..Default::default()},
+            Task{id:"read".into(),project_id:"personal".into(),title:"Read a chapter".into(),content:"### This week’s reading\n- [ ] Set aside 20 minutes\n- [ ] Take notes".into(),..Default::default()}
         ],
-        groups:vec![crate::api::ProjectGroup{id:"work-group".into(),name:"Trabalho".into(),sort_order:0},crate::api::ProjectGroup{id:"personal-group".into(),name:"Pessoal".into(),sort_order:1}],
+        groups:vec![crate::api::ProjectGroup{id:"work-group".into(),name:"Work".into(),sort_order:0},crate::api::ProjectGroup{id:"personal-group".into(),name:"Personal".into(),sort_order:1}],
         user_name: Some("Alex".into()),
         report_days: vec![chrono::Utc::now().with_timezone(&chrono_tz::America::Recife).date_naive()],
-        completed: ["Revisar proposta com o time", "Publicar correção", "Organizar a semana"].iter().enumerate().map(|(i, title)| Task {
+        completed: ["Review proposal with the team", "Publish fix", "Plan the week"].iter().enumerate().map(|(i, title)| Task {
             id: format!("done-{i}"), project_id: "work".into(), title: (*title).into(), status: 2,
             extra: serde_json::from_value(serde_json::json!({"completedTime": chrono::Utc::now().to_rfc3339()})).unwrap(),
             ..Default::default()
@@ -2381,9 +2802,9 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
             if app.data.report_days.contains(&app.report_day)
                 || app.report_loading.contains_key(&app.report_day)
             {
-                "[ anterior   ] seguinte   t hoje   :report AAAA-MM-DD"
+                "[ previous   ] next   t today   :report YYYY-MM-DD"
             } else {
-                "Registros locais · histórico remoto indisponível · r tentar novamente"
+                "Local records · remote history unavailable · r to retry"
             },
         )
         .style(Style::default().fg(muted))
@@ -2401,20 +2822,20 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
         let (symbol, title, subtitle) = if loading {
             (
                 spinner,
-                "Buscando suas conquistas…",
-                "Consultando o TickTick para este dia",
+                "Loading your accomplishments…",
+                "Loading this day from TickTick",
             )
         } else if remote {
             (
                 "☀",
-                "Um dia sem conclusões registradas",
-                "Seu ritmo também tem espaço para uma pausa.",
+                "No completions recorded today",
+                "Your routine has room for a break, too.",
             )
         } else {
             (
                 "◌",
-                "Histórico indisponível",
-                "Não foi possível consultar este dia no TickTick. Use r para tentar novamente.",
+                "History unavailable",
+                "Could not load this day from TickTick. Press r to retry.",
             )
         };
         let center = centered(sections[1], 76, 7);
@@ -2430,9 +2851,9 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
                     if loading {
                         ""
                     } else if focus.is_some_and(|v| v.error.is_some()) {
-                        "Tempo focado indisponível"
+                        "Focus time unavailable"
                     } else {
-                        "Foco · sem sessões registradas neste dia"
+                        "Focus · no sessions recorded on this day"
                     },
                     Style::default().fg(muted),
                 ),
@@ -2454,7 +2875,7 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
             .unwrap_or(if app.data.inbox_id.as_ref() == Some(&t.project_id) {
                 "Inbox"
             } else {
-                "Lista"
+                "List"
             })
     };
     for task in &tasks {
@@ -2481,8 +2902,8 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
         .spacing(1)
         .split(dashboard[0]);
     for (i, (label, value, color)) in [
-        ("CONCLUSÕES", total, success),
-        ("LISTAS", groups.len(), accent),
+        ("COMPLETIONS", total, success),
+        ("LISTS", groups.len(), accent),
     ]
     .into_iter()
     .enumerate()
@@ -2506,12 +2927,12 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
             );
         }
     }
-    let mut priorities = vec![Span::styled("Prioridades  ", Style::default().fg(muted))];
+    let mut priorities = vec![Span::styled("Priorities  ", Style::default().fg(muted))];
     for (i, (priority, label, color)) in [
-        (5, "alta", preview::color(&theme.danger)),
-        (3, "média", accent),
-        (1, "baixa", success),
-        (0, "sem prioridade", muted),
+        (5, "high", preview::color(&theme.danger)),
+        (3, "medium", accent),
+        (1, "low", success),
+        (0, "no priority", muted),
     ]
     .into_iter()
     .enumerate()
@@ -2538,7 +2959,7 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
     .spacing(if area.width >= 72 { 1 } else { 0 })
     .split(dashboard[2]);
     let selected = app.selected.min(total.saturating_sub(1));
-    let list_block = shell(&format!("✓ Conquistas  {}/{}", selected + 1, total));
+    let list_block = shell(&format!("✓ Accomplishments  {}/{}", selected + 1, total));
     let inner = list_block.inner(columns[0]);
     let project_width = if inner.width >= 50 { 16 } else { 0 };
     let title_width = inner.width.saturating_sub(project_width + 5) as usize;
@@ -2588,7 +3009,7 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
         &mut TableState::default().with_selected((!tasks.is_empty()).then_some(selected)),
     );
     if columns[1].width > 0 {
-        let block = shell("Por lista");
+        let block = shell("By list");
         let inner = block.inner(columns[1]);
         f.render_widget(block, columns[1]);
         let mut groups = groups.into_iter().collect::<Vec<_>>();
@@ -2621,11 +3042,11 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
     let focus_total = focus.map_or(0, |v| v.totals.iter().map(|t| t.seconds).sum());
     let focus_title = if has_focus {
         format!(
-            "Tempo focado por lista · {}",
+            "Focus time by list · {}",
             crate::focus::duration(focus_total)
         )
     } else {
-        "Tempo focado por lista".into()
+        "Focus time by list".into()
     };
     let focus_block = shell(&focus_title);
     let focus_inner = focus_block.inner(dashboard[3]);
@@ -2659,19 +3080,19 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
     } else {
         f.render_widget(
             Paragraph::new(if focus.is_some_and(|d| d.error.is_some()) {
-                "Não foi possível consultar o foco · r tentar novamente"
+                "Could not load focus time · r to retry"
             } else {
-                "Nenhuma sessão de foco registrada neste dia"
+                "No focus sessions recorded on this day"
             })
             .alignment(Alignment::Center)
             .style(Style::default().fg(muted)),
             focus_inner,
         );
     }
-    let detail = shell("Selecionada · l / Enter ver atividade");
+    let detail = shell("Selected · l / Enter to view activity");
     f.render_widget(
         Paragraph::new(tasks.get(selected).map_or(
-            "Nenhuma tarefa concluída · o tempo focado também é progresso",
+            "No completed tasks · focus time counts as progress, too",
             |t| t.title.as_str(),
         ))
         .wrap(Wrap { trim: true })
@@ -2681,7 +3102,276 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App, theme: &config::Theme) {
     );
 }
 
-fn draw(f: &mut Frame, app: &App, c: &Config) {
+fn draw(f: &mut Frame, app: &mut App, c: &Config) {
+    if !app.global_search {
+        draw_main(f, app, c);
+        return;
+    }
+    let foreground = SearchBackground::capture(app);
+    let mode = app.mode.clone();
+    if let Some(background) = app.search_background.clone() {
+        background.restore(app);
+    }
+    app.global_search = false;
+    app.mode = Mode::Normal;
+    draw_main(f, app, c);
+    foreground.restore(app);
+    app.global_search = true;
+    app.mode = mode;
+    draw_search(f, app, c);
+}
+
+fn search_notice(f: &mut Frame, area: Rect, title: &str, detail: &str, color: Color, muted: Color) {
+    let width = area.width.saturating_sub(6).min(72);
+    let height = if detail.is_empty() { 1 } else { 5 };
+    let mut lines = vec![Line::styled(
+        title.to_owned(),
+        Style::default().fg(color).bold(),
+    )];
+    if !detail.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(detail.to_owned(), Style::default().fg(muted)));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        centered(area, width, height),
+    );
+}
+
+fn draw_search(f: &mut Frame, app: &App, c: &Config) {
+    let t = &c.theme;
+    let panel = preview::color(&t.panel);
+    let fg = preview::color(&t.foreground);
+    let muted = preview::color(&t.muted);
+    let accent = preview::color(&t.accent);
+    let selection = preview::color(&t.selection);
+    let border = preview::color(&t.border);
+    let area = centered(
+        f.area(),
+        ((f.area().width as u32 * 9 / 10) as u16).min(140),
+        ((f.area().height as u32 * 17 / 20) as u16).min(36),
+    );
+    f.render_widget(Clear, area);
+    let shell = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Global search ")
+        .title_style(Style::default().fg(accent).bold())
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(panel).fg(fg))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = shell.inner(area);
+    f.render_widget(shell, area);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .spacing(1)
+    .split(inner);
+    let tasks = app.visible();
+    let opening = app.opening_task.is_some();
+    let loading = opening || app.remote_search.as_ref().is_some_and(|s| s.loading);
+    let error = app
+        .open_error
+        .as_deref()
+        .or_else(|| app.remote_search.as_ref().and_then(|s| s.error.as_deref()));
+    let count = if loading || error.is_some() || tasks.is_empty() {
+        String::new()
+    } else if app.remote_search.is_some() {
+        format!("{} results", tasks.len())
+    } else if app.demo {
+        format!("{} demo results", tasks.len())
+    } else {
+        format!("{} local", tasks.len())
+    };
+    let query_shell = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(border));
+    let query_inner = query_shell.inner(rows[0]);
+    f.render_widget(query_shell, rows[0]);
+    let header = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(count.width() as u16),
+    ])
+    .split(Rect::new(
+        query_inner.x,
+        query_inner.y,
+        query_inner.width,
+        query_inner.height.min(1),
+    ));
+    f.render_widget(
+        Paragraph::new("›").style(Style::default().fg(accent).bold()),
+        header[0],
+    );
+    let query = if app.mode == Mode::Search {
+        input_line(f, header[1], &app.input, app.input_cursor)
+    } else {
+        app.query.clone()
+    };
+    f.render_widget(
+        Paragraph::new(query).style(Style::default().fg(fg).bold()),
+        header[1],
+    );
+    f.render_widget(
+        Paragraph::new(count)
+            .style(Style::default().fg(muted))
+            .alignment(Alignment::Right),
+        header[2],
+    );
+
+    if loading {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = frames[(app.last_sync.elapsed().as_millis() / 100) as usize % frames.len()];
+        let title = format!(
+            "{spinner} {}",
+            if opening {
+                "Loading activity…"
+            } else {
+                "Searching TickTick…"
+            }
+        );
+        search_notice(f, rows[1], &title, "", accent, muted);
+    } else if let Some(error) = error {
+        let detail = error.strip_prefix("Search failed: ").unwrap_or(error);
+        let detail = detail.strip_suffix(". Use fs to retry.").unwrap_or(detail);
+        search_notice(
+            f,
+            rows[1],
+            if app.open_error.is_some() {
+                "Could not open activity"
+            } else {
+                "Search failed"
+            },
+            detail,
+            preview::color(&t.danger),
+            muted,
+        );
+    } else if tasks.is_empty() {
+        if app.remote_search.is_none() && !app.demo {
+            search_notice(
+                f,
+                rows[1],
+                "Search your activities",
+                "Find pending and completed tasks on TickTick.",
+                fg,
+                muted,
+            );
+        } else {
+            search_notice(
+                f,
+                rows[1],
+                "No results",
+                "Try a different search.",
+                fg,
+                muted,
+            );
+        }
+    } else {
+        let cols = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .spacing(2)
+            .split(rows[1]);
+        let items = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, task)| {
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", task.marker()),
+                            Style::default().fg(if task.status == 2 {
+                                preview::color(&t.success)
+                            } else {
+                                muted
+                            }),
+                        ),
+                        Span::styled(
+                            task.title.replace(['\n', '\r'], " "),
+                            if i == app.selected {
+                                Style::default().fg(accent).bold()
+                            } else {
+                                Style::default().fg(fg)
+                            },
+                        ),
+                    ]),
+                    Line::styled(
+                        format!("   {}", app.project_name(&task.project_id)),
+                        Style::default().fg(muted),
+                    ),
+                    Line::default(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(app.selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_style(Style::default().bg(selection))
+                .highlight_symbol("▎"),
+            cols[0],
+            &mut state,
+        );
+        let divider = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(border))
+            .padding(Padding::left(2));
+        let preview_inner = divider.inner(cols[1]);
+        f.render_widget(divider, cols[1]);
+        let mut data = app.data.clone();
+        if let Some(search) = &app.remote_search {
+            data.tasks = search.tasks.clone();
+        }
+        let document = app
+            .task()
+            .map(|task| {
+                preview::document(&task, &data, t, preview_inner.width as usize, app.hide_done)
+            })
+            .unwrap_or_default();
+        preview::render(
+            f,
+            preview_inner,
+            &document,
+            app.preview_cursor,
+            app.preview_focus,
+            t,
+        );
+    }
+    let hints: Vec<(&str, &str)> = if app.mode == Mode::Search {
+        vec![("Enter", "Search"), ("Esc", "Cancel")]
+    } else if loading {
+        vec![("q", "Cancel")]
+    } else if app.open_error.is_some() {
+        vec![("o", "Retry"), ("q", "Close")]
+    } else if error.is_some() {
+        vec![("fs", "Retry"), ("q", "Close")]
+    } else if tasks.is_empty() {
+        vec![("fs", "Edit search"), ("q", "Close")]
+    } else {
+        vec![
+            ("↑↓", "Select"),
+            ("o", "Open"),
+            ("Tab", "Details"),
+            ("fs", "Edit search"),
+            ("q", "Close"),
+        ]
+    };
+    let spans = hints
+        .into_iter()
+        .flat_map(|(key, label)| {
+            [
+                Span::styled(
+                    format!(" {key} "),
+                    Style::default().fg(accent).bg(selection).bold(),
+                ),
+                Span::styled(format!(" {label}   "), Style::default().fg(muted)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[2]);
+}
+
+fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     let t = &c.theme;
     let fg = preview::color(&t.foreground);
     let muted = preview::color(&t.muted);
@@ -2721,17 +3411,27 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     let project = current
         .get(app.project)
         .map(|e| e.name.as_str())
-        .unwrap_or("Todas as tarefas");
+        .unwrap_or("All tasks");
+    let project = if app.global_search {
+        "Global search"
+    } else {
+        project
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(project, Style::default().fg(muted)),
             Span::styled(
-                if matches!(app.view(), View::Habits | View::Focus) {
-                    "  /  Hábitos e foco".into()
+                if app.global_search {
+                    format!(
+                        "  /  {} results · pending and completed",
+                        app.visible().len()
+                    )
+                } else if matches!(app.view(), View::Habits | View::Focus) {
+                    "  /  Habits and focus".into()
                 } else if app.view() == View::Report {
-                    "  /  Seu progresso".into()
+                    "  /  Your progress".into()
                 } else {
-                    format!("  /  {} pendentes", app.visible().len())
+                    format!("  /  {} pending", app.visible().len())
                 },
                 Style::default().fg(muted),
             ),
@@ -2748,11 +3448,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 .user_name
                 .as_deref()
                 .or(c.user_name.as_deref())
-                .unwrap_or(if app.demo {
-                    "Pessoa de exemplo"
-                } else {
-                    "Minha conta"
-                }),
+                .unwrap_or(if app.demo { "Demo user" } else { "My account" }),
             Style::default().fg(if app.busy {
                 accent
             } else {
@@ -2871,11 +3567,11 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                         Style::default()
                     }),
                 ];
-                // The "LISTAS" header lives in item 3, so highlight only the first line by hand.
+                // The "LISTS" header lives in item 3, so highlight only the first line by hand.
                 if i == 5 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
-                        "  LISTAS",
+                        "  LISTS",
                         Style::default().fg(muted).bold(),
                     )));
                     lines.push(Line::default());
@@ -2886,7 +3582,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         let mut state = ListState::default().with_selected(Some(app.project));
         f.render_stateful_widget(
             List::new(projects).block(
-                block(" 1 · Listas ".into(), app.projects_focus).padding(Padding::vertical(1)),
+                block(" 1 · Lists ".into(), app.projects_focus).padding(Padding::vertical(1)),
             ),
             cols[0],
             &mut state,
@@ -2922,9 +3618,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                 };
                 let mut badges = Vec::new();
                 match task.priority {
-                    5 => badges.push(pill("● alta".into(), danger)),
-                    3 => badges.push(pill("● média".into(), accent)),
-                    1 => badges.push(pill("● baixa".into(), muted)),
+                    5 => badges.push(pill("● high".into(), danger)),
+                    3 => badges.push(pill("● medium".into(), accent)),
+                    1 => badges.push(pill("● low".into(), muted)),
                     _ => (),
                 }
                 if !task.content.is_empty() {
@@ -3005,14 +3701,20 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         } else {
             Some(app.selected)
         });
-        let title = if matches!(app.view(), View::Habits | View::Focus) {
+        let title = if app.global_search {
+            format!(
+                " 2 · Global search fs: {} · {} · q close ",
+                app.query,
+                tree.len()
+            )
+        } else if matches!(app.view(), View::Habits | View::Focus) {
             format!(" {} ", project)
         } else if app.view() == View::Report {
-            " ★ · Relatório do dia ".into()
+            " ★ · Daily report ".into()
         } else if app.query.is_empty() {
-            format!(" 2 · Tarefas  {} ", tree.len())
+            format!(" 2 · {project}  {} ", tree.len())
         } else {
-            format!(" 2 · Busca /{} ", app.query)
+            format!(" 2 · Search /{} ", app.query)
         };
         let taskblock = block(title, !app.projects_focus && !app.preview_focus)
             .padding(Padding::new(1, 1, 1, 0));
@@ -3040,10 +3742,12 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             draw_report(f, inner, app, t);
         } else if tree.is_empty() {
             f.render_widget(
-                Paragraph::new(if app.busy {
-                    "Buscando suas tarefas…"
+                Paragraph::new(if app.global_search {
+                    "No matching tasks.\n\nSearch includes pending and completed tasks from loaded history."
+                } else if app.busy {
+                    "Loading your tasks…"
                 } else {
-                    "Tudo em dia.\n\nSelecione uma lista e pressione a\npara adicionar uma tarefa."
+                    "All caught up.\n\nSelect a list and press a\nto add a task."
                 })
                 .style(Style::default().fg(muted))
                 .wrap(Wrap { trim: false })
@@ -3056,12 +3760,12 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         let document = app.preview(t);
         let preview_block = block(
             if app.view() == View::Report {
-                " Atividade concluída · h / Esc voltar ".into()
+                " Completed activity · h / Esc to return ".into()
             } else {
                 format!(
                     " 3 · Preview{} ",
                     if app.preview_focus {
-                        " · j/k navegar"
+                        " · j/k navigate"
                     } else {
                         ""
                     }
@@ -3074,8 +3778,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         f.render_widget(preview_block, preview);
         if document.is_empty() {
             f.render_widget(
-                Paragraph::new("Selecione uma tarefa para visualizar.")
-                    .style(Style::default().fg(muted)),
+                Paragraph::new("Select a task to preview.").style(Style::default().fg(muted)),
                 inner,
             );
         } else {
@@ -3091,7 +3794,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     }
     f.render_widget(
         Paragraph::new(if app.busy {
-            " ◌ Sincronizando com TickTick…".to_owned()
+            " ◌ Syncing with TickTick…".to_owned()
         } else {
             format!(" {}", app.message)
         })
@@ -3105,9 +3808,9 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             format!(" {}{text}", if app.mode == Mode::Search { "/" } else { ":" })
         }
         Mode::Add | Mode::Subtask | Mode::Rename | Mode::ItemRename => {
-            " INSERIR  Enter salvar · Esc cancelar".into()
+            " INSERT  Enter save · Esc cancel".into()
         }
-        Mode::Item => " CHECKLIST  Enter adiciona e continua · colar várias linhas · Esc sai".into(),
+        Mode::Item => " CHECKLIST  Enter add and continue · paste multiple lines · Esc close".into(),
         Mode::Move => {
             let names = app
                 .lists(&app.input)
@@ -3118,41 +3821,42 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             let area = Rect::new(rows[3].x + 14, rows[3].y, rows[3].width.saturating_sub(14), rows[3].height);
             let text = input_line(f, area, &app.input, app.input_cursor);
             format!(
-                " MOVER  Lista: {}   → {}",
+                " MOVE  List: {}   → {}",
                 text,
                 if names.is_empty() {
-                    "nenhuma lista".into()
+                    "no lists".into()
                 } else {
                     names.join(" · ")
                 }
             )
         }
-        Mode::Visual => " VISUAL  j/k estender · J/K mover · v/Esc sair".into(),
+        Mode::Visual => " VISUAL  j/k extend · J/K move · v/Esc exit".into(),
+        Mode::GoList => " LISTS  Type to filter · ↑/↓ select · Enter open · Esc cancel".into(),
         Mode::FocusTask => format!(
-            " ATIVIDADE  Buscar: {}   ↑/↓ escolher · Enter iniciar com ela · Esc cancelar",
+            " ACTIVITY  Search: {}   ↑/↓ select · Enter use activity · Esc cancel",
             app.input.clone()
         ),
         Mode::FocusConfig => {
-            " POMODORO  foco pausa pausa-longa (min) · Enter salvar · Esc cancelar".into()
+            " POMODORO  focus break long-break (min) · Enter save · Esc cancel".into()
         }
         Mode::Due => {
-            " PRAZO  hjkl dia · H/L mês · Space marcar · 0-9 hora · r lembrete · x sem prazo · Enter salvar · Esc cancelar".into()
+            " DUE  hjkl day · H/L month · Space select · 0-9 time · r reminder · x clear date · Enter save · Esc cancel".into()
         }
         Mode::Remind => {
-            " LEMBRETES  j/k escolher · Space marcar · Enter salvar · Esc cancelar".into()
+            " REMINDERS  j/k select · Space toggle · Enter save · Esc cancel".into()
         }
         Mode::Delete => {
-            " EXCLUIR  Confirmar exclusão permanente? y / qualquer tecla cancela".into()
+            " DELETE  Permanently delete? y / any other key cancels".into()
         }
         _ => {
             if matches!(app.view(), View::Focus) {
-                " FOCO  Space iniciar/pausar · t atividade · c tempos · n próxima fase · s encerrar/salvar · p/w modo · h listas".into()
+                " FOCUS  Space start/pause · t activity · c durations · n next phase · s stop/save · p/w mode · h lists".into()
             } else if app.view() == View::Habits {
-                " HÁBITOS  j/k rolar · Space concluir/desmarcar · h listas · r sincronizar · ? ajuda".into()
+                " HABITS  j/k scroll · Space complete/reset · h lists · r sync · ? help".into()
             } else if app.preview_focus {
-                " PREVIEW  x marcar · o/O novo item · J/K mover · cc renomear · dd apagar · u desfazer · gs subtarefa · zh ocultar feitos · h voltar".into()
+                " PREVIEW  x toggle · o/O new item · J/K move · cc rename · dd delete · u undo · gs subtask · zh hide completed · h back".into()
             } else {
-                " NORMAL  h/j/k/l navegar · a nova · J/K mover · H/L nível · m lista · D prazo · R lembrete · za recolher · ? ajuda".into()
+                " NORMAL  h/j/k/l navigate · a new · J/K move · H/L level · m list · D due · R reminder · za fold · ? help".into()
             }
         }
     };
@@ -3182,13 +3886,10 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .collect::<Vec<_>>();
         lines.push(Line::default());
         lines.push(Line::from(vec![
-            Span::styled(" Selecionados: ", Style::default().fg(muted)),
+            Span::styled(" Selected: ", Style::default().fg(muted)),
             Span::raw(app.input.clone()),
         ]));
-        lines.push(Line::styled(
-            " ou digite: 2h, 3d",
-            Style::default().fg(muted),
-        ));
+        lines.push(Line::styled(" or type: 2h, 3d", Style::default().fg(muted)));
         let area = centered(f.area(), 44, lines.len() as u16 + 4);
         let input_area = Rect::new(
             area.x + 17,
@@ -3206,31 +3907,31 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         f.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().bg(panel).fg(fg))
-                .block(block(" Lembretes ".into(), true).padding(Padding::new(1, 1, 1, 0))),
+                .block(block(" Reminders ".into(), true).padding(Padding::new(1, 1, 1, 0))),
             area,
         );
     }
     if app.mode == Mode::Due {
         use chrono::Datelike;
         const MONTHS: [&str; 12] = [
-            "janeiro",
-            "fevereiro",
-            "março",
-            "abril",
-            "maio",
-            "junho",
-            "julho",
-            "agosto",
-            "setembro",
-            "outubro",
-            "novembro",
-            "dezembro",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
         ];
         let today = sidebar::today(&app.data);
         let first = app.cal.with_day(1).unwrap();
         let start = first - chrono::Duration::days(first.weekday().num_days_from_monday() as i64);
         let mut lines = vec![Line::styled(
-            "  S   T   Q   Q   S   S   D",
+            "  M   T   W   T   F   S   S",
             Style::default().fg(muted),
         )];
         for week in 0..6 {
@@ -3258,22 +3959,22 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         lines.push(Line::default());
         let time = due_time(&app.input);
         lines.push(Line::from(vec![
-            Span::styled(" Hora: ", Style::default().fg(muted)),
+            Span::styled(" Time: ", Style::default().fg(muted)),
             Span::raw(if time.is_empty() {
-                "dia todo".into()
+                "all day".into()
             } else {
                 time
             }),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(" Lembrete: ", Style::default().fg(muted)),
+            Span::styled(" Reminder: ", Style::default().fg(muted)),
             Span::raw(match app.pick {
-                0 => "Sem lembrete",
+                0 => "No reminder",
                 i => REMIND[i - 1].0,
             }),
         ]));
         let title = format!(
-            " Prazo · {} {} ",
+            " Due · {} {} ",
             MONTHS[app.cal.month0() as usize],
             app.cal.year()
         );
@@ -3283,6 +3984,52 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             Paragraph::new(lines)
                 .style(Style::default().bg(panel).fg(fg))
                 .block(block(title, true).padding(Padding::new(1, 1, 1, 0))),
+            area,
+        );
+    }
+    if app.mode == Mode::GoList {
+        let choices = app.destinations(&app.input);
+        let first = app.pick.saturating_sub(9);
+        let mut lines = choices
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(10)
+            .map(|(i, (_, name))| {
+                Line::styled(
+                    format!(" {name}"),
+                    if i == app.pick {
+                        Style::default().bg(selection).fg(accent)
+                    } else {
+                        Style::default().fg(fg)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(Line::styled(
+                " No matching view or list",
+                Style::default().fg(muted),
+            ));
+        }
+        lines.push(Line::default());
+        lines.push(Line::raw(" Search: "));
+        let area = centered(f.area(), 60, lines.len() as u16 + 3);
+        let input_area = Rect::new(
+            area.x + 10,
+            area.y + area.height.saturating_sub(2),
+            area.width.saturating_sub(12),
+            1,
+        );
+        let text = input_line(f, input_area, &app.input, app.input_cursor);
+        *lines.last_mut().unwrap() = Line::raw(format!(" Search: {text}"));
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(panel).fg(fg))
+                .block(
+                    block(" Go to view or list ".into(), true).padding(Padding::new(1, 1, 1, 0)),
+                ),
             area,
         );
     }
@@ -3313,7 +4060,7 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
                             .map(|x| app.project_name(&x.project_id))
                             .unwrap_or_default(),
                     ),
-                    None => ("○ Foco livre (sem tarefa)".into(), String::new()),
+                    None => ("○ Free focus (no task)".into(), String::new()),
                 };
                 Line::from(vec![
                     Span::styled(format!(" {title} "), style),
@@ -3323,13 +4070,13 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
             .collect::<Vec<_>>();
         if lines.is_empty() {
             lines.push(Line::styled(
-                " Nenhuma tarefa encontrada",
+                " No matching tasks",
                 Style::default().fg(muted),
             ));
         }
         lines.push(Line::default());
         lines.push(Line::from(vec![
-            Span::styled(" Buscar: ", Style::default().fg(muted)),
+            Span::styled(" Search: ", Style::default().fg(muted)),
             Span::raw(app.input.clone()),
         ]));
         let area = centered(f.area(), width, lines.len() as u16 + 3);
@@ -3349,17 +4096,17 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
         f.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().bg(panel).fg(fg))
-                .block(block(" Atividade do foco ".into(), true).padding(Padding::new(1, 1, 1, 0))),
+                .block(block(" Focus activity ".into(), true).padding(Padding::new(1, 1, 1, 0))),
             area,
         );
     }
     let title = match app.mode {
-        Mode::Add => Some(" Nova tarefa "),
-        Mode::Subtask => Some(" Subtarefa "),
-        Mode::Item => Some(" Novo item "),
+        Mode::Add => Some(" New task "),
+        Mode::Subtask => Some(" Subtask "),
+        Mode::Item => Some(" New item "),
         Mode::ItemRename => Some(" Item "),
-        Mode::Rename => Some(" Título "),
-        Mode::FocusConfig => Some(" Foco · pausa · pausa longa (minutos) "),
+        Mode::Rename => Some(" Title "),
+        Mode::FocusConfig => Some(" Focus · break · long break (minutes) "),
         _ => None,
     };
     if let Some(title) = title {
@@ -3394,18 +4141,18 @@ fn draw(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVEGAÇÃO\nh / l, Tab     Listas → tarefas → preview\n1 / 2 / 3      Focar listas / tarefas / preview\nj / k, 5j      Navegar com contagem       gg / G    Início / fim\nCtrl-d / u     Descer / subir 10 linhas   Enter     Focar preview\nzp             Mostrar / ocultar preview  Esc / h   Voltar às tarefas\nf              Zoom no preview            < / >     Redimensionar colunas\nb              Ocultar / mostrar listas\n\nTAREFAS\na / i / o      Nova tarefa na lista       A         Nova subtarefa\nza / zo / zc   Alternar / abrir / recolher árvore\ncc             Renomear                   e         Editar no Vim/$EDITOR\nv + j/k        Selecionar (v/Esc sai)     J / K     Mover tarefa/seleção ↓ / ↑\nH / L          Subir nível / virar subtarefa da de cima\nm              Mover para outra lista     D / R     Prazo / lembretes\nx / Space      Concluir / reabrir tarefa            dd        Excluir (confirmar y)\nzh             Mostrar / ocultar tarefas concluídas\np              Alternar prioridade        /         Buscar com ancestrais\n\nPREVIEW\nj / k, ] / [   Próximo / anterior checkbox ou subtarefa (sem mais: rola)\nCtrl-d / u     Rolar o texto 10 linhas\nSpace / x      Marcar checkbox, checklist ou concluir subtarefa\nEnter          Marcar checkbox / abrir subtarefa (l também abre)\na / o / O      Novo item: fim / abaixo / acima (colar linhas cria vários)\nJ / K          Mover item ↓ / ↑           u         Desfazer última edição\ncc / dd        Renomear / apagar item, checkbox ou subtarefa\ngs             Item ↔ subtarefa           gx        Abrir link\nzh             Ocultar / mostrar itens concluídos\n\nRELATÓRIO\n[ / ]          Dia anterior / seguinte    t         Hoje\n:report AAAA-MM-DD  Escolher uma data\n\nHÁBITOS E FOCO\nSpace / x      Concluir / desmarcar hábito\np / w          Pomodoro / Stopwatch (na tela Foco)\nSpace / Enter  Iniciar / pausar timer local\nt              Escolher atividade         c         Tempos de foco / pausas\nn              Próxima fase do Pomodoro   s         Encerrar e salvar sessão\n:focus-retry   Reenviar foco pendente após conferir histórico\n\nCOMANDOS\n:token         Configurar API token       :subtask  Nova subtarefa\n:theme dark    Tema escuro                :theme light  Tema claro\n:sync / :w     Sincronizar                :config   Caminho da configuração\n:noh           Limpar busca               :q / q    Sair\n\nQualquer tecla fecha a ajuda.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Atalhos ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVIGATION\nh / l, Tab     Lists → tasks → preview\n1 / 2 / 3      Focus lists / tasks / preview\nj / k, 5j      Navigate with counts       gg / G    First / last\nCtrl-d / u     Scroll down / up 10 lines  Enter     Focus preview\nzp             Show / hide preview        Esc / h   Back to tasks\nF              Zoom preview               < / >     Resize columns\nb              Show / hide lists\n\nTASKS\na / o          New task                   A         New subtask\nza / zo / zc   Toggle / expand / collapse tree\ncc             Rename                     i         Edit in Vim/$EDITOR\nv + j/k        Select (v/Esc exits)       J / K     Move task/selection ↓ / ↑\nH / L          Outdent / nest under previous task\nm              Move to another list       D / R     Due date / reminders\nx / Space      Complete / reopen task     dd        Delete (confirm with y)\nzh             Show / hide completed tasks\np              Cycle priority             /         Search this list\nfs             Global search (Enter applies; o opens result; q closes)\nee             Go to view or list (filter in dialog)\n\nPREVIEW\nj / k, ] / [   Next / previous checkbox or subtask; otherwise scroll\nCtrl-d / u     Scroll text 10 lines\nSpace / x      Toggle checkbox/checklist item or complete subtask\nEnter          Toggle checkbox / open subtask (l also opens)\na / o / O      New item: end / below / above; paste multiple lines\nJ / K          Move item ↓ / ↑            u         Undo last edit\ncc / dd        Rename / delete item, checkbox or subtask\ngs             Item ↔ subtask             gx        Open link\nzh             Show / hide completed items\n\nREPORT\n[ / ]          Previous / next day        t         Today\n:report YYYY-MM-DD  Choose a date\n\nHABITS AND FOCUS\nSpace / x      Complete / reset habit\np / w          Pomodoro / Stopwatch (in Focus)\nSpace / Enter  Start / pause local timer\nt              Choose activity            c         Focus / break durations\nn              Next Pomodoro phase        s         Stop and save session\n:focus-retry   Retry pending upload after checking history\n\nCOMMANDS\n:token         Configure API token        :subtask  New subtask\n:theme dark    Dark theme                 :theme light  Light theme\n:sync / :w     Sync                       :config   Configuration path\n:noh           Clear search               :q / q    Quit\n\nPress any key to close help.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Shortcuts ".into(),true).padding(Padding::horizontal(2))),area);
     }
     if app.quitting {
         let area = centered(f.area(), 44, 5);
         f.render_widget(Clear, area);
         f.render_widget(
             Paragraph::new(
-                "Sincronizando… sai ao terminar.
-Ctrl-C força a saída.",
+                "Syncing… exiting when finished.
+Ctrl-C forces quit.",
             )
             .style(Style::default().bg(panel).fg(fg))
-            .block(block(" Sincronizando ".into(), true).padding(Padding::horizontal(1))),
+            .block(block(" Syncing ".into(), true).padding(Padding::horizontal(1))),
             area,
         );
     }
@@ -3419,12 +4166,12 @@ fn due_time(digits: &str) -> String {
     }
 }
 const REMIND: [(&str, &str); 6] = [
-    ("No horário", "0"),
-    ("5 min antes", "5m"),
-    ("15 min antes", "15m"),
-    ("30 min antes", "30m"),
-    ("1 hora antes", "1h"),
-    ("1 dia antes", "1d"),
+    ("At due time", "0"),
+    ("5 min before", "5m"),
+    ("15 min before", "15m"),
+    ("30 min before", "30m"),
+    ("1 hour before", "1h"),
+    ("1 day before", "1d"),
 ];
 fn truncate(text: &str, width: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -3487,12 +4234,12 @@ mod tests {
                 a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
                 let today = sidebar::today(&a.data);
                 a.mode = Mode::Add;
-                a.input = "Nova tarefa".into();
+                a.input = "New task".into();
                 a.submit();
                 let Job::Create(task) = rx.try_recv().unwrap() else {
                     panic!("expected task creation");
                 };
-                assert_eq!(task.title, "Nova tarefa");
+                assert_eq!(task.title, "New task");
                 assert!(task.parent_id.is_none());
                 let expected_project = if matches!(view, View::Project(_)) {
                     "p"
@@ -3628,12 +4375,20 @@ mod tests {
             item: None,
             hide_done: false,
             show_completed: false,
+            revealed_completed: None,
             undo: Vec::new(),
             theme_request: None,
             mode: Mode::Normal,
             input: String::new(),
             input_cursor: 0,
             search_original: String::new(),
+            global_search: false,
+            search_background: None,
+            search_request_id: 0,
+            remote_search: None,
+            opening_task: None,
+            open_error: None,
+            search_was_global: false,
             target: None,
             query: String::new(),
             message: String::new(),
@@ -3667,12 +4422,12 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(100, 30);
         Terminal::new(backend)
             .unwrap()
-            .draw(|f| draw(f, &a, &Config::default()))
+            .draw(|f| draw(f, &mut a, &Config::default()))
             .unwrap();
         {
             let backend = ratatui::backend::TestBackend::new(100, 30);
             let mut t = Terminal::new(backend).unwrap();
-            t.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            t.draw(|f| draw(f, &mut a, &Config::default())).unwrap();
             let buf = t.backend().buffer().clone();
             for y in 5..25 {
                 let line: String = (30..75).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -3686,7 +4441,7 @@ mod tests {
             a.tz(),
             tomorrow - chrono::Duration::days(1),
         );
-        assert_eq!(label, Some(("amanhã 14:30".into(), false)));
+        assert_eq!(label, Some(("tomorrow 14:30".into(), false)));
         assert_eq!(
             a.data.tasks[0].extra["reminders"],
             serde_json::json!(["TRIGGER:-PT5M"])
@@ -3719,7 +4474,9 @@ mod tests {
             for size in [(30, 10), (100, 30)] {
                 let backend = ratatui::backend::TestBackend::new(size.0, size.1);
                 let mut terminal = Terminal::new(backend).unwrap();
-                terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+                terminal
+                    .draw(|f| draw(f, &mut a, &Config::default()))
+                    .unwrap();
             }
         }
     }
@@ -3759,7 +4516,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(100, 30);
         Terminal::new(backend)
             .unwrap()
-            .draw(|f| draw(f, &a, &Config::default()))
+            .draw(|f| draw(f, &mut a, &Config::default()))
             .unwrap();
         a.key(KeyEvent::from(K::Enter));
         assert_eq!(a.timer.task().map(|t| t.title.clone()), Some(title));
@@ -3879,6 +4636,701 @@ mod tests {
         assert!(a.input.is_empty());
         assert_eq!(a.data.tasks.len(), 20);
     }
+    #[test]
+    fn global_search_includes_both_statuses_from_every_screen() {
+        for view in [
+            View::Today,
+            View::Report,
+            View::Habits,
+            View::Focus,
+            View::Project("p".into()),
+        ] {
+            for pane in 0..=2 {
+                let mut a = app();
+                a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
+                let original_project = a.project;
+                a.data.tasks.push(Task {
+                    id: "remote".into(),
+                    project_id: "other".into(),
+                    title: "Needle pending".into(),
+                    ..Default::default()
+                });
+                a.data.completed.push(Task {
+                    id: "done".into(),
+                    project_id: "other".into(),
+                    title: "Needle finished".into(),
+                    status: 2,
+                    ..Default::default()
+                });
+                a.focus(pane);
+                press(&mut a, 'f');
+                press(&mut a, 's');
+                for c in "NEEDLE".chars() {
+                    press(&mut a, c);
+                }
+                assert_eq!(a.visible().len(), 2);
+                a.key(KeyEvent::from(K::Enter));
+                assert_eq!(a.view(), View::All);
+                assert!(!a.projects_focus && !a.preview_focus);
+                assert_eq!(
+                    a.visible().iter().map(|t| t.status).collect::<Vec<_>>(),
+                    vec![0, 2]
+                );
+                press(&mut a, 'Q');
+                assert!(!a.global_search);
+                assert_eq!(a.project, original_project);
+                assert_eq!(a.view(), view);
+            }
+        }
+    }
+
+    #[test]
+    fn global_search_escape_exits_after_reopening_and_sync_preserves_origin() {
+        let mut a = app();
+        let origin = a.project;
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        press(&mut a, '3');
+        a.key(KeyEvent::from(K::Enter));
+        let data = a.data.clone();
+        a.replace_snapshot(data);
+        assert_eq!(a.project, origin);
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        press(&mut a, 'X');
+        a.key(KeyEvent::from(K::Esc));
+        assert!(!a.global_search);
+        assert!(a.query.is_empty());
+        assert_eq!(a.project, origin);
+        assert_eq!(a.visible().len(), 20);
+    }
+
+    #[test]
+    fn list_picker_filters_navigates_and_opens_collapsed_groups() {
+        let mut a = app();
+        a.data.projects.push(Project {
+            id: "q".into(),
+            name: "Work personal".into(),
+            group_id: Some("g".into()),
+            ..Default::default()
+        });
+        a.data.groups =
+            serde_json::from_value(serde_json::json!([{"id":"g", "name":"Group"}])).unwrap();
+        a.collapsed.insert("group:g".into());
+        for view in [View::Report, View::Habits, View::Focus] {
+            a.project = a.sidebar().iter().position(|e| e.view == view).unwrap();
+            press(&mut a, 'e');
+            press(&mut a, 'e');
+            assert!(a.mode == Mode::GoList);
+            a.key(KeyEvent::from(K::Esc));
+            assert_eq!(a.view(), view);
+        }
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.key(KeyEvent::from(K::Enter));
+        press(&mut a, 'e');
+        press(&mut a, 'e');
+        for c in "WORK".chars() {
+            press(&mut a, c);
+        }
+        assert_eq!(a.lists(&a.input).len(), 2);
+        a.key(KeyEvent::from(K::Down));
+        assert_eq!(a.pick, 1);
+        let destination = a
+            .destinations(&a.input)
+            .iter()
+            .position(|(view, _)| *view == View::Project("q".into()))
+            .unwrap();
+        while a.pick != destination {
+            a.key(KeyEvent::from(K::Down));
+        }
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.view(), View::Project("q".into()));
+        assert!(!a.collapsed.contains("group:g"));
+        assert!(!a.global_search && a.query.is_empty());
+        assert!(!a.projects_focus && !a.preview_focus);
+        press(&mut a, 'e');
+        press(&mut a, 'e');
+        for c in "missing".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        assert!(a.mode == Mode::GoList);
+        assert_eq!(a.view(), View::Project("q".into()));
+    }
+
+    #[test]
+    fn destination_picker_opens_all_smart_views() {
+        for (query, view) in [
+            ("today", View::Today),
+            ("inbox", View::Inbox),
+            ("tomorrow", View::Tomorrow),
+            ("report", View::Report),
+            ("habits", View::Habits),
+            ("focus", View::Focus),
+            ("all", View::All),
+        ] {
+            let mut a = app();
+            press(&mut a, 'e');
+            press(&mut a, 'e');
+            for c in query.chars() {
+                press(&mut a, c);
+            }
+            assert_eq!(a.destinations(&a.input).len(), 1);
+            a.key(KeyEvent::from(K::Enter));
+            assert_eq!(a.view(), view);
+            assert!(a.mode == Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn opening_completed_result_does_not_enable_completed_tasks_in_other_lists() {
+        let mut a = app();
+        a.data.projects.push(Project {
+            id: "q".into(),
+            name: "Other list".into(),
+            ..Default::default()
+        });
+        let old = Task {
+            id: "old".into(),
+            project_id: "p".into(),
+            title: "Old task".into(),
+            status: 2,
+            ..Default::default()
+        };
+        a.data.completed = vec![
+            old.clone(),
+            Task {
+                id: "hidden".into(),
+                project_id: "p".into(),
+                title: "Hidden completion".into(),
+                status: 2,
+                ..Default::default()
+            },
+            Task {
+                id: "other".into(),
+                project_id: "q".into(),
+                title: "Other completion".into(),
+                status: 2,
+                ..Default::default()
+            },
+        ];
+        a.confirmed = a.data.clone();
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.query = "Old".into();
+        a.mode = Mode::Normal;
+        a.remote_search = Some(RemoteSearch {
+            id: 1,
+            query: a.query.clone(),
+            loading: false,
+            tasks: vec![old],
+            error: None,
+        });
+        press(&mut a, 'o');
+        assert!(!a.show_completed);
+        assert_eq!(
+            a.visible()
+                .iter()
+                .filter(|t| t.status == 2)
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        // Opening and canceling another search keeps the selected activity visible.
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.key(KeyEvent::from(K::Esc));
+        assert_eq!(a.task().unwrap().id, "old");
+        press(&mut a, 'e');
+        press(&mut a, 'e');
+        for c in "Other list".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.view(), View::Project("q".into()));
+        assert!(!a.show_completed && a.revealed_completed.is_none());
+        assert!(a.visible().is_empty());
+        a.open_list("p");
+        assert!(a.visible().iter().all(|t| t.status == 0));
+        press(&mut a, 'z');
+        press(&mut a, 'h');
+        assert_eq!(a.visible().iter().filter(|t| t.status == 2).count(), 2);
+    }
+
+    #[test]
+    fn opening_search_hit_fetches_full_body_and_canceled_load_never_changes_the_view() {
+        let mut a = app();
+        a.demo = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        let origin = a.project;
+        let summary = Task {
+            id: "remote".into(),
+            project_id: "p".into(),
+            title: "Remote activity".into(),
+            ..Default::default()
+        };
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.query = "Remote".into();
+        a.mode = Mode::Normal;
+        a.remote_search = Some(RemoteSearch {
+            id: 1,
+            query: a.query.clone(),
+            loading: false,
+            tasks: vec![summary.clone()],
+            error: None,
+        });
+        press(&mut a, 'o');
+        let Job::LoadTask { request: first, .. } = rx.recv().unwrap() else {
+            panic!("expected detail request");
+        };
+        press(&mut a, 'q');
+        let mut full = summary.clone();
+        full.content = "Full body fetched from TickTick".into();
+        a.finish_open_task(first, Ok(full.clone()));
+        assert!(!a.global_search && a.project == origin);
+        assert!(!a.data.tasks.iter().any(|t| t.id == "remote"));
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.query = "Remote".into();
+        a.mode = Mode::Normal;
+        a.remote_search = Some(RemoteSearch {
+            id: 2,
+            query: a.query.clone(),
+            loading: false,
+            tasks: vec![summary],
+            error: None,
+        });
+        press(&mut a, 'o');
+        let Job::LoadTask {
+            request: second, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected detail request");
+        };
+        a.finish_open_task(first, Ok(full.clone()));
+        assert!(a.global_search);
+        a.finish_open_task(second, Err("TickTick HTTP 503".into()));
+        assert!(a.global_search && a.open_error.is_some());
+        press(&mut a, 'o');
+        let Job::LoadTask { request: third, .. } = rx.recv().unwrap() else {
+            panic!("expected detail request");
+        };
+        a.finish_open_task(third, Ok(full));
+        assert!(!a.global_search);
+        assert_eq!(
+            editor_body(&a.task().unwrap()),
+            "Full body fetched from TickTick"
+        );
+    }
+
+    #[test]
+    fn checklist_editor_uses_description_and_saves_back_to_the_same_field() {
+        let mut a = app();
+        a.demo = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        a.data.tasks[0].desc = Some("Existing checklist description".into());
+        a.data.tasks[0].content.clear();
+        a.data.tasks[0]
+            .extra
+            .insert("kind".into(), serde_json::Value::from("CHECKLIST"));
+        a.confirmed = a.data.clone();
+        a.selected = 0;
+        let mut task = a.task().unwrap();
+        assert_eq!(editor_body(&task), "Existing checklist description");
+        apply_editor_change(
+            &mut task,
+            "Edited checklist".into(),
+            "Updated description".into(),
+        );
+        a.update(task);
+        let Job::Patch { fields, .. } = rx.recv().unwrap() else {
+            panic!("expected patch");
+        };
+        assert_eq!(fields["desc"], "Updated description");
+        assert!(!fields.contains_key("content"));
+        assert_eq!(
+            a.task().unwrap().desc.as_deref(),
+            Some("Updated description")
+        );
+    }
+
+    #[test]
+    fn search_feedback_is_single_centered_state_with_no_empty_details_panel() {
+        let mut a = app();
+        a.demo = false;
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.mode = Mode::Normal;
+        a.query = "Flights".into();
+        a.remote_search = Some(RemoteSearch {
+            id: 1,
+            query: a.query.clone(),
+            loading: true,
+            tasks: vec![],
+            error: None,
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        for loading in [true, false] {
+            a.remote_search.as_mut().unwrap().loading = loading;
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert_eq!(
+                text.matches("Searching TickTick").count(),
+                if loading { 1 } else { 0 }
+            );
+            assert_eq!(
+                text.matches("No results").count(),
+                if loading { 0 } else { 1 }
+            );
+            assert!(!text.contains("Details"));
+            if loading {
+                let buffer = terminal.backend().buffer();
+                let row = (0..32)
+                    .find(|y| {
+                        buffer.content[y * 120..(y + 1) * 120]
+                            .iter()
+                            .map(|c| c.symbol())
+                            .collect::<String>()
+                            .contains("Searching TickTick")
+                    })
+                    .unwrap();
+                assert!(row > 10 && row < 22);
+            }
+        }
+    }
+
+    #[test]
+    fn opening_remote_completed_result_reveals_it_and_allows_edits_and_reopening() {
+        let mut a = app();
+        a.demo = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        a.data.projects[0].group_id = Some("g".into());
+        a.data.groups =
+            serde_json::from_value(serde_json::json!([{"id":"g","name":"Group"}])).unwrap();
+        a.confirmed = a.data.clone();
+        a.collapsed.extend(["group:g".into(), "0".into()]);
+        a.project = 3; // Search from the report, where tasks normally cannot be edited.
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        for c in "archive".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        let Job::Search { id, .. } = rx.recv().unwrap() else {
+            panic!("expected search");
+        };
+        let task = Task {
+            id: "old".into(),
+            project_id: "p".into(),
+            parent_id: Some("0".into()),
+            title: "An old completed activity".into(),
+            content: "archive".into(),
+            status: 2,
+            extra: serde_json::from_value(
+                serde_json::json!({"completedTime":"2019-01-01T00:00:00Z"}),
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        a.finish_search(id, Ok(vec![task.clone()]));
+        press(&mut a, 'o');
+        let Job::LoadTask {
+            request,
+            project,
+            id,
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected full task load");
+        };
+        assert_eq!(project, "p");
+        assert_eq!(id, "old");
+        assert!(a.global_search);
+        a.finish_open_task(request, Ok(task));
+        assert!(!a.global_search);
+        assert_eq!(a.view(), View::Project("p".into()));
+        assert!(!a.projects_focus && !a.preview_focus);
+        assert!(!a.show_completed);
+        assert_eq!(a.revealed_completed.as_deref(), Some("old"));
+        assert!(!a.collapsed.contains("group:g") && !a.collapsed.contains("0"));
+        assert_eq!(a.task().unwrap().id, "old");
+        assert_eq!(a.task().unwrap().status, 2);
+        assert!(rx.try_recv().is_err()); // Opening does not change the remote task.
+        press(&mut a, 'c');
+        press(&mut a, 'c');
+        a.input = "Edited completed activity".into();
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.task().unwrap().title, "Edited completed activity");
+        assert_eq!(a.task().unwrap().status, 2);
+        let patch = rx.recv().unwrap();
+        assert!(
+            matches!(&patch, Job::Patch { fields, .. } if fields.get("title").unwrap() == "Edited completed activity")
+        );
+        sync::apply(&mut a.confirmed, &patch);
+        a.pending_jobs.pop_front();
+        a.replay();
+        press(&mut a, 'x');
+        let Job::Reopen(task) = rx.recv().unwrap() else {
+            panic!("expected reopen");
+        };
+        assert_eq!(task.id, "old");
+        assert_eq!(task.title, "Edited completed activity");
+        assert_eq!(a.task().unwrap().status, 0);
+        assert!(!a.task().unwrap().extra.contains_key("completedTime"));
+        assert!(!a.data.completed.iter().any(|t| t.id == "old"));
+        // A rejected write restores the completed record with its saved edit.
+        a.pending_jobs.pop_front();
+        a.replay();
+        a.selected = a.visible().iter().position(|t| t.id == "old").unwrap();
+        assert_eq!(a.task().unwrap().status, 2);
+        assert_eq!(a.task().unwrap().title, "Edited completed activity");
+    }
+
+    #[test]
+    fn opening_result_from_unlisted_project_uses_all_tasks() {
+        let mut a = app();
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        a.query = "archive".into();
+        a.remote_search = Some(RemoteSearch {
+            id: 1,
+            query: a.query.clone(),
+            loading: false,
+            error: None,
+            tasks: vec![Task {
+                id: "old".into(),
+                project_id: "archived".into(),
+                title: "Old activity".into(),
+                status: 2,
+                ..Default::default()
+            }],
+        });
+        a.mode = Mode::Normal;
+        press(&mut a, 'o');
+        assert_eq!(a.view(), View::All);
+        assert_eq!(a.task().unwrap().id, "old");
+        assert!(a.revealed_completed.is_some() && !a.global_search);
+        a.key(KeyEvent::from(K::Char(' ')));
+        assert_eq!(a.task().unwrap().status, 0);
+    }
+
+    #[test]
+    fn global_search_requests_api_only_on_enter_and_ignores_stale_responses() {
+        let mut a = app();
+        a.demo = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        a.tx = Some(tx);
+        let origin = a.project;
+        let count = a.data.tasks.len();
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        for c in "needle".chars() {
+            press(&mut a, c);
+        }
+        assert!(rx.try_recv().is_err());
+        a.key(KeyEvent::from(K::Enter));
+        let Job::Search { id: first, query } = rx.recv().unwrap() else {
+            panic!("expected search");
+        };
+        assert_eq!(query, "needle");
+        assert!(a.pending_jobs.is_empty());
+        assert!(a.remote_search.as_ref().unwrap().loading);
+        let old_completion = Task {
+            id: "old".into(),
+            project_id: "p".into(),
+            title: "An older task".into(),
+            content: "needle in the description".into(),
+            status: 2,
+            extra: serde_json::from_value(
+                serde_json::json!({"completedTime":"2019-01-01T00:00:00Z"}),
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        a.finish_search(first, Ok(vec![old_completion.clone()]));
+        assert_eq!(a.visible().len(), 1); // API can match content, not just the title.
+        assert_eq!(a.task().unwrap().id, "old");
+        assert_eq!(a.data.tasks.len(), count);
+        assert!(a.data.completed.is_empty());
+        press(&mut a, 'q');
+        assert!(!a.global_search);
+        assert_eq!(a.project, origin);
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        for c in "other".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        let Job::Search { id: second, .. } = rx.recv().unwrap() else {
+            panic!("expected search");
+        };
+        assert!(second > first);
+        a.finish_search(first, Ok(vec![old_completion.clone()]));
+        assert!(a.remote_search.as_ref().unwrap().loading);
+        assert!(a.visible().is_empty());
+        a.finish_search(second, Err("TickTick HTTP 403".into()));
+        assert!(!a.remote_search.as_ref().unwrap().loading);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Search failed"));
+        assert!(!text.contains("No matching tasks."));
+        press(&mut a, 'q');
+        a.finish_search(second, Ok(vec![old_completion]));
+        assert!(!a.global_search && a.remote_search.is_none());
+        assert_eq!(a.data.tasks.len(), count);
+    }
+
+    #[test]
+    fn search_modal_preserves_background_and_renders_at_small_sizes() {
+        let mut a = app();
+        a.open_list("p");
+        a.query = "Task".into();
+        a.selected = 7;
+        a.focus(2);
+        let project = a.project;
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        for (w, h) in [(120, 32), (40, 12), (10, 4)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
+            assert!(a.global_search && a.mode == Mode::Search);
+            assert_eq!(a.project, project);
+            if w == 120 {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("Global search"));
+                assert!(text.contains("Priority"));
+                assert!(text.contains("Work"));
+                assert_eq!(terminal.backend().buffer()[(6, 2)].symbol(), "╭");
+            }
+        }
+        a.key(KeyEvent::from(K::Enter));
+        let before = a.data.tasks.len();
+        press(&mut a, 'x'); // Research results never complete tasks.
+        assert_eq!(a.data.tasks.len(), before);
+        press(&mut a, 'Q');
+        assert!(!a.global_search);
+        assert_eq!(a.query, "Task");
+        assert_eq!(a.selected, 7);
+        assert!(a.preview_focus);
+        assert_eq!(a.project, project);
+    }
+
+    #[test]
+    fn escape_cancels_typing_and_q_exits_applied_global_search() {
+        for preview in [false, true] {
+            let mut a = app();
+            a.open_list("p");
+            press(&mut a, 'f');
+            press(&mut a, 's');
+            press(&mut a, '3');
+            if preview {
+                a.key(KeyEvent::from(K::Enter));
+                press(&mut a, 'F');
+                assert!(a.preview_focus && a.zoom);
+            }
+            a.key(KeyEvent::from(K::Esc));
+            if preview {
+                assert!(a.global_search);
+                press(&mut a, 'Q');
+            }
+            assert!(!a.global_search);
+            assert!(a.query.is_empty());
+            assert!(a.mode == Mode::Normal);
+            assert!(!a.preview_focus && !a.zoom);
+            assert_eq!(a.view(), View::Project("p".into()));
+            assert_eq!(a.visible().len(), 20);
+        }
+    }
+
+    #[test]
+    fn q_is_search_text_until_enter_and_escape_keeps_applied_filter() {
+        let mut a = app();
+        a.open_list("p");
+        press(&mut a, 'f');
+        press(&mut a, 's');
+        press(&mut a, 'Q');
+        assert_eq!(a.input, "Q");
+        assert!(a.global_search && a.mode == Mode::Search);
+        a.key(KeyEvent::from(K::Enter));
+        a.key(KeyEvent::from(K::Esc));
+        assert!(a.global_search);
+        assert_eq!(a.query, "Q");
+        press(&mut a, 'Q');
+        assert!(!a.global_search);
+        assert!(a.query.is_empty());
+        assert_eq!(a.view(), View::Project("p".into()));
+    }
+
+    #[test]
+    fn local_search_stays_in_list_and_shortcut_prefixes_do_not_zoom() {
+        let mut a = app();
+        a.open_list("p");
+        a.data.tasks.push(Task {
+            id: "other".into(),
+            project_id: "other".into(),
+            title: "Task 3".into(),
+            ..Default::default()
+        });
+        press(&mut a, '/');
+        for c in "Task 3".chars() {
+            press(&mut a, c);
+        }
+        a.key(KeyEvent::from(K::Enter));
+        assert_eq!(a.view(), View::Project("p".into()));
+        assert_eq!(a.visible().len(), 1);
+        assert!(!a.global_search);
+        press(&mut a, 'f');
+        assert!(!a.zoom);
+        assert!(a.mode == Mode::Normal);
+        press(&mut a, 's');
+        assert!(a.mode == Mode::Search);
+        assert!(a.global_search);
+        assert_eq!(a.visible().len(), 2);
+        a.key(KeyEvent::from(K::Enter));
+        press(&mut a, '/');
+        assert!(!a.global_search);
+        assert_eq!(a.visible().len(), 1);
+        a.key(KeyEvent::from(K::Esc));
+        assert!(a.global_search);
+        press(&mut a, 'F');
+        assert!(a.zoom);
+        press(&mut a, 'F');
+        assert!(!a.zoom);
+        press(&mut a, 'e');
+        assert!(a.mode == Mode::Normal);
+        press(&mut a, 'e');
+        assert!(a.mode == Mode::GoList);
+    }
+
     #[test]
     fn search_is_case_insensitive_and_clamps_selection() {
         let mut a = app();
@@ -4060,7 +5512,7 @@ mod tests {
         let before = a.data.tasks.len();
         a.send(Job::Report(a.report_day));
         assert!(matches!(rx.try_recv().unwrap(), Job::Report(_)));
-        assert!(a.message.starts_with("Consultando relatório de "));
+        assert!(a.message.starts_with("Loading report for "));
         assert!(!a.message.contains("Salvando"));
         assert!(a.pending_jobs.is_empty());
         assert_eq!(a.data.tasks.len(), before);
@@ -4068,10 +5520,10 @@ mod tests {
         a.busy = false;
         a.send(Job::Refresh);
         assert!(matches!(rx.try_recv().unwrap(), Job::Refresh));
-        assert_eq!(a.message, "Sincronizando com TickTick…");
+        assert_eq!(a.message, "Syncing with TickTick…");
         let task = a.data.tasks[0].clone();
         a.send(Job::Complete(task));
-        assert!(a.message.starts_with("Salvando… 1 operação"));
+        assert!(a.message.starts_with("Saving… 1 operation"));
         assert_eq!(a.pending_jobs.len(), 1);
     }
     #[test]
@@ -4084,7 +5536,9 @@ mod tests {
         a.projects_focus = false;
         for (w, h) in [(120, 32), (40, 12), (10, 4)] {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
             if w == 120 {
                 let buffer = terminal.backend().buffer();
                 let text = buffer
@@ -4092,8 +5546,8 @@ mod tests {
                     .iter()
                     .map(|c| c.symbol())
                     .collect::<String>();
-                assert!(text.contains("CONCLUSÕES"));
-                assert!(text.contains("Revisar proposta com o time"));
+                assert!(text.contains("COMPLETIONS"));
+                assert!(text.contains("Review proposal with the team"));
                 assert!(text.contains("Alex"));
                 if let Ok(path) = std::env::var("TICKTICK_REPORT_PREVIEW") {
                     let cells = buffer.content.iter().map(|c| serde_json::json!({"text":c.symbol(), "fg":format!("{:?}",c.fg), "bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
@@ -4112,7 +5566,9 @@ mod tests {
         press(&mut a, '[');
         assert_eq!(a.report_day, today.pred_opt().unwrap());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
-        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -4120,8 +5576,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Histórico indisponível"));
-        assert!(!text.contains("Revisar proposta com o time"));
+        assert!(text.contains("History unavailable"));
+        assert!(!text.contains("Review proposal with the team"));
         press(&mut a, 't');
         assert_eq!(a.report_day, today);
         press(&mut a, ']');
@@ -4189,7 +5645,9 @@ mod tests {
         assert!(a.preview_focus);
         for (w, h) in [(140, 40), (80, 24), (40, 12)] {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
             if w == 140 {
                 let text = terminal
                     .backend()
@@ -4218,7 +5676,7 @@ mod tests {
         press(&mut a, 'j');
         assert_eq!(a.selected, 1);
         a.key(KeyEvent::new(K::Enter, M::NONE));
-        assert_eq!(a.task().unwrap().title, "Publicar correção");
+        assert_eq!(a.task().unwrap().title, "Publish fix");
         a.key(KeyEvent::new(K::Esc, M::NONE));
         assert!(!a.preview_focus);
     }
@@ -4232,14 +5690,16 @@ mod tests {
         a.project = 3;
         a.report_day = sidebar::today(&a.data);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let text = buffer
             .content
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        for label in ["1 alta", "1 média", "1 baixa", "0 sem prioridade"] {
+        for label in ["1 high", "1 medium", "1 low", "0 no priority"] {
             assert!(text.contains(label));
         }
         assert!(!text.contains("PRIORIDADE ALTA"));
@@ -4279,7 +5739,7 @@ mod tests {
                 },
                 crate::focus::FocusTotal {
                     project_id: None,
-                    label: "Foco livre".into(),
+                    label: "Free focus".into(),
                     seconds: 1800,
                 },
             ],
@@ -4287,7 +5747,9 @@ mod tests {
         });
         for (w, h) in [(140, 40), (80, 24), (40, 12)] {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
             if w == 140 {
                 let text = terminal
                     .backend()
@@ -4297,20 +5759,22 @@ mod tests {
                     .map(|c| c.symbol())
                     .collect::<String>();
                 for label in [
-                    "Tempo focado por lista",
+                    "Focus time by list",
                     "Expin",
                     "1h 30min",
-                    "Foco livre",
+                    "Free focus",
                     "30min",
                 ] {
                     assert!(text.contains(label), "Missing {label}");
                 }
-                assert!(!text.contains("Um dia sem conclusões registradas"));
+                assert!(!text.contains("No completions recorded today"));
             }
         }
         a.report_day = a.report_day.pred_opt().unwrap();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -4333,7 +5797,9 @@ mod tests {
         a.finish_report(yesterday);
         assert!(a.report_loading.contains_key(&today));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -4341,31 +5807,33 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Buscando suas conquistas"));
-        assert!(!text.contains("Revisar proposta com o time"));
+        assert!(text.contains("Loading your accomplishments"));
+        assert!(!text.contains("Review proposal with the team"));
         a.finish_report(today);
         a.report_day = yesterday;
         a.data.report_days.push(yesterday);
-        terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut a, &Config::default()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let text = buffer
             .content
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Um dia sem conclusões registradas"));
+        assert!(text.contains("No completions recorded today"));
         let y = (0..40)
             .find(|y| {
                 buffer.content[y * 140..(y + 1) * 140]
                     .iter()
                     .map(|c| c.symbol())
                     .collect::<String>()
-                    .contains("Um dia sem conclusões registradas")
+                    .contains("No completions recorded today")
             })
             .unwrap();
         let x = buffer.content[y * 140..(y + 1) * 140]
             .iter()
-            .position(|c| c.symbol() == "U")
+            .position(|c| c.symbol() == "N")
             .unwrap();
         assert!(y > 10); // Centered vertically, below the header.
         assert!(x > 35); // Centered horizontally, beyond the sidebar edge.
@@ -4376,7 +5844,9 @@ mod tests {
         a.mode = Mode::Help;
         for (w, h) in [(120, 32), (40, 12), (10, 4)] {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| draw(f, &a, &Config::default())).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut a, &Config::default()))
+                .unwrap();
         }
     }
     #[test]

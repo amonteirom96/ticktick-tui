@@ -121,9 +121,9 @@ pub fn summarize(day: NaiveDate, data: &Snapshot, records: &[Value]) -> Result<V
                     {
                         "Inbox"
                     } else if task_id.is_some() {
-                        "Lista não identificada"
+                        "Unknown list"
                     } else {
-                        "Foco livre"
+                        "Free focus"
                     }
                     .into()
                 });
@@ -213,7 +213,7 @@ mod tests {
         let totals = summarize(day, &data, &records).unwrap();
         assert_eq!(totals[0].label, "Expin");
         assert_eq!(totals[0].seconds, 5400);
-        assert_eq!(totals[1].label, "Foco livre");
+        assert_eq!(totals[1].label, "Free focus");
         assert_eq!(totals[1].seconds, 1800);
         let next = summarize(day.succ_opt().unwrap(), &data, &records).unwrap();
         assert_eq!(next.len(), 1);
@@ -238,7 +238,7 @@ mod tests {
         let row = json!({"status":1,"duration":1800000,"pauseDuration":1800000,"startTime":"2026-11-03T12:00:00Z","endTime":"2026-11-03T13:00:00Z","tasks":[{"taskId":"unknown","startTime":"2026-11-03T12:00:00Z","endTime":"2026-11-03T13:00:00Z"}]});
         let totals = summarize(day, &data, &[row]).unwrap();
         assert_eq!(totals[0].seconds, 1800);
-        assert_eq!(totals[0].label, "Lista não identificada");
+        assert_eq!(totals[0].label, "Unknown list");
         assert!(summarize(day, &data, &[json!({"duration":1000})]).is_err());
     }
 }

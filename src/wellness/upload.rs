@@ -133,11 +133,11 @@ impl Timer {
             .filter(|u| self.account.as_ref() == Some(&u.account))
             .count();
         if self.account.is_none() {
-            "demonstração · sem envio".into()
+            "demo · no uploads".into()
         } else if pending > 0 {
-            format!("{pending} envio(s) pendente(s) · :focus-retry após conferir histórico")
+            format!("{pending} pending uploads · :focus-retry after checking history")
         } else {
-            "sessões salvas no TickTick".into()
+            "sessions saved to TickTick".into()
         }
     }
     pub fn uncertain_uploads(&self) -> usize {

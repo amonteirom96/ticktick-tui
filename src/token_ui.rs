@@ -22,12 +22,12 @@ impl Form {
     fn submit(&mut self) {
         let token = self.token.trim().to_owned();
         if token.is_empty() {
-            self.message = "Cole seu API token antes de continuar.".into();
+            self.message = "Paste your API token before continuing.".into();
             return;
         }
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
-        self.message = "Validando com o TickTick…".into();
+        self.message = "Validating with TickTick…".into();
         std::thread::spawn(move || {
             let result = Api::new(token).and_then(|api| {
                 api.validate()?;
@@ -61,7 +61,7 @@ impl Form {
                 .min(width.saturating_sub(14) as usize),
         );
         let text = format!(
-            "\nConecte sua conta com um API token do TickTick.\nCole o token abaixo; a entrada fica oculta.\n\nAPI token: {mask}\n\n{}\n\nEnter  validar e salvar    Ctrl-u  limpar    Esc  cancelar\n\nO token é salvo separado do tema, com acesso restrito.",
+            "\nConnect your account with a TickTick API token.\nPaste your token below; input is hidden.\n\nAPI token: {mask}\n\n{}\n\nEnter  validate and save    Ctrl-u  clear    Esc  cancel\n\nYour token is stored separately from the theme, with restricted access.",
             self.message
         );
         if area.width >= 14 && area.height > 6 {
@@ -95,14 +95,23 @@ pub fn configure<B: Backend>(terminal: &mut Terminal<B>, config: &Config) -> Res
             form.pending = None;
             match result {
                 Ok(api) => {
-                    match config::private_write(&config::config_dir().join("token"), form.token.trim().as_bytes()) {
-                        Ok(()) => { form.token.clear(); return Ok(Some(api)); },
-                        Err(_) => form.message = "Não foi possível salvar o token. Verifique as permissões e tente novamente.".into(),
+                    match config::private_write(
+                        &config::config_dir().join("token"),
+                        form.token.trim().as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            form.token.clear();
+                            return Ok(Some(api));
+                        }
+                        Err(_) => {
+                            form.message =
+                                "Could not save token. Check permissions and try again.".into()
+                        }
                     }
                 }
                 Err(_) => {
                     form.message =
-                        "Falha ao validar. Verifique o token e a conexão e tente novamente.".into()
+                        "Validation failed. Check your token and connection and try again.".into()
                 }
             }
         }

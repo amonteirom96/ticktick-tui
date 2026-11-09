@@ -10,6 +10,15 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum Job {
     Refresh,
+    LoadTask {
+        request: u64,
+        project: String,
+        id: String,
+    },
+    Search {
+        id: u64,
+        query: String,
+    },
     SaveFocus(crate::wellness::FocusUpload),
     /// `value` equal to `goal` completes the habit; 0 undoes it.
     CheckHabit {
@@ -34,6 +43,14 @@ pub enum Job {
     },
 }
 pub enum Event {
+    TaskLoaded {
+        request: u64,
+        result: Result<Task, String>,
+    },
+    Search {
+        id: u64,
+        result: Result<Vec<Task>, String>,
+    },
     FocusSaved {
         id: String,
         result: Result<Snapshot, String>,
@@ -51,10 +68,28 @@ pub enum Event {
         mutation: bool,
     },
 }
+/// Remember an API task without treating a search result as a user mutation.
+pub fn remember(data: &mut Snapshot, task: &Task) {
+    let tasks = if task.status == 2 {
+        &mut data.completed
+    } else {
+        &mut data.tasks
+    };
+    if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
+        *existing = task.clone();
+    } else {
+        tasks.push(task.clone());
+    }
+}
 /// The same operation is used for optimistic rendering, commit and rollback replay.
 pub fn apply(data: &mut Snapshot, job: &Job) {
     match job {
-        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
+        Job::LoadTask { .. }
+        | Job::Search { .. }
+        | Job::SaveFocus(_)
+        | Job::Refresh
+        | Job::Report(_)
+        | Job::CheckHabit { .. } => (),
         Job::Reopen(task) => {
             let mut task = task.clone();
             task.status = 0;
@@ -70,7 +105,12 @@ pub fn apply(data: &mut Snapshot, job: &Job) {
             }
         }
         Job::Patch { id, fields, .. } => {
-            if let Some(t) = data.tasks.iter_mut().find(|t| &t.id == id) {
+            if let Some(t) = data
+                .tasks
+                .iter_mut()
+                .chain(data.completed.iter_mut())
+                .find(|t| &t.id == id)
+            {
                 let mut value = serde_json::to_value(&*t).expect("task serializes");
                 for (key, v) in fields {
                     value[key] = v.clone();
@@ -149,7 +189,12 @@ pub fn remap(job: &mut Job, old: &str, new: &str) {
                 fields.insert("parentId".into(), Value::String(new.into()));
             }
         }
-        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => (),
+        Job::LoadTask { .. }
+        | Job::Search { .. }
+        | Job::SaveFocus(_)
+        | Job::Refresh
+        | Job::Report(_)
+        | Job::CheckHabit { .. } => (),
     }
 }
 fn reflected(data: &Snapshot, job: &Job) -> bool {
@@ -160,11 +205,21 @@ fn reflected(data: &Snapshot, job: &Job) -> bool {
             .tasks
             .iter()
             .any(|x| x.id == task.id && &x.project_id == to),
-        Job::Patch { id, fields, .. } => data.tasks.iter().find(|t| &t.id == id).is_some_and(|t| {
-            let v = serde_json::to_value(t).unwrap();
-            fields.iter().all(|(k, x)| v.get(k) == Some(x))
-        }),
-        Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => true,
+        Job::Patch { id, fields, .. } => data
+            .tasks
+            .iter()
+            .chain(data.completed.iter())
+            .find(|t| &t.id == id)
+            .is_some_and(|t| {
+                let v = serde_json::to_value(t).unwrap();
+                fields.iter().all(|(k, x)| v.get(k) == Some(x))
+            }),
+        Job::LoadTask { .. }
+        | Job::Search { .. }
+        | Job::SaveFocus(_)
+        | Job::Refresh
+        | Job::Report(_)
+        | Job::CheckHabit { .. } => true,
     }
 }
 /// A newer patch of the same field supersedes the older one, so it is never replayed over it.
@@ -192,7 +247,7 @@ fn cache(data: &Snapshot) -> Option<String> {
         .map_err(anyhow::Error::from)
         .and_then(|v| config::private_write(&config::cache_path(), &v))
         .err()
-        .map(|_| "Não foi possível atualizar o cache local".into())
+        .map(|_| "Could not update local cache".into())
 }
 /// Recurring completions receive a new ID in TickTick's history. Match only
 /// the local recurring copy, with its schedule and completion instant intact.
@@ -255,13 +310,13 @@ fn fetch_report(api: &Api, data: &mut Snapshot, day: chrono::NaiveDate) -> Strin
         Ok(tasks) => {
             merge_completed(data, tasks, day);
             format!(
-                "Relatório de {} atualizado · Sincronizado com TickTick",
+                "Report for {} updated · Synced with TickTick",
                 day.format("%d/%m/%Y")
             )
         }
         Err(e) => {
             data.report_days.retain(|d| *d != day);
-            format!("Histórico indisponível: {e}. Exibindo registros locais.")
+            format!("History unavailable: {e}. Showing local records.")
         }
     };
     let focus = match api.focus_on(day, data) {
@@ -310,7 +365,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     .is_some_and(|id| id.starts_with("local:"));
                 let result = if unresolved {
                     Err(anyhow::anyhow!(
-                        "A tarefa do foco ainda não foi salva no TickTick"
+                        "The focus task has not been saved to TickTick yet"
                     ))
                 } else {
                     api.create_focus(&body)
@@ -341,9 +396,8 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                             .zip(last)
                             .is_some_and(|(first, last)| day.day >= first && day.day <= last)
                         {
-                            day.error = Some(
-                                "Nova sessão salva · use r no relatório para atualizar".into(),
-                            );
+                            day.error =
+                                Some("New session saved · press r in the report to refresh".into());
                         }
                     }
                     let _ = cache(&known);
@@ -391,9 +445,9 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     Ok(()) => {
                         crate::wellness::record_checkin(&mut known, id, day, goal, value);
                         let mut message = if value > 0.0 {
-                            "Hábito concluído · salvo no TickTick"
+                            "Habit completed · saved to TickTick"
                         } else {
-                            "Hábito desmarcado · salvo no TickTick"
+                            "Habit reset · saved to TickTick"
                         }
                         .to_string();
                         if let Some(warning) = cache(&known) {
@@ -404,8 +458,41 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                         }
                     }
                     Err(error) => {
-                        let _ = out.send(Event::Error { message: format!("Não foi possível {} o hábito: {error}. Use r para conferir antes de tentar novamente.", if value > 0.0 { "concluir" } else { "desmarcar" }), mutation: false });
+                        let _ = out.send(Event::Error {
+                            message: format!(
+                                "Could not {} habit: {error}. Press r to check before retrying.",
+                                if value > 0.0 { "complete" } else { "reset" }
+                            ),
+                            mutation: false,
+                        });
                     }
+                }
+                continue;
+            }
+            if let Job::LoadTask {
+                request,
+                ref project,
+                ref id,
+            } = job
+            {
+                let result = api.task(project, id).map_err(|error| error.to_string());
+                if let Ok(task) = &result {
+                    remember(&mut known, task);
+                }
+                if out.send(Event::TaskLoaded { request, result }).is_err() {
+                    break;
+                }
+                continue;
+            }
+            if let Job::Search { id, ref query } = job {
+                let result = api.search(query).map_err(|error| error.to_string());
+                if let Ok(tasks) = &result {
+                    for task in tasks {
+                        remember(&mut known, task);
+                    }
+                }
+                if out.send(Event::Search { id, result }).is_err() {
+                    break;
                 }
                 continue;
             }
@@ -425,7 +512,12 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
             }
             let mutation = !matches!(
                 job,
-                Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. }
+                Job::LoadTask { .. }
+                    | Job::Search { .. }
+                    | Job::SaveFocus(_)
+                    | Job::Refresh
+                    | Job::Report(_)
+                    | Job::CheckHabit { .. }
             );
             let unresolved = match &job {
                 Job::Create(t) => t
@@ -436,15 +528,23 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                 Job::Reopen(t) | Job::Complete(t) | Job::Delete(t) | Job::Move { task: t, .. } => {
                     t.id.starts_with("local:")
                 }
-                Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => false,
+                Job::LoadTask { .. }
+                | Job::Search { .. }
+                | Job::SaveFocus(_)
+                | Job::Refresh
+                | Job::Report(_)
+                | Job::CheckHabit { .. } => false,
             };
             let result = if unresolved {
-                Err(anyhow::anyhow!("A criação da tarefa anterior falhou"))
+                Err(anyhow::anyhow!("The previous task could not be created"))
             } else {
                 match &job {
-                    Job::SaveFocus(_) | Job::Refresh | Job::Report(_) | Job::CheckHabit { .. } => {
-                        Ok(job.clone())
-                    }
+                    Job::LoadTask { .. }
+                    | Job::Search { .. }
+                    | Job::SaveFocus(_)
+                    | Job::Refresh
+                    | Job::Report(_)
+                    | Job::CheckHabit { .. } => Ok(job.clone()),
                     Job::Create(t) => api.create(t).map(|remote| {
                         aliases.insert(t.id.clone(), remote.id.clone());
                         Job::Create(remote)
@@ -454,13 +554,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                         project,
                         fields,
                     } => api.patch(id, project, fields.clone()).map(|_| job.clone()),
-                    Job::Reopen(t) => api
-                        .patch(
-                            &t.id,
-                            &t.project_id,
-                            Map::from_iter([("status".into(), Value::from(0))]),
-                        )
-                        .map(|_| job.clone()),
+                    Job::Reopen(t) => api.reopen(t).map(|_| job.clone()),
                     Job::Complete(t) => api.complete(t).map(|_| job.clone()),
                     Job::Delete(t) => api.delete(t).map(|_| job.clone()),
                     Job::Move { task, to } => api.move_task(task, to).map(|_| job.clone()),
@@ -470,7 +564,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                 Ok(job) => job,
                 Err(e) => {
                     for _ in 0..merged {
-                        let _=out.send(Event::Error{message:format!("Falha na gravação: {e}. Alteração local desfeita; use r para conferir antes de tentar novamente."),mutation});
+                        let _=out.send(Event::Error{message:format!("Save failed: {e}. Local change reverted; press r to check before retrying."),mutation});
                     }
                     continue;
                 }
@@ -479,7 +573,7 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                 apply(&mut known, &actual);
                 track(&mut unindexed, actual.clone());
             }
-            let mut message = String::from("Sincronizado com TickTick");
+            let mut message = String::from("Synced with TickTick");
             // More writes queued (e.g. reorder burst): skip the full refetch until the last one.
             queue.extend(rx.try_iter());
             let busy = mutation && !queue.is_empty();
@@ -535,11 +629,11 @@ pub fn worker(api: Api, initial: Snapshot) -> (Sender<Job>, Receiver<Event>) {
                     }
                 }
                 Some(Err(e)) if mutation => {
-                    message = format!("Salvo no TickTick; atualização da lista falhou: {e}")
+                    message = format!("Saved to TickTick; list refresh failed: {e}")
                 }
                 Some(Err(e)) => {
                     let _ = out.send(Event::Error {
-                        message: format!("Falha na sincronização: {e}"),
+                        message: format!("Sync failed: {e}"),
                         mutation: false,
                     });
                     continue;
@@ -620,6 +714,35 @@ mod tests {
             Value::from("2026-11-05T09:15:47+00:00"),
         );
         assert!(!recurring_completion(&unrelated, &remote));
+    }
+
+    #[test]
+    fn completed_search_records_can_be_patched_and_reopened_without_losing_edits() {
+        let mut data = Snapshot::default();
+        let task = Task {
+            id: "old".into(),
+            project_id: "p".into(),
+            title: "Old activity".into(),
+            status: 2,
+            ..Default::default()
+        };
+        remember(&mut data, &task);
+        remember(&mut data, &task);
+        assert_eq!(data.completed.len(), 1);
+        let patch = Job::Patch {
+            id: task.id.clone(),
+            project: task.project_id.clone(),
+            fields: Map::from_iter([("title".into(), Value::from("Edited activity"))]),
+        };
+        assert!(!reflected(&data, &patch));
+        apply(&mut data, &patch);
+        assert!(reflected(&data, &patch));
+        let edited = data.completed[0].clone();
+        apply(&mut data, &Job::Reopen(edited));
+        assert!(data.completed.is_empty());
+        assert_eq!(data.tasks.len(), 1);
+        assert_eq!(data.tasks[0].title, "Edited activity");
+        assert_eq!(data.tasks[0].status, 0);
     }
 
     #[test]

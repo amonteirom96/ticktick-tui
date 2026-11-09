@@ -5,23 +5,28 @@ use chrono::{
 use chrono_tz::Tz;
 use serde_json::{Map, Value, json};
 
-const WEEKDAYS: [&str; 7] = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"];
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const LEGACY_WEEKDAYS: [&str; 7] = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"];
 const API_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%z";
 
-/// Parses `hoje`, `amanhã`, `+3`, `sex` (next one), `25/12`, `25/12/2026` or `2026-12-25`, optionally followed by `HH:MM`.
+/// Parses `today`, `tomorrow`, `+3`, `fri` (next one), `25/12`, `25/12/2026` or `2026-12-25`, optionally followed by `HH:MM`.
 fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTime>), String> {
     let mut parts = input.split_whitespace();
     let day = parts.next().unwrap_or_default().to_lowercase();
     let time = parts
         .next()
-        .map(|t| NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| format!("Hora inválida: {t}")))
+        .map(|t| NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| format!("Invalid time: {t}")))
         .transpose()?;
     let date = match day.as_str() {
-        "hoje" => Some(today),
-        "amanhã" | "amanha" => Some(today + Duration::days(1)),
+        "today" | "hoje" => Some(today),
+        "tomorrow" | "amanhã" | "amanha" => Some(today + Duration::days(1)),
         d if d.starts_with('+') => d[1..].parse().ok().map(|n| today + Duration::days(n)),
-        d if WEEKDAYS.contains(&d) => {
-            let target = WEEKDAYS.iter().position(|w| *w == d).unwrap() as i64;
+        d if WEEKDAYS.contains(&d) || LEGACY_WEEKDAYS.contains(&d) => {
+            let target = WEEKDAYS
+                .iter()
+                .position(|w| *w == d)
+                .or_else(|| LEGACY_WEEKDAYS.iter().position(|w| *w == d))
+                .unwrap() as i64;
             let ahead =
                 (target - today.weekday().num_days_from_monday() as i64 - 1).rem_euclid(7) + 1;
             Some(today + Duration::days(ahead))
@@ -35,7 +40,7 @@ fn parse_due(input: &str, today: NaiveDate) -> Result<(NaiveDate, Option<NaiveTi
     };
     match (date, parts.next()) {
         (Some(date), None) => Ok((date, time)),
-        _ => Err(format!("Data inválida: {input}")),
+        _ => Err(format!("Invalid date: {input}")),
     }
 }
 
@@ -66,7 +71,7 @@ pub fn due_fields(
     }
     let (date, time) = parse_due(input, today)?;
     let utc = to_utc(date.and_time(time.unwrap_or_default()), tz)
-        .ok_or("Horário inexistente nesse fuso")?;
+        .ok_or("Time does not exist in this time zone")?;
     let value = json!(utc.format(API_FORMAT).to_string());
     fields.insert("dueDate".into(), value.clone());
     fields.insert("startDate".into(), value);
@@ -95,7 +100,7 @@ pub fn format_due(due: &str, all_day: bool, tz: Option<Tz>) -> String {
         .to_string()
 }
 
-/// Short label for the task list: `hoje 14:30`, `amanhã`, `sex`, `25/12`. `true` when overdue.
+/// Short label for the task list: `today 14:30`, `tomorrow`, `fri`, `25/12`. `true` when overdue.
 pub fn relative_due(
     due: &str,
     all_day: bool,
@@ -109,8 +114,8 @@ pub fn relative_due(
     };
     let days = (local.date() - today).num_days();
     let day = match days {
-        0 => "hoje".to_owned(),
-        1 => "amanhã".to_owned(),
+        0 => "today".to_owned(),
+        1 => "tomorrow".to_owned(),
         2..=6 => WEEKDAYS[local.date().weekday().num_days_from_monday() as usize].to_owned(),
         _ if local.year() == today.year() => local.format("%d/%m").to_string(),
         _ => local.format("%d/%m/%y").to_string(),
@@ -142,7 +147,7 @@ pub fn parse_reminders(input: &str) -> Result<Vec<String>, String> {
             unit('m', |n| format!("TRIGGER:-PT{n}M"))
                 .or_else(|| unit('h', |n| format!("TRIGGER:-PT{n}H")))
                 .or_else(|| unit('d', |n| format!("TRIGGER:-P{n}D")))
-                .ok_or(format!("Lembrete inválido: {s} (use 0, 15m, 1h ou 1d)"))
+                .ok_or(format!("Invalid reminder: {s} (use 0, 15m, 1h or 1d)"))
         })
         .collect()
 }
@@ -181,7 +186,7 @@ mod tests {
     #[test]
     fn due_accepts_relative_and_brazilian_dates() {
         let tz = Some(chrono_tz::America::Sao_Paulo);
-        let f = due_fields("amanhã 14:30", today(), tz).unwrap();
+        let f = due_fields("tomorrow 14:30", today(), tz).unwrap();
         assert_eq!(f["dueDate"], "2026-11-04T17:30:00+0000");
         assert_eq!(f["startDate"], f["dueDate"]);
         assert_eq!(f["isAllDay"], false);
@@ -198,9 +203,9 @@ mod tests {
             "2027-01-10T03:00:00+0000"
         );
         assert!(due_fields("", today(), tz).unwrap()["dueDate"].is_null());
-        // today is a Tuesday: "sex" is this Friday, "ter" is next week's.
+        // today is a Tuesday: "fri" is this Friday, "tue" is next week's.
         assert_eq!(
-            due_fields("sex 14:30", today(), tz).unwrap()["dueDate"],
+            due_fields("fri 14:30", today(), tz).unwrap()["dueDate"],
             "2026-11-06T17:30:00+0000"
         );
         assert_eq!(
@@ -208,7 +213,7 @@ mod tests {
             "2026-11-10T03:00:00+0000"
         );
         assert!(due_fields("ontem", today(), tz).is_err());
-        assert!(due_fields("hoje 25:00", today(), tz).is_err());
+        assert!(due_fields("today 25:00", today(), tz).is_err());
     }
     #[test]
     fn due_roundtrips_to_prompt_text() {
@@ -228,15 +233,15 @@ mod tests {
         let label = |due, all_day| relative_due(due, all_day, tz, today()).unwrap();
         assert_eq!(
             label("2026-11-03T17:30:00+0000", false),
-            ("hoje 14:30".into(), false)
+            ("today 14:30".into(), false)
         );
         assert_eq!(
             label("2026-11-04T03:00:00+0000", true),
-            ("amanhã".into(), false)
+            ("tomorrow".into(), false)
         );
         assert_eq!(
             label("2026-11-06T03:00:00+0000", true),
-            ("sex".into(), false)
+            ("fri".into(), false)
         );
         assert_eq!(
             label("2026-11-01T03:00:00+0000", true),
@@ -262,6 +267,6 @@ mod tests {
         );
         assert_eq!(format_reminders(&r), "0, 15m, 1h, 2d, TRIGGER:P0DT9H0M0S");
         assert!(parse_reminders("").unwrap().is_empty());
-        assert!(parse_reminders("amanhã").is_err());
+        assert!(parse_reminders("tomorrow").is_err());
     }
 }

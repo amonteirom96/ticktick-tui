@@ -218,7 +218,7 @@ impl Api {
         {
             Ok(groups) => groups,
             Err(_) => {
-                result.warnings.push("Grupos indisponíveis na API".into());
+                result.warnings.push("Groups unavailable from API".into());
                 vec![]
             }
         };
@@ -262,7 +262,7 @@ impl Api {
                     if tasks.len() >= 200 {
                         result
                             .warnings
-                            .push("Inbox: API limitou a leitura a 200 tarefas".into());
+                            .push("Inbox: API returned a maximum of 200 tasks".into());
                     }
                     result
                         .tasks
@@ -270,7 +270,7 @@ impl Api {
                 }
                 Err(_) => result
                     .warnings
-                    .push("Inbox indisponível na API; use r para tentar novamente".into()),
+                    .push("Inbox unavailable from API; press r to retry".into()),
             },
         }
         if result.inbox_id.is_none() {
@@ -297,11 +297,11 @@ impl Api {
                     &format!("/focus?{}", url.query().unwrap()),
                     None,
                 )?;
-                let rows = value.as_array().context("Resposta de foco inválida")?;
+                let rows = value.as_array().context("Invalid focus response")?;
                 for row in rows {
                     let mut row = crate::focus::normalize_record(row.clone());
                     row.as_object_mut()
-                        .context("Registro de foco inválido")?
+                        .context("Invalid focus record")?
                         .insert("type".into(), json!(kind));
                     records.push(row);
                 }
@@ -310,7 +310,7 @@ impl Api {
         })();
         match focus_result {
             Ok(records) => result.focus_records = records,
-            Err(e) => result.wellness_error = Some(format!("Histórico de foco indisponível: {e}")),
+            Err(e) => result.wellness_error = Some(format!("Focus history unavailable: {e}")),
         }
         match self
             .request(Method::GET, "/habit", None)
@@ -324,7 +324,7 @@ impl Api {
                     Err(e) => result.habit_checkin_error = Some(e.to_string()),
                 }
             }
-            Err(e) => result.habit_error = Some(format!("Hábitos indisponíveis: {e}")),
+            Err(e) => result.habit_error = Some(format!("Habits unavailable: {e}")),
         }
         Ok(result)
     }
@@ -342,7 +342,7 @@ impl Api {
         // The API uses an exclusive upper bound; equal dates return no check-ins.
         let end = today
             .succ_opt()
-            .context("Data de hábito inválida")?
+            .context("Invalid habit date")?
             .format("%Y%m%d")
             .to_string();
         let mut records = Vec::new();
@@ -360,7 +360,7 @@ impl Api {
             records.extend(
                 value
                     .as_array()
-                    .context("Resposta de check-in inválida")?
+                    .context("Invalid check-in response")?
                     .iter()
                     .cloned(),
             );
@@ -380,13 +380,10 @@ impl Api {
                 && id
                     .bytes()
                     .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
-            "ID de hábito inválido"
+            "Invalid habit ID"
         );
-        anyhow::ensure!(goal.is_finite() && goal > 0.0, "Meta de hábito inválida");
-        anyhow::ensure!(
-            value.is_finite() && value >= 0.0,
-            "Valor de hábito inválido"
-        );
+        anyhow::ensure!(goal.is_finite() && goal > 0.0, "Invalid habit goal");
+        anyhow::ensure!(value.is_finite() && value >= 0.0, "Invalid habit value");
         let stamp = day.format("%Y%m%d").to_string().parse::<i32>()?;
         let time = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
         self.request(
@@ -409,6 +406,25 @@ impl Api {
                     .filter(|s| !s.trim().is_empty())
                     .map(str::to_owned)
             })
+    }
+    /// Search all accessible projects and all completion dates on TickTick.
+    pub fn search(&self, keywords: &str) -> Result<Vec<Task>> {
+        let keywords = keywords.trim();
+        anyhow::ensure!(!keywords.is_empty(), "Enter a search term");
+        let value = self.request(
+            Method::POST,
+            "/task/search",
+            Some(json!({"keywords": keywords, "status": [0, 2]})),
+        )?;
+        let tasks: Vec<Task> =
+            serde_json::from_value(value).context("Unexpected search response")?;
+        anyhow::ensure!(
+            tasks.iter().all(|task| !task.id.is_empty()
+                && !task.project_id.is_empty()
+                && matches!(task.status, 0 | 2)),
+            "Invalid task in search response"
+        );
+        Ok(tasks)
     }
     pub fn completed_on(&self, day: chrono::NaiveDate, data: &Snapshot) -> Result<Vec<Task>> {
         let next = day.succ_opt().context("Date out of range")?;
@@ -535,9 +551,40 @@ impl Api {
         )?;
         Ok(())
     }
+    pub fn task(&self, project: &str, id: &str) -> Result<Task> {
+        let value = self.request(Method::GET, &format!("/project/{project}/task/{id}"), None)?;
+        let task: Task =
+            serde_json::from_value(value).context("Unexpected task detail response")?;
+        anyhow::ensure!(
+            task.id == id && task.project_id == project,
+            "Unexpected activity returned by TickTick"
+        );
+        Ok(task)
+    }
+    pub fn reopen(&self, task: &Task) -> Result<()> {
+        self.patch(
+            &task.id,
+            &task.project_id,
+            serde_json::Map::from_iter([("status".into(), Value::from(0))]),
+        )?;
+        // Confirm the saved status instead of relying on an optimistic local change.
+        let value = self
+            .request(
+                Method::GET,
+                &format!("/project/{}/task/{}", task.project_id, task.id),
+                None,
+            )
+            .context("Reopen could not be confirmed; refresh before retrying")?;
+        let saved: Task = serde_json::from_value(value).context("Unexpected reopen response")?;
+        anyhow::ensure!(
+            saved.id == task.id && saved.project_id == task.project_id && saved.status == 0,
+            "TickTick has not confirmed the task as open; refresh before retrying"
+        );
+        Ok(())
+    }
     pub fn complete(&self, task: &Task) -> Result<()> {
         if task.is_note() {
-            bail!("Anotações não podem ser concluídas");
+            bail!("Notes cannot be completed");
         }
         self.request(
             Method::POST,
@@ -618,6 +665,211 @@ mod tests {
         server.join().unwrap();
     }
     use super::*;
+    #[test]
+    fn full_task_load_preserves_body_description_and_checklist() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes[..n])
+                    .starts_with("GET /open/v1/project/p/task/old ")
+            );
+            let body = json!({"id":"old","projectId":"p","title":"Old activity","content":"Full body", "desc":"Checklist description", "status":2, "items":[{"id":"item","title":"Check","status":1}]}).to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{address}/open/v1");
+        let (tx, rx) = crate::sync::worker(api, Snapshot::default());
+        tx.send(crate::sync::Job::LoadTask {
+            request: 4,
+            project: "p".into(),
+            id: "old".into(),
+        })
+        .unwrap();
+        let crate::sync::Event::TaskLoaded { request, result } =
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected task details");
+        };
+        let task = result.unwrap();
+        assert_eq!(request, 4);
+        assert_eq!(task.content, "Full body");
+        assert_eq!(task.desc.as_deref(), Some("Checklist description"));
+        assert_eq!(task.items[0].title, "Check");
+        assert_eq!(task.status, 2);
+        drop(tx);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reopen_posts_open_status_and_requires_remote_confirmation() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for saved_status in [0, 2] {
+                for method in ["POST", "GET"] {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let length: usize = header
+                                .lines()
+                                .find_map(|line| {
+                                    line.strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() < end + 4 + length {
+                                continue;
+                            }
+                            if method == "POST" {
+                                assert!(header.starts_with("post /open/v1/task/old "));
+                                let body: Value =
+                                    serde_json::from_slice(&bytes[end + 4..]).unwrap();
+                                assert_eq!(body, json!({"id":"old","projectId":"p","status":0}));
+                            } else {
+                                assert!(header.starts_with("get /open/v1/project/p/task/old "));
+                            }
+                            break;
+                        }
+                    }
+                    let body = if method == "POST" {
+                        String::new()
+                    } else {
+                        json!({"id":"old","projectId":"p","title":"Old activity","status":saved_status}).to_string()
+                    };
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{address}/open/v1");
+        let task = Task {
+            id: "old".into(),
+            project_id: "p".into(),
+            status: 2,
+            ..Default::default()
+        };
+        api.reopen(&task).unwrap();
+        assert!(
+            api.reopen(&task)
+                .unwrap_err()
+                .to_string()
+                .contains("not confirmed")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn search_uses_both_statuses_without_date_or_project_limits() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (status, body) in [
+                (
+                    200,
+                    r#"[{"id":"pending","projectId":"p","title":"Needle","status":0},{"id":"old","projectId":"archive","title":"Old completion","status":2,"completedTime":"2019-01-01T00:00:00Z"}]"#,
+                ),
+                (403, "{}"),
+                (200, "{}"),
+                (200, "[]"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() < end + 4 + length {
+                            continue;
+                        }
+                        assert!(header.starts_with("post /open/v1/task/search "));
+                        assert!(header.contains("authorization: bearer test"));
+                        let body: Value = serde_json::from_slice(&bytes[end + 4..]).unwrap();
+                        assert_eq!(body, json!({"keywords":"needle", "status":[0,2]}));
+                        break;
+                    }
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut api = Api::new("test".into()).unwrap();
+        api.base = format!("http://{address}/open/v1");
+        assert!(api.search(" ").is_err()); // No request for blank terms.
+        let tasks = api.search(" needle ").unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].status, 2);
+        assert_eq!(tasks[1].extra["completedTime"], "2019-01-01T00:00:00Z");
+        let (tx, rx) = crate::sync::worker(api, Snapshot::default());
+        for id in 1..=3 {
+            tx.send(crate::sync::Job::Search {
+                id,
+                query: "needle".into(),
+            })
+            .unwrap();
+            let crate::sync::Event::Search {
+                id: received,
+                result,
+            } = rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("expected search event");
+            };
+            assert_eq!(id, received);
+            if id < 3 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_empty());
+            }
+        }
+        drop(tx);
+        server.join().unwrap();
+    }
+
     #[test]
     fn ancestry_resolves_active_and_completed_parents_and_cycles() {
         let mut data = Snapshot::default();

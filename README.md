@@ -53,10 +53,10 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `j` / `k`, `5j` / `5k` | Navegar, com contagem opcional |
 | `gg` / `G` | Primeiro / último item |
 | `Ctrl-d` / `Ctrl-u` | Descer / subir 10 itens |
-| `a`, `i`, `o` | Criar tarefa na lista selecionada |
+| `a`, `o` | Criar tarefa na lista selecionada |
 | `cc` | Renomear tarefa |
 | `v` + `j`/`k`, `J` / `K` | Selecionar e mover tarefas na lista, com contagem (`3J`); `v`/`Esc` sai. Ordem manual (`sortOrder`) do TickTick; subtarefas acompanham o pai |
-| `e` | Editar título e conteúdo no editor |
+| `i` | Editar título e conteúdo no editor |
 | `x`, `Space` | Concluir tarefa |
 | `dd` | Excluir, com confirmação `y` |
 | `p` | Alternar prioridade: nenhuma → baixa → média → alta |
@@ -65,11 +65,13 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `D` | Prazo: calendário (`hjkl` dia, `H`/`L` mês, `Space` marca, dígitos = hora, `r` lembrete, `x` sem prazo, `Enter` salva) |
 | `R` | Lembretes: `Space` marca as opções, ou digite `2h`, `3d` |
 | `za` / `zo` / `zc` | Recolher / expandir pasta (em Listas) ou subtarefas |
-| `/` | Filtrar títulos; Enter aplica |
+| `/` | Filtrar títulos somente na lista atual; Enter aplica, Esc cancela/limpa |
+| `fs` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `o` abre o resultado selecionado na tela principal, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
+| `ee` | Abrir seletor de telas e listas (Today, Inbox, Tomorrow, Daily report, Habits, Focus e listas): digite para filtrar, ↑/↓ ou Tab para escolher, Enter abre, Esc cancela |
 | `Esc` | Cancelar entrada ou limpar filtro |
 | `Enter` | Mostrar / ocultar detalhes |
 | `zp` | Mostrar / ocultar preview |
-| `f` | Zoom: preview em tela cheia (`f`/`Esc` volta) |
+| `F` | Zoom: preview em tela cheia (`F`/`Esc` volta) |
 | `<` / `>` | Estreitar / alargar a coluna de tarefas |
 | `b` | Ocultar / mostrar a coluna de listas (`h` reabre) |
 | `r`, `:sync`, `:w` | Sincronizar |
@@ -82,7 +84,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 
 Ao criar uma tarefa em Today ou Amanhã, ela recebe a data correspondente e é salva no Inbox, mantendo a visão atual com a nova tarefa selecionada. Nas demais visões, selecione uma lista específica ou o Inbox: a visão “All tasks” não determina um projeto de destino. No editor, a primeira linha é o título e o restante é o conteúdo. `$VISUAL` tem precedência sobre `$EDITOR`; o padrão é `vi` em Unix e `notepad.exe` em Windows. Use o caminho de um executável ou script wrapper, sem argumentos na variável.
 
-A interface usa modos Normal, Inserção e Comando. Não implementa todo o motor de edição do Vim (macros, registros e operadores de texto); para todos os comandos de edição, use `e` com Vim/Neovim.
+A interface usa modos Normal, Inserção e Comando. Não implementa todo o motor de edição do Vim (macros, registros e operadores de texto); para todos os comandos de edição, use `i` com Vim/Neovim.
 
 ## Cores nos dotfiles
 
@@ -139,7 +141,7 @@ Extraia o download correspondente ao seu sistema e arquitetura e coloque `tickti
 
 O aplicativo abre com foco na primeira coluna e **Today** selecionado. A ordem é Today, Inbox, Amanhã, Relatório do dia, Hábitos, Pomodoro, Stopwatch, suas listas e Todas as tarefas. Today inclui tarefas atrasadas; Amanhã considera somente a data seguinte no fuso do TickTick (ou do sistema quando indisponível). Nessas duas visões, cada tarefa mostra discretamente, à direita, o nome da lista a que pertence.
 
-O **Relatório do dia** começa na data atual e exibe cartões com contadores grandes, distribuição visual por lista e uma tabela compacta de conquistas. O título completo da conquista selecionada aparece abaixo da tabela. Estados vazios ficam centralizados; ao consultar uma data, um indicador animado aparece no centro. Use `[` para o dia anterior, `]` para o seguinte, `t` para hoje e `:report AAAA-MM-DD` para uma data específica. `j`/`k` selecionam conquistas quando a coluna central está focada. `l` ou `Enter` abre a atividade concluída com descrição e checklist; `j`/`k` rolam o preview e `h`/`Esc` volta. O resumo separa as quantidades por prioridade, e os números por lista aparecem sobre as barras com texto na cor do painel.
+O **Daily report** começa na data atual e exibe cartões com contadores grandes, distribuição visual por lista e uma tabela compacta de conquistas. O título completo da conquista selecionada aparece abaixo da tabela. Estados vazios ficam centralizados; ao consultar uma data, um indicador animado aparece no centro. Use `[` para o dia anterior, `]` para o seguinte, `t` para hoje e `:report AAAA-MM-DD` para uma data específica. `j`/`k` selecionam conquistas quando a coluna central está focada. `l` ou `Enter` abre a atividade concluída com descrição e checklist; `j`/`k` rolam o preview e `h`/`Esc` volta. O resumo separa as quantidades por prioridade, e os números por lista aparecem sobre as barras com texto na cor do painel.
 
 O cliente tenta consultar `/task/completed` para a data escolhida. Esse endpoint e `/user/info` são opcionais e não têm disponibilidade garantida na Open API. Quando o histórico não está disponível ou a resposta está truncada, o relatório avisa e apresenta as conclusões confirmadas neste aplicativo, preservadas no cache. Excluir uma tarefa não conta como conclusão. Não é possível garantir a recuperação de conclusões antigas ou realizadas em outros clientes com todos os tipos de token. O relatório é uma visão local, sem criar uma lista no TickTick.
 
@@ -151,7 +153,7 @@ O painel **Tempo focado por lista** soma registros reais de Pomodoro e cronômet
 
 ## Hábitos, Pomodoro e Stopwatch
 
-Logo abaixo do relatório, **Hábitos** consulta `/habit` e mostra os nomes e metas do TickTick. **Pomodoro** e **Stopwatch** consultam `/focus` para mostrar as sessões de hoje por tipo. Se o token não permitir um endpoint, a tela informa a indisponibilidade; `r` tenta novamente.
+Logo abaixo do relatório, **Habits** consulta `/habit` e mostra os nomes e metas do TickTick. **Pomodoro** e **Stopwatch** consultam `/focus` para mostrar as sessões de hoje por tipo. Se o token não permitir um endpoint, a tela informa a indisponibilidade; `r` tenta novamente.
 
 Hábitos mostra apenas os programados para hoje, seguindo a `repeatRule` do TickTick (dias da semana em `BYDAY`, ou `INTERVAL` diário a partir da data de início); hábitos arquivados ou que ainda não começaram ficam ocultos. `Space` ou `x` conclui o hábito selecionado; num hábito já concluído, desmarca (envia o check-in do dia com valor 0).
 
@@ -177,3 +179,9 @@ Dentro da lista, `zh` mostra ou oculta tarefas concluídas disponíveis no hist�
 Os envios de foco ficam persistidos junto ao timer e vinculados à credencial que os originou. Sessões ainda não enviadas são retomadas ao abrir o TUI. Se uma tentativa ficar sem confirmação (incluindo fechamento durante o envio), o cliente preserva o registro e evita reenviar automaticamente: confira o histórico no TickTick antes de executar `:focus-retry`, pois uma resposta perdida pode significar que o servidor já salvou a sessão. Trocar de conta interrompe a sessão em andamento e mantém os envios antigos isolados. Demo não envia nem persiste sessões. Timers antigos sem informações de sessão começam uma nova contagem após esta atualização.
 
 Referência oficial de foco: [Create Focus](https://developer.ticktick.com/docs/openapi.md#focus). A criação usa duração e pausas em segundos; o cliente normaliza leituras em segundos e respostas legadas em milissegundos para o formato do cache.
+
+A interface do TUI usa inglês em todas as telas, mensagens e atalhos. Os nomes das listas e o conteúdo das tarefas vindos do TickTick são preservados. A pesquisa geral consulta `POST /open/v1/task/search` com `status: [0, 2]`, sem limitar projetos ou datas; os resultados não dependem do histórico já carregado no TUI. Falhas aparecem no próprio modal e podem ser consultadas novamente com `fs`.
+
+Na pesquisa geral, após aplicar com Enter, selecione com `j`/`k` e pressione `o` para abrir a atividade na lista de origem (ou em All tasks se a lista não estiver disponível). Antes de fechar a pesquisa, o TUI carrega os detalhes completos da atividade na API. A atividade fica selecionada na lista; se estiver concluída, apenas ela é revelada temporariamente, sem ativar a exibição de todas as concluídas. Trocar de lista encerra essa revelação. Use `i` para editar e `x` ou `Space` para reabrir uma concluída. A reabertura é confirmada na API antes de ser considerada salva. O modal ocupa até 90% da largura e 85% da altura, com limites de 140 colunas e 36 linhas.
+
+Durante a pesquisa, o carregamento aparece uma única vez no centro do modal. Resultados vazios e erros usam o mesmo espaço; o painel de detalhes aparece apenas quando há atividades. Ao editar checklists, o texto de descrição é preservado no campo correspondente da API.

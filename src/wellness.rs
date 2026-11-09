@@ -82,11 +82,11 @@ impl Timer {
     pub fn durations(&self) -> (u64, u64, u64) {
         (self.focus, self.short, self.long)
     }
-    /// Accepts "foco pausa pausa-longa" in minutes, e.g. "50 10 20" or "50/10/20".
+    /// Accepts "focus break long-break" in minutes, e.g. "50 10 20" or "50/10/20".
     pub fn set_durations(&mut self, text: &str) -> Result<(), String> {
         self.finish_if_due();
         if self.session.is_some() || self.started.is_some() || self.elapsed > 0 {
-            return Err("Encerre a sessão com s antes de alterar os tempos.".into());
+            return Err("Stop the session with s before changing durations.".into());
         }
         let values = text
             .split(|c: char| c.is_whitespace() || c == '/' || c == ',')
@@ -98,7 +98,7 @@ impl Timer {
                 (self.focus, self.short, self.long) = (focus, short, long);
                 Ok(())
             }
-            _ => Err("Use: foco pausa pausa-longa em minutos (1–480), ex.: 50 10 20".into()),
+            _ => Err("Use: focus break long-break in minutes (1–480), e.g. 50 10 20".into()),
         }
     }
     pub fn phase(&self) -> Phase {
@@ -212,9 +212,9 @@ impl Timer {
     pub fn header(&self) -> Option<String> {
         self.started?;
         let label = if self.pomodoro && self.phase != Phase::Focus {
-            "Pausa"
+            "Break"
         } else {
-            "Foco"
+            "Focus"
         };
         let seconds = self.seconds();
         Some(format!(
@@ -424,7 +424,7 @@ fn goal_label(habit: &Value) -> String {
     let unit = habit["unit"]
         .as_str()
         .filter(|u| !u.is_empty())
-        .unwrap_or(if goal == 1.0 { "vez" } else { "vezes" });
+        .unwrap_or(if goal == 1.0 { "time" } else { "times" });
     format!("{goal} {unit}")
 }
 fn heading(f: &mut Frame, area: Rect, data: &Snapshot, title: &str, theme: &config::Theme) {
@@ -474,9 +474,9 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
         Constraint::Length(1),
     ])
     .split(area);
-    heading(f, sections[0], data, "Seu ritmo, todos os dias", theme);
+    heading(f, sections[0], data, "Your routine, every day", theme);
     f.render_widget(
-        Paragraph::new("j/k selecionar   Space / x concluir ou desmarcar   r atualizar")
+        Paragraph::new("j/k select   Space / x complete or reset   r refresh")
             .alignment(Alignment::Center)
             .style(Style::default().fg(muted)),
         sections[2],
@@ -485,16 +485,16 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
     if data.habit_error.is_some() || list.is_empty() {
         let (title, subtitle) = if data.habit_error.is_some() {
             (
-                "Hábitos indisponíveis",
-                "Não foi possível consultar seus hábitos. Use r para tentar novamente.",
+                "Habits unavailable",
+                "Could not load your habits. Press r to retry.",
             )
         } else if data.habits.is_empty() {
             (
-                "Uma pequena ação por dia",
-                "Seus hábitos do TickTick aparecem aqui.",
+                "One small action each day",
+                "Your TickTick habits appear here.",
             )
         } else {
-            ("Dia livre", "Nenhum hábito programado para hoje.")
+            ("Free day", "No habits scheduled for today.")
         };
         empty(f, sections[1], "◌", title, subtitle, theme);
         return;
@@ -512,8 +512,8 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
     let stats = Layout::horizontal([Constraint::Ratio(1, 2); 2])
         .spacing(1)
         .split(dashboard[0]);
-    stat(f, stats[0], "CONCLUÍDOS HOJE", done, success, theme);
-    stat(f, stats[1], "HÁBITOS HOJE", total, accent, theme);
+    stat(f, stats[0], "COMPLETED TODAY", done, success, theme);
+    stat(f, stats[1], "HABITS TODAY", total, accent, theme);
     let unknown = data.habit_checkin_error.is_some();
     f.render_widget(
         Gauge::default()
@@ -525,9 +525,9 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
             )
             .label(Span::styled(
                 if unknown {
-                    "Histórico parcial · r tentar novamente".into()
+                    "Partial history · r to retry".into()
                 } else {
-                    format!("{done} de {total} concluídos hoje")
+                    format!("{done} of {total} completed today")
                 },
                 Style::default().fg(fg).bold(),
             )),
@@ -554,16 +554,16 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
             Cell::from(
                 habit["name"]
                     .as_str()
-                    .unwrap_or("Hábito")
+                    .unwrap_or("Habit")
                     .replace(['\n', '\r'], " "),
             ),
             Cell::from(goal_label(habit)).style(Style::default().fg(muted)),
             Cell::from(if done {
-                "Feito"
+                "Done"
             } else if unknown {
                 "—"
             } else {
-                "Pendente"
+                "Pending"
             })
             .style(Style::default().fg(if done { success } else { muted })),
         ])
@@ -583,14 +583,14 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
         .header(
             Row::new([
                 "",
-                "HÁBITO",
-                if compact { "" } else { "META" },
-                if compact { "" } else { "HOJE" },
+                "HABIT",
+                if compact { "" } else { "GOAL" },
+                if compact { "" } else { "TODAY" },
             ])
             .style(Style::default().fg(muted))
             .bottom_margin(1),
         )
-        .block(shell("Seus hábitos", theme))
+        .block(shell("Your habits", theme))
         .row_highlight_style(
             Style::default()
                 .bg(preview::color(&theme.selection))
@@ -603,7 +603,7 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
     );
     let habit = list[selected];
     if columns[1].width > 0 {
-        let block = shell("Selecionado", theme).padding(Padding::horizontal(1));
+        let block = shell("Selected", theme).padding(Padding::horizontal(1));
         let inner = block.inner(columns[1]);
         f.render_widget(block, columns[1]);
         let done = habit_done(data, habit);
@@ -611,18 +611,18 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
             Paragraph::new(vec![
                 Line::default(),
                 Line::styled(
-                    habit["name"].as_str().unwrap_or("Hábito").to_string(),
+                    habit["name"].as_str().unwrap_or("Habit").to_string(),
                     Style::default().fg(fg).bold(),
                 ),
                 Line::default(),
-                Line::styled("META", Style::default().fg(muted)),
+                Line::styled("GOAL", Style::default().fg(muted)),
                 Line::styled(goal_label(habit), Style::default().fg(accent).bold()),
                 Line::default(),
                 Line::styled(
                     if done {
-                        "✓ Concluído hoje · Space desmarca"
+                        "✓ Completed today · Space to reset"
                     } else {
-                        "Space / x · concluir"
+                        "Space / x · complete"
                     },
                     Style::default().fg(if done { success } else { accent }),
                 ),
@@ -631,9 +631,9 @@ fn draw_habits(f: &mut Frame, area: Rect, data: &Snapshot, selected: usize, them
             inner,
         );
     }
-    let block = shell("Selecionado · Space / x concluir ou desmarcar", theme);
+    let block = shell("Selected · Space / x complete or reset", theme);
     f.render_widget(
-        Paragraph::new(habit["name"].as_str().unwrap_or("Hábito"))
+        Paragraph::new(habit["name"].as_str().unwrap_or("Habit"))
             .style(Style::default().fg(fg))
             .wrap(Wrap { trim: true })
             .block(block),
@@ -677,7 +677,7 @@ fn record_label(record: &Value, data: &Snapshot) -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| "Foco livre".into())
+        .unwrap_or_else(|| "Free focus".into())
 }
 fn big_clock(value: &str) -> Vec<Line<'static>> {
     let digits: Vec<_> = value
@@ -745,7 +745,7 @@ fn draw_focus(
         .alignment(Alignment::Center),
         parts[0],
     );
-    f.render_widget(Paragraph::new("Space iniciar / pausar   t atividade   c tempos   n próxima fase   s encerrar/salvar   p / w modo").alignment(Alignment::Center).style(Style::default().fg(muted)), parts[2]);
+    f.render_widget(Paragraph::new("Space start / pause   t activity   c durations   n next phase   s stop/save   p / w mode").alignment(Alignment::Center).style(Style::default().fg(muted)), parts[2]);
     let dashboard = Layout::vertical([
         Constraint::Length(if area.height >= 24 {
             12
@@ -762,16 +762,16 @@ fn draw_focus(
     let phase = timer.phase();
     let title = match (timer.pomodoro, timer.target()) {
         (true, Some(target)) => format!(
-            "{} · {} MIN · CICLO {}/{LONG_EVERY}",
+            "{} · {} MIN · CYCLE {}/{LONG_EVERY}",
             match phase {
-                Phase::Focus => "FOCO",
-                Phase::Short => "PAUSA CURTA",
-                Phase::Long => "PAUSA LONGA",
+                Phase::Focus => "FOCUS",
+                Phase::Short => "SHORT BREAK",
+                Phase::Long => "LONG BREAK",
             },
             target / 60,
             timer.cycle()
         ),
-        _ => "STOPWATCH · TEMPO LIVRE".into(),
+        _ => "STOPWATCH · FREE TIME".into(),
     };
     let hero = shell(&title, theme);
     let inner = hero.inner(dashboard[0]);
@@ -814,20 +814,20 @@ fn draw_focus(
     );
     let status = if finished {
         if phase == Phase::Focus {
-            "✓ Foco concluído · Space inicia a pausa"
+            "✓ Focus complete · Space starts break"
         } else {
-            "✓ Pausa concluída · Space volta ao foco"
+            "✓ Break complete · Space returns to focus"
         }
     } else if timer.started.is_some() {
         if resting {
-            "● Descansando"
+            "● Resting"
         } else {
-            "● Em andamento"
+            "● Running"
         }
     } else if seconds > 0 {
-        "◐ Pausado"
+        "◐ Paused"
     } else {
-        "○ Pronto para começar"
+        "○ Ready to start"
     };
     f.render_widget(
         Paragraph::new(status)
@@ -844,7 +844,7 @@ fn draw_focus(
             ),
         ]),
         None => Line::styled(
-            "Foco livre · t escolher atividade",
+            "Free focus · t to choose activity",
             Style::default().fg(muted),
         ),
     };
@@ -876,7 +876,7 @@ fn draw_focus(
         let (focus, short, long) = timer.durations();
         f.render_widget(
             Paragraph::new(format!(
-                "Foco {focus}min · pausa {short}min · pausa longa {long}min · {}",
+                "Focus {focus}min · break {short}min · long break {long}min · {}",
                 timer.sync_status()
             ))
             .alignment(Alignment::Center)
@@ -888,9 +888,9 @@ fn draw_focus(
     let stats = Layout::horizontal([Constraint::Ratio(1, 2); 2])
         .spacing(1)
         .split(dashboard[1]);
-    stat(f, stats[0], "SESSÕES HOJE", records.len(), success, theme);
+    stat(f, stats[0], "SESSIONS TODAY", records.len(), success, theme);
     let total_seconds: u64 = records.iter().map(|r| record_seconds(r)).sum();
-    let duration_block = shell("TEMPO FOCADO HOJE", theme);
+    let duration_block = shell("FOCUS TIME TODAY", theme);
     let duration_inner = duration_block.inner(stats[1]);
     f.render_widget(duration_block, stats[1]);
     f.render_widget(
@@ -899,15 +899,15 @@ fn draw_focus(
             .style(Style::default().fg(accent).bold()),
         center(duration_inner, duration_inner.width, 1),
     );
-    let block = shell("Sessões de hoje · TickTick", theme);
+    let block = shell("Today’s sessions · TickTick", theme);
     let history_inner = block.inner(dashboard[2]);
     if data.wellness_error.is_some() || records.is_empty() {
         f.render_widget(block, dashboard[2]);
         f.render_widget(
             Paragraph::new(if data.wellness_error.is_some() {
-                "Histórico indisponível · r tentar novamente"
+                "History unavailable · r to retry"
             } else {
-                "Nenhuma sessão registrada hoje"
+                "No sessions recorded today"
             })
             .alignment(Alignment::Center)
             .style(Style::default().fg(muted)),
@@ -933,7 +933,7 @@ fn draw_focus(
             )
             .column_spacing(1)
             .header(
-                Row::new(["INÍCIO", "FOCO", "DURAÇÃO"])
+                Row::new(["START", "FOCUS", "DURATION"])
                     .style(Style::default().fg(muted))
                     .bottom_margin(1),
             )

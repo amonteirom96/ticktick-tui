@@ -105,7 +105,7 @@ fn code_block(source: &str, language: &str, theme: &Theme, width: usize) -> Vec<
     let base = Style::default().fg(color(&theme.foreground));
     let muted = Style::default().fg(color(&theme.muted));
     let title = if language.is_empty() {
-        "código"
+        "code"
     } else {
         language
     };
@@ -538,18 +538,18 @@ pub fn document(
         ]))
     };
     let (priority, priority_color) = match task.priority {
-        5 => ("● Alta", &theme.danger),
-        3 => ("● Média", &theme.accent),
-        1 => ("● Baixa", &theme.muted),
-        _ => ("Nenhuma", &theme.muted),
+        5 => ("● High", &theme.danger),
+        3 => ("● Medium", &theme.accent),
+        1 => ("● Low", &theme.muted),
+        _ => ("None", &theme.muted),
     };
-    rows.push(field("Lista", project.to_owned(), &theme.foreground));
-    rows.push(field("Prioridade", priority.into(), priority_color));
+    rows.push(field("List", project.to_owned(), &theme.foreground));
+    rows.push(field("Priority", priority.into(), priority_color));
     if let Some(due) = &task.due_date {
         let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
         let tz = data.time_zone.as_ref().and_then(|s| s.parse().ok());
         rows.push(field(
-            "Vencimento",
+            "Due date",
             crate::fields::format_due(due, all_day, tz),
             &theme.accent,
         ));
@@ -561,24 +561,19 @@ pub fn document(
         .filter(|r| !r.is_empty())
     {
         rows.push(field(
-            "Lembretes",
+            "Reminders",
             crate::fields::format_reminders(&reminders),
             &theme.foreground,
         ));
     }
     rows.push(field(
-        "Tipo",
-        if task.is_note() {
-            "Anotação"
-        } else {
-            "Atividade"
-        }
-        .into(),
+        "Type",
+        if task.is_note() { "Note" } else { "Activity" }.into(),
         &theme.foreground,
     ));
     let context = data.ancestry(task);
     if !context.is_empty() {
-        rows.push(field("Subtarefa de", context, &theme.foreground));
+        rows.push(field("Subtask of", context, &theme.foreground));
     }
     rows.push(Row::text(""));
     rows.push(Row::text(Span::styled(
@@ -642,7 +637,7 @@ pub fn document(
         let hidden = task.items.iter().filter(|i| i.status == 1).count();
         if hide_done && hidden > 0 {
             rows.push(Row::text(Span::styled(
-                format!("  {hidden} concluído(s) oculto(s) · zh mostra"),
+                format!("  {hidden} completed hidden · zh to show"),
                 Style::default().fg(color(&theme.muted)).italic(),
             )));
         }
@@ -656,7 +651,7 @@ pub fn document(
         rows.push(Row::text(""));
         rows.push(Row::text(Line::from(vec![
             Span::styled(
-                "SUBTAREFAS  ",
+                "SUBTASKS  ",
                 Style::default().fg(color(&theme.muted)).bold(),
             ),
             Span::styled(

@@ -90,10 +90,10 @@ pub fn entries(data: &Snapshot, collapsed: &std::collections::HashSet<String>) -
     };
     add(View::Today, "Today".into(), 0);
     add(View::Inbox, "Inbox".into(), 0);
-    add(View::Tomorrow, "Amanhã".into(), 0);
-    add(View::Report, "Relatório do dia".into(), 0);
-    add(View::Habits, "Hábitos".into(), 0);
-    add(View::Focus, "Foco".into(), 0);
+    add(View::Tomorrow, "Tomorrow".into(), 0);
+    add(View::Report, "Daily report".into(), 0);
+    add(View::Habits, "Habits".into(), 0);
+    add(View::Focus, "Focus".into(), 0);
     // Groups and root lists keep TickTick's sortOrder. Child lists retain their own order.
     let mut roots = data
         .groups
@@ -130,7 +130,7 @@ pub fn entries(data: &Snapshot, collapsed: &std::collections::HashSet<String>) -
             add(View::Project(p.id.clone()), p.name.clone(), 0);
         }
     }
-    add(View::All, "Todas as tarefas".into(), 0);
+    add(View::All, "All tasks".into(), 0);
     rows
 }
 
