@@ -2688,8 +2688,10 @@ fn edit_input(input: &mut String, cursor: &mut usize, key: KeyEvent) {
     *input = chars.into_iter().collect();
 }
 fn editor_uses_description(task: &Task) -> bool {
-    task.extra.get("kind").and_then(serde_json::Value::as_str) == Some("CHECKLIST")
-        || (task.content.is_empty() && task.desc.is_some())
+    let has_desc = task.desc.as_deref().is_some_and(|d| !d.trim().is_empty());
+    (task.extra.get("kind").and_then(serde_json::Value::as_str) == Some("CHECKLIST")
+        && (has_desc || task.content.trim().is_empty()))
+        || (task.content.trim().is_empty() && task.desc.is_some())
 }
 fn editor_body(task: &Task) -> &str {
     if editor_uses_description(task) {
