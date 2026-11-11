@@ -520,7 +520,6 @@ pub fn document(
             task.title.clone(),
             Style::default().fg(color(&theme.heading)).bold(),
         )),
-        Row::text(""),
     ];
     let project = data
         .projects
@@ -528,31 +527,27 @@ pub fn document(
         .find(|p| p.id == task.project_id)
         .map(|p| p.name.as_str())
         .unwrap_or("");
-    let field = |label: &str, value: String, fg: &str| {
-        Row::text(Line::from(vec![
-            Span::styled(
-                format!("{label:<14}"),
-                Style::default().fg(color(&theme.muted)),
-            ),
-            Span::styled(value, Style::default().fg(color(fg))),
-        ]))
+    // One compact metadata line; empty fields are omitted.
+    let mut meta = vec![Span::styled(
+        project.to_owned(),
+        Style::default().fg(color(&theme.muted)),
+    )];
+    let mut field = |value: String, fg: &str| {
+        meta.push(Span::styled(
+            format!("  ·  {value}"),
+            Style::default().fg(color(fg)),
+        ))
     };
-    let (priority, priority_color) = match task.priority {
-        5 => ("● High", &theme.danger),
-        3 => ("● Medium", &theme.accent),
-        1 => ("● Low", &theme.muted),
-        _ => ("None", &theme.muted),
-    };
-    rows.push(field("List", project.to_owned(), &theme.foreground));
-    rows.push(field("Priority", priority.into(), priority_color));
+    match task.priority {
+        5 => field("● High".into(), &theme.danger),
+        3 => field("● Medium".into(), &theme.accent),
+        1 => field("● Low".into(), &theme.muted),
+        _ => (),
+    }
     if let Some(due) = &task.due_date {
         let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
         let tz = data.time_zone.as_ref().and_then(|s| s.parse().ok());
-        rows.push(field(
-            "Due date",
-            crate::fields::format_due(due, all_day, tz),
-            &theme.accent,
-        ));
+        field(crate::fields::format_due(due, all_day, tz), &theme.accent);
     }
     if let Some(reminders) = task
         .extra
@@ -560,27 +555,21 @@ pub fn document(
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
         .filter(|r| !r.is_empty())
     {
-        rows.push(field(
-            "Reminders",
-            crate::fields::format_reminders(&reminders),
-            &theme.foreground,
-        ));
+        field(
+            format!("⏰ {}", crate::fields::format_reminders(&reminders)),
+            &theme.muted,
+        );
     }
-    rows.push(field(
-        "Type",
-        if task.is_note() { "Note" } else { "Activity" }.into(),
-        &theme.foreground,
-    ));
+    if task.is_note() {
+        field("Note".into(), &theme.muted);
+    }
     let context = data.ancestry(task);
     if !context.is_empty() {
-        rows.push(field("Subtask of", context, &theme.foreground));
+        field(format!("↳ {context}"), &theme.muted);
     }
+    rows.push(Row::text(Line::from(meta)));
     rows.push(Row::text(""));
-    rows.push(Row::text(Span::styled(
-        "─".repeat(width),
-        Style::default().fg(color(&theme.border)),
-    )));
-    rows.push(Row::text(""));
+
     rows.extend(markdown(&task.content, Field::Content, theme, width));
     if let Some(desc) = task.desc.as_ref().filter(|s| !s.is_empty()) {
         rows.extend(markdown(desc, Field::Description, theme, width));

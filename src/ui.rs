@@ -2518,6 +2518,7 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         app.clamp();
         let area = terminal.size()?;
         let preview_area = preview_area(Rect::new(0, 0, area.width, area.height), &app);
+        // Borders, padding and one column for the scrollbar.
         app.preview_width = preview_area.width.saturating_sub(6).max(1) as usize;
         app.preview_cursor = app
             .preview_cursor
@@ -2763,7 +2764,7 @@ fn demo_data() -> Snapshot {
 }
 fn body_area(area: Rect) -> Rect {
     Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -3495,28 +3496,14 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         f.area(),
     );
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(f.area());
-    let header = Layout::horizontal([
-        Constraint::Length(23),
-        Constraint::Min(0),
-        Constraint::Length(24),
-    ])
-    .split(rows[0].inner(Margin::new(1, 1)));
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ◉ ", Style::default().fg(accent)),
-            Span::styled(
-                "TickTick TUI",
-                Style::default().fg(preview::color(&t.heading)).bold(),
-            ),
-        ])),
-        header[0],
-    );
+    let header = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)])
+        .split(rows[0].inner(Margin::new(1, 0)));
     let current = app.sidebar();
     let project = current
         .get(app.project)
@@ -3529,19 +3516,12 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(project, Style::default().fg(muted)),
+            Span::styled(project, Style::default().fg(preview::color(&t.heading)).bold()),
             Span::styled(
-                if app.global_search {
-                    format!(
-                        "  /  {} results · pending and completed",
-                        app.visible().len()
-                    )
-                } else if matches!(app.view(), View::Habits | View::Focus) {
-                    "  /  Habits and focus".into()
-                } else if app.view() == View::Report {
-                    "  /  Your progress".into()
+                if matches!(app.view(), View::Habits | View::Focus | View::Report) {
+                    String::new()
                 } else {
-                    format!("  /  {} pending", app.visible().len())
+                    format!("  {}", app.visible().len())
                 },
                 Style::default().fg(muted),
             ),
@@ -3550,7 +3530,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                 Style::default().fg(accent),
             ),
         ])),
-        header[1],
+        header[0],
     );
     f.render_widget(
         Paragraph::new(Span::styled(
@@ -3566,7 +3546,8 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             }),
         ))
         .alignment(Alignment::Right),
-        header[2],
+        header[1],
+
     );
     let block = |title: String, active: bool| {
         Block::bordered()
@@ -3671,10 +3652,12 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                         ),
                         Span::styled(
                             {
-                                let count = if matches!(
-                                    e.view,
-                                    View::Report | View::Habits | View::Focus | View::Group(_)
-                                ) {
+                                let count = if e.count == 0
+                                    || matches!(
+                                        e.view,
+                                        View::Report | View::Habits | View::Focus | View::Group(_)
+                                    )
+                                {
                                     String::new()
                                 } else {
                                     e.count.to_string()
@@ -3706,7 +3689,6 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                         "  LISTS",
                         Style::default().fg(muted).bold(),
                     )));
-                    lines.push(Line::default());
                 }
                 ListItem::new(lines)
             })
@@ -3714,7 +3696,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let mut state = ListState::default().with_selected(Some(app.project));
         f.render_stateful_widget(
             List::new(projects).block(
-                block(" 1 · Lists ".into(), app.projects_focus).padding(Padding::vertical(1)),
+                block(" 1 Lists ".into(), app.projects_focus),
             ),
             cols[0],
             &mut state,
@@ -3726,117 +3708,37 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let row_width = cols[1].width.saturating_sub(5) as usize;
         let visual = (app.mode == Mode::Visual).then(|| app.range());
         let mut previous_context = String::new();
-        let mut next_at_depth = Vec::<usize>::new();
-        let mut has_sibling = vec![false; tree.len()];
-        for (i, row) in tree.iter().enumerate().rev() {
-            while next_at_depth
-                .last()
-                .is_some_and(|&next| tree[next].depth > row.depth)
-            {
-                next_at_depth.pop();
-            }
-            has_sibling[i] = next_at_depth
-                .last()
-                .is_some_and(|&next| tree[next].depth == row.depth);
-            next_at_depth.push(i);
-        }
-        let mut ancestor_siblings = Vec::new();
+        let aggregate = !matches!(app.view(), View::Project(_) | View::Inbox);
         let items = tree
             .iter()
             .enumerate()
             .map(|(i, row)| {
                 let task = row.task;
-                let depth = row.depth.min(cols[1].width.saturating_sub(20) as usize / 2);
-                ancestor_siblings.resize(row.depth + 1, false);
-                ancestor_siblings[row.depth] = has_sibling[i];
-                let mut indent = String::new();
-                for level in 1..depth {
-                    indent.push_str(if ancestor_siblings[level] {
-                        "│  "
-                    } else {
-                        "   "
-                    });
-                }
-                let connector = if row.depth == 0 {
-                    ""
-                } else if has_sibling[i] {
-                    "├─ "
-                } else {
-                    "└─ "
+                let depth = row.depth.min(row_width.saturating_sub(16) / 2);
+                let collapsed = app.collapsed.contains(&task.id);
+                let branch = match (row.children, collapsed) {
+                    (0, _) => "  ",
+                    (_, true) => "▸ ",
+                    _ => "▾ ",
                 };
-                let branch = if row.children > 0 {
-                    if app.collapsed.contains(&task.id) {
-                        "▸ "
-                    } else {
-                        "▾ "
-                    }
+                let left = format!(" {}{branch}{} ", "  ".repeat(depth), task.marker());
+                let marker = if task.status == 2 {
+                    preview::color(&t.success)
                 } else {
-                    ""
+                    match task.priority {
+                        5 => danger,
+                        3 => accent,
+                        _ => muted,
+                    }
                 };
                 let pill = |text: String, color: Color| {
                     Span::styled(format!("  {text}"), Style::default().fg(color))
                 };
-                let mut badges = Vec::new();
-                match task.priority {
-                    5 => badges.push(pill("● high".into(), danger)),
-                    3 => badges.push(pill("● medium".into(), accent)),
-                    1 => badges.push(pill("● low".into(), muted)),
-                    _ => (),
-                }
-                if !task.content.is_empty() {
-                    badges.push(pill("≡".into(), muted));
-                }
-                if !task.items.is_empty() {
-                    let done = task.items.iter().filter(|i| i.status == 1).count();
-                    badges.push(pill(format!("✓ {done}/{}", task.items.len()), muted));
-                }
-                if row.children > 0 && app.collapsed.contains(&task.id) {
-                    badges.push(pill(format!("+{}", row.children), muted));
-                }
-                if task
-                    .extra
-                    .get("reminders")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|r| !r.is_empty())
-                {
-                    badges.push(pill("⏰".into(), muted));
-                }
-                let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
-                if let Some((label, overdue)) = task
-                    .due_date
-                    .as_deref()
-                    .and_then(|d| fields::relative_due(d, all_day, tz, today))
-                {
-                    badges.push(pill(label, if overdue { danger } else { accent }));
-                }
-                let context = app.data.ancestry(task);
-                let show_context =
-                    row.depth == 0 && !context.is_empty() && context != previous_context;
-                let left = if row.depth == 0 && !context.is_empty() {
-                    format!("   {} ", task.marker())
-                } else {
-                    format!(
-                        " {}{indent}{connector}{branch}{} ",
-                        if row.depth > 0 { "  " } else { "" },
-                        task.marker()
-                    )
-                };
                 let selected = i == app.selected;
-                let title = truncate(
-                    &task.title.replace(['\n', '\r'], " "),
-                    row_width.saturating_sub(left.width()),
-                );
-                let line = vec![
+                let mut spans = vec![
+                    Span::styled(left, Style::default().fg(marker)),
                     Span::styled(
-                        left.clone(),
-                        Style::default().fg(if task.status == 2 {
-                            preview::color(&t.success)
-                        } else {
-                            muted
-                        }),
-                    ),
-                    Span::styled(
-                        title,
+                        task.title.replace(['\n', '\r'], " "),
                         if selected {
                             Style::default().fg(accent).bold()
                         } else {
@@ -3844,51 +3746,51 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                         },
                     ),
                 ];
-                let has_metadata = row.depth == 0 || !badges.is_empty();
-                let badge_width: usize = badges.iter().map(Span::width).sum();
-                let metadata_indent = if row.depth > 0 {
-                    let guide = if has_sibling[i] { "│  " } else { "   " };
-                    let prefix = format!("   {indent}{guide}");
-                    format!(
-                        "{prefix}{}",
-                        " ".repeat(left.width().saturating_sub(prefix.width()))
-                    )
-                } else {
-                    " ".repeat(left.width())
-                };
-                let mut metadata = vec![Span::styled(
-                    format!(
-                        "{}{}",
-                        metadata_indent,
-                        truncate(
-                            &if row.depth == 0 {
-                                app.project_name(&task.project_id)
-                            } else {
-                                String::new()
-                            },
-                            row_width.saturating_sub(left.width() + badge_width)
-                        )
-                    ),
-                    Style::default().fg(muted),
-                )];
-                metadata.extend(badges);
+                let all_day = task.extra.get("isAllDay").and_then(|v| v.as_bool()) == Some(true);
+                if let Some((label, overdue)) = task
+                    .due_date
+                    .as_deref()
+                    .and_then(|d| fields::relative_due(d, all_day, tz, today))
+                {
+                    spans.push(pill(label, if overdue { danger } else { accent }));
+                }
+                if !task.items.is_empty() {
+                    let done = task.items.iter().filter(|i| i.status == 1).count();
+                    spans.push(pill(format!("{done}/{}", task.items.len()), muted));
+                }
+                if row.children > 0 && collapsed {
+                    spans.push(pill(format!("+{}", row.children), muted));
+                }
+                if task
+                    .extra
+                    .get("reminders")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|r| !r.is_empty())
+                {
+                    spans.push(pill("⏰".into(), muted));
+                }
+                if aggregate && row.depth == 0 {
+                    spans.push(pill(app.project_name(&task.project_id), muted));
+                }
+                let context = app.data.ancestry(task);
                 let mut lines = Vec::new();
-                if show_context {
+                if row.depth == 0 && !context.is_empty() && context != previous_context {
                     lines.push(Line::styled(
-                        truncate(&format!(" {indent}{context}"), row_width),
+                        truncate(&format!("   {context}"), row_width),
                         Style::default().fg(muted),
                     ));
                 }
                 previous_context = context;
-                lines.push(Line::from(line));
-                if cols[1].height >= 12 {
-                    if has_metadata {
-                        lines.push(Line::from(metadata));
-                    }
-                    if !tree.get(i + 1).is_some_and(|next| next.depth > 0) {
-                        lines.push(Line::default());
-                    }
-                }
+                let wrapped = preview::wrap(
+                    vec![preview::Row {
+                        line: Line::from(spans),
+                        action: None,
+                        link: None,
+                        hang: 1,
+                    }],
+                    row_width,
+                );
+                lines.extend(wrapped.into_iter().map(|r| r.line));
                 let item = ListItem::new(lines);
                 match visual {
                     Some((lo, hi)) if (lo..=hi).contains(&i) => {
@@ -3905,30 +3807,21 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         });
         let title = if app.global_search {
             format!(
-                " 2 · Global search fs: {} · {} · q close ",
+                " 2 Search: {} · {} · q close ",
                 app.query,
                 tree.len()
             )
         } else if matches!(app.view(), View::Habits | View::Focus) {
             format!(" {} ", project)
         } else if app.view() == View::Report {
-            " ★ · Daily report ".into()
+            " ★ Daily report ".into()
         } else if app.query.is_empty() {
-            format!(" 2 · {project} ")
+            format!(" 2 {project} ")
         } else {
-            format!(" 2 · Search /{} ", app.query)
+            format!(" 2 /{} ", app.query)
         };
-        let mut taskblock = block(title, !app.projects_focus && !app.preview_focus)
-            .padding(Padding::new(0, 1, 1, 0));
-        if !matches!(app.view(), View::Report | View::Habits | View::Focus) {
-            taskblock = taskblock.title_bottom(
-                Line::styled(
-                    format!(" {} activities ", tree.len()),
-                    Style::default().fg(muted),
-                )
-                .right_aligned(),
-            );
-        }
+        let taskblock = block(title, !app.projects_focus && !app.preview_focus)
+            .padding(Padding::new(0, 1, 0, 0));
         let inner = taskblock.inner(cols[1]);
         let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
         f.render_stateful_widget(
@@ -3993,24 +3886,13 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let document = app.preview(t);
         let preview_block = block(
             if app.view() == View::Report {
-                " Completed activity · h / Esc to return ".into()
+                " Completed · h back ".into()
             } else {
-                " 3 · Activity details ".into()
+                " 3 Preview ".into()
             },
             app.preview_focus,
         )
-        .title_bottom(
-            Line::styled(
-                if app.preview_focus {
-                    " j/k navigate · h return "
-                } else {
-                    " 3 focus "
-                },
-                Style::default().fg(muted),
-            )
-            .right_aligned(),
-        )
-        .padding(Padding::new(2, 2, 1, 1));
+        .padding(Padding::new(2, 1, 0, 0));
         let inner = preview_block.inner(preview);
         f.render_widget(preview_block, preview);
         if document.is_empty() {
@@ -4093,9 +3975,10 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             } else if app.view() == View::Habits {
                 " HABITS  j/k scroll · Space complete/reset · h lists · r sync · ? help".into()
             } else if app.preview_focus {
-                " PREVIEW  x toggle · o/O new item · J/K move · cc rename · dd delete · u undo · gs subtask · zh hide completed · h back".into()
+                " PREVIEW  x toggle · o new item · cc rename · dd delete · h back · ? help".into()
             } else {
-                " NORMAL  h/j/k/l navigate · a new · J/K move · H/L level · m list · D due · R reminder · za fold · ? help".into()
+                " NORMAL  a new · x done · D due · m move · / search · ? help".into()
+
             }
         }
     };
@@ -5530,7 +5413,7 @@ mod tests {
                     .map(|c| c.symbol())
                     .collect::<String>();
                 assert!(text.contains("Global search"));
-                assert!(text.contains("Priority"));
+                assert!(text.contains("3 Preview"));
                 assert!(text.contains("Work"));
                 assert_eq!(terminal.backend().buffer()[(6, 2)].symbol(), "╭");
             }
