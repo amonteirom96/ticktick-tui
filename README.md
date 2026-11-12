@@ -1,6 +1,6 @@
 # ticktick-tui
 
-Um gerenciador de tarefas minimalista em Rust para o terminal, conectado à Open API do TickTick. Navegação inspirada no Vim, projetos à esquerda, tarefas no centro e detalhes à direita em terminais largos.
+Um gerenciador de tarefas minimalista em Rust para o terminal, conectado à Open API do TickTick. Navegação inspirada no Vim, projetos à esquerda e tarefas no centro; a tarefa selecionada abre como card dentro da lista.
 
 ## Instalação
 
@@ -49,7 +49,7 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | Tecla | Ação |
 | --- | --- |
 | `h` / `l`, `Tab` | Focar listas / tarefas |
-| `1` / `2` / `3` | Focar listas / tarefas / preview |
+| `1` / `2` / `3` | Focar listas / tarefas / card da tarefa |
 | `j` / `k`, `5j` / `5k` | Navegar, com contagem opcional |
 | `gg` / `G` | Primeiro / último item |
 | `Ctrl-d` / `Ctrl-u` | Descer / subir 10 itens |
@@ -69,10 +69,9 @@ O token é salvo separadamente em `~/.config/ticktick-tui/token` (permissão 060
 | `ff` | Abrir modal de pesquisa com resultados e detalhes. Enter consulta a API do TickTick para tarefas pendentes e concluídas, de qualquer data; `/` filtra localmente os resultados exibidos (Esc cancela a edição), `o` abre o resultado selecionado na tela principal, `Ctrl-j`/`Ctrl-k` navegam e `Ctrl-l` abre o selecionado mesmo durante a digitação, `q` ou `Q` fecha. Esc cancela durante a digitação. Antes de Enter, são exibidas sugestões locais; no modo demo a busca é local |
 | `fl` | Abrir seletor de telas e listas (Today, Inbox, Tomorrow, Daily report, Habits, Focus e listas): digite para filtrar, ↑/↓ ou Tab para escolher, Enter abre, Esc cancela |
 | `Esc` | Cancelar entrada ou limpar filtro |
-| `Enter` | Mostrar / ocultar detalhes |
-| `zp` | Mostrar / ocultar preview |
+| `Enter`, `l` | Abrir a tarefa como card dentro da lista (notas, checklist, prazo); `Esc` recolhe |
 | `F` | Zoom: preview em tela cheia (`F`/`Esc` volta) |
-| `<` / `>` | Estreitar / alargar a coluna de tarefas |
+| `<` / `>` | Estreitar / alargar a coluna de listas |
 | `b` | Ocultar / mostrar a coluna de listas (`h` reabre) |
 | `r`, `:sync`, `:w` | Sincronizar |
 | `:complete`, `:delete` | Concluir / excluir |

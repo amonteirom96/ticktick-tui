@@ -110,7 +110,6 @@ struct App {
     preview_cursor: usize,
     preview_width: usize,
     /// Task column width (%) when the preview is visible.
-    split: u16,
     /// Extra sidebar width (columns), changed with `<`/`>` while the list is focused.
     lists: i16,
     zoom: bool,
@@ -153,7 +152,6 @@ struct App {
     audio: Option<(rodio::MixerDeviceSink, Arc<AtomicBool>)>,
     pending: char,
     count: String,
-    details: bool,
     last_sync: Instant,
     tx: Option<Sender<Job>>,
     rx: Option<Receiver<sync::Event>>,
@@ -672,6 +670,12 @@ impl App {
             })
             .unwrap_or_default()
     }
+    /// Preview open as a card inside the task list.
+    fn card(&self) -> bool {
+        self.preview_focus
+            && !self.zoom
+            && !matches!(self.view(), View::Report | View::Habits | View::Focus)
+    }
     fn focus(&mut self, pane: u8) {
         if pane == 2
             && self.view() == View::Report
@@ -684,9 +688,6 @@ impl App {
         self.preview_focus = pane == 2;
         self.zoom &= self.preview_focus;
         self.hide_lists &= !self.projects_focus;
-        if self.preview_focus {
-            self.details = true;
-        }
         if entering
             && self.view() != View::Report
             && let Some(&i) = self.open_boxes().first()
@@ -2205,20 +2206,12 @@ impl App {
             }
             K::Char('<') if self.projects_focus => self.lists = (self.lists - 2).max(-6),
             K::Char('>') if self.projects_focus => self.lists = (self.lists + 2).min(40),
-            K::Char('<') => self.split = self.split.saturating_sub(5).max(15),
-            K::Char('>') => self.split = (self.split + 5).min(70),
             K::Enter => self.focus(2),
             K::Char('v')
                 if !self.projects_focus && !self.preview_focus && self.task().is_some() =>
             {
                 self.mode = Mode::Visual;
                 self.anchor = self.selected;
-            }
-            K::Char('p') if pending == 'z' => {
-                self.details = !self.details;
-                if !self.details {
-                    self.focus(1);
-                }
             }
             K::Char('p') => {
                 if let Some(mut t) = self.task() {
@@ -2325,7 +2318,6 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         preview_focus: false,
         preview_cursor: 0,
         preview_width: 60,
-        split: 34,
         lists: 0,
         zoom: false,
         hide_lists: false,
@@ -2365,7 +2357,6 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         audio: config.sounds.then(open_audio).flatten(),
         pending: '\0',
         count: String::new(),
-        details: true,
         last_sync: Instant::now(),
         tx,
         rx,
@@ -2519,7 +2510,14 @@ pub fn run(mut config: Config, api: Option<Api>, demo: bool) -> Result<()> {
         let area = terminal.size()?;
         let preview_area = preview_area(Rect::new(0, 0, area.width, area.height), &app);
         // Borders, padding and one column for the scrollbar.
-        app.preview_width = preview_area.width.saturating_sub(6).max(1) as usize;
+        // Card width is set before it opens so the first frame wraps like the rest.
+        app.preview_width = if preview_area.width > 0 {
+            preview_area.width.saturating_sub(6)
+        } else {
+            // Lists column and gap, task list borders/padding, card inset/padding, scrollbar.
+            area.width.saturating_sub(lists_width(area.width, &app) + 13)
+        }
+        .max(1) as usize;
         app.preview_cursor = app
             .preview_cursor
             .min(app.preview(&config.theme).len().saturating_sub(1));
@@ -2773,39 +2771,19 @@ fn body_area(area: Rect) -> Rect {
     ])
     .split(area)[1]
 }
+fn lists_width(width: u16, app: &App) -> u16 {
+    if app.hide_lists {
+        0
+    } else {
+        (if width < 55 { 17u16 } else { 25 }).saturating_add_signed(app.lists)
+    }
+}
 fn preview_area(area: Rect, app: &App) -> Rect {
-    let body = body_area(area);
-    if matches!(app.view(), View::Habits | View::Focus) {
-        return Rect::default();
+    if app.preview_focus && (app.zoom || app.view() == View::Report) {
+        body_area(area)
+    } else {
+        Rect::default()
     }
-    if app.view() == View::Report {
-        return if app.preview_focus {
-            body
-        } else {
-            Rect::default()
-        };
-    }
-    if app.preview_focus && (app.zoom || body.width < 110) {
-        return body;
-    }
-    if app.details && body.width >= 110 {
-        let sidebar = if app.hide_lists {
-            0
-        } else if body.width >= 150 {
-            25u16
-        } else {
-            21
-        }
-        .saturating_add_signed(if app.hide_lists { 0 } else { app.lists });
-        return Layout::horizontal([
-            Constraint::Length(sidebar),
-            Constraint::Percentage(app.split),
-            Constraint::Min(40),
-        ])
-        .spacing(1)
-        .split(body)[2];
-    }
-    Rect::default()
 }
 pub(crate) fn report_number(value: usize) -> Vec<Line<'static>> {
     const DIGITS: [[&str; 3]; 10] = [
@@ -3564,51 +3542,14 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             .style(Style::default().bg(panel).fg(fg))
     };
     let preview = preview_area(f.area(), app);
-    let fullscreen =
-        app.preview_focus && (app.view() == View::Report || app.zoom || rows[1].width < 110);
-    if !fullscreen {
-        let cols = if preview.width > 0 {
-            Layout::horizontal([
-                Constraint::Length(
-                    if app.hide_lists {
-                        0
-                    } else if rows[1].width >= 150 {
-                        25u16
-                    } else {
-                        21
-                    }
-                    .saturating_add_signed(if app.hide_lists {
-                        0
-                    } else {
-                        app.lists
-                    }),
-                ),
-                Constraint::Percentage(app.split),
-                Constraint::Min(40),
-            ])
-            .spacing(1)
-            .split(rows[1])
-        } else {
-            Layout::horizontal([
-                Constraint::Length(
-                    if app.hide_lists {
-                        0
-                    } else if rows[1].width < 55 {
-                        17u16
-                    } else {
-                        25
-                    }
-                    .saturating_add_signed(if app.hide_lists {
-                        0
-                    } else {
-                        app.lists
-                    }),
-                ),
-                Constraint::Min(0),
-            ])
-            .spacing(1)
-            .split(rows[1])
-        };
+    let card = app.card().then(|| app.preview(t));
+    if preview.width == 0 {
+        let cols = Layout::horizontal([
+            Constraint::Length(lists_width(rows[1].width, app)),
+            Constraint::Min(0),
+        ])
+        .spacing(1)
+        .split(rows[1]);
         let lists_selection = panel_selection(t, app.projects_focus);
         let tasks_selection = panel_selection(t, !app.projects_focus && !app.preview_focus);
         let entries = app.sidebar();
@@ -3711,6 +3652,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let visual = (app.mode == Mode::Visual).then(|| app.range());
         let mut previous_context = String::new();
         let aggregate = !matches!(app.view(), View::Project(_) | View::Inbox);
+        let row_lines = std::cell::Cell::new(0);
         let items = tree
             .iter()
             .enumerate()
@@ -3793,6 +3735,15 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                     row_width,
                 );
                 lines.extend(wrapped.into_iter().map(|r| r.line));
+                if selected && let Some(card) = &card {
+                    // The row stays as is; the card body (without its title) opens below it,
+                    // with bottom padding and a margin line.
+                    row_lines.set(lines.len());
+                    let surface = preview::color(&t.code_background);
+                    lines = lines.into_iter().map(|l| l.style(Style::default().bg(surface))).collect();
+                    let height = (lines.len() + card.len() + 1).min(cols[1].height.saturating_sub(2) as usize);
+                    lines.resize(height.max(lines.len()), Line::default());
+                }
                 let item = ListItem::new(lines);
                 match visual {
                     Some((lo, hi)) if (lo..=hi).contains(&i) => {
@@ -3822,14 +3773,18 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         } else {
             format!(" 2 /{} ", app.query)
         };
-        let taskblock = block(title, !app.projects_focus && !app.preview_focus)
+        let taskblock = block(title, !app.projects_focus && (!app.preview_focus || card.is_some()))
             .padding(Padding::new(0, 1, 0, 0));
         let inner = taskblock.inner(cols[1]);
         let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
         f.render_stateful_widget(
             List::new(items)
                 .block(taskblock)
-                .highlight_style(Style::default().bg(tasks_selection))
+                .highlight_style(if card.is_some() {
+                    Style::default()
+                } else {
+                    Style::default().bg(tasks_selection)
+                })
                 .highlight_symbol(if !app.projects_focus && !app.preview_focus {
                     "▎"
                 } else {
@@ -3854,6 +3809,41 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                         Rect::new(inner.x, inner.y + y as u16, 1, 1),
                     );
                 }
+            }
+        }
+        if let Some(card) = &card {
+            let offset = state.offset();
+            let top: usize = item_heights
+                .iter()
+                .skip(offset)
+                .take(app.selected.saturating_sub(offset))
+                .sum();
+            let height = item_heights.get(app.selected).copied().unwrap_or(0);
+            let height = height.min((inner.height as usize).saturating_sub(top)) as u16;
+            let rows = row_lines.get() as u16;
+            if app.selected >= offset && height > rows {
+                let surface = preview::color(&t.code_background);
+                // Selected-row marker on the title only.
+                for y in 0..rows {
+                    f.render_widget(
+                        Paragraph::new("▎").style(Style::default().fg(accent).bg(surface)),
+                        Rect::new(inner.x, inner.y + top as u16 + y, 1, 1),
+                    );
+                }
+                // Body on the same surface as the title row, text aligned with the task titles.
+                let area = Rect::new(
+                    inner.x,
+                    inner.y + top as u16 + rows,
+                    inner.width,
+                    (height - rows).saturating_sub(u16::from(height > rows + 2)),
+                );
+                let card_block = Block::default()
+                    .style(Style::default().bg(surface).fg(fg))
+                    .padding(Padding::new(6, 1, 0, 1));
+                let body = card_block.inner(area);
+                f.render_widget(card_block, area);
+                let cursor = app.preview_cursor;
+                preview::render(f, body, &card[1..], cursor.saturating_sub(1), cursor > 0, t);
             }
         }
         if matches!(app.view(), View::Habits | View::Focus) {
@@ -3890,7 +3880,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             if app.view() == View::Report {
                 " Completed · h back ".into()
             } else {
-                " 3 Preview ".into()
+                " Preview ".into()
             },
             app.preview_focus,
         )
@@ -4265,7 +4255,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     if app.mode == Mode::Help {
         let area = centered(f.area(), 84, 36);
         f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new("\nNAVIGATION\nh / l, Tab     Lists → tasks → preview\n1 / 2 / 3      Focus lists / tasks / preview\nj / k, 5j      Navigate with counts       gg / G    First / last\nCtrl-d / u     Scroll down / up 10 lines  Enter     Focus preview\nzp             Show / hide preview        Esc / h   Back to tasks\nF              Zoom preview               < / >     Resize columns\nb              Show / hide lists\n\nTASKS\na / o          New task                   A         New subtask\nza / zo / zc   Toggle / expand / collapse tree\ncc             Rename                     i         Edit in Vim/$EDITOR\nv + j/k        Select (v/Esc exits)       J / K     Move task/selection ↓ / ↑\nH / L          Outdent / nest under previous task\nm              Move to another list       D / R     Due date / reminders\nx / Space      Complete / reopen task     dd        Delete (confirm with y)\nzh             Show / hide completed tasks\np              Cycle priority             /         Search this list\nff             Global search (Enter applies; o opens result; q closes)\nfl             Go to view or list (filter; Enter or Ctrl-l selects)\n\nPREVIEW\nj / k, ] / [   Next / previous checkbox or subtask; otherwise scroll\nCtrl-d / u     Scroll text 10 lines\nSpace / x      Toggle checkbox/checklist item or complete subtask\nEnter          Toggle checkbox / open subtask (l also opens)\na / o / O      New item: end / below / above; paste multiple lines\nJ / K          Move item ↓ / ↑            u         Undo last edit\ncc / dd        Rename / delete item, checkbox or subtask\ngs             Item ↔ subtask             gx        Open link\nzh             Show / hide completed items\n\nREPORT\n[ / ]          Previous / next day        t         Today\n:report YYYY-MM-DD  Choose a date\n\nHABITS AND FOCUS\nSpace / x      Complete / reset habit\np / w          Pomodoro / Stopwatch (in Focus)\nSpace / Enter  Start / pause local timer\nt              Choose activity            c         Focus / break durations\nn              Next Pomodoro phase        s         Stop and save session\n:focus-retry   Retry pending upload after checking history\n\nCOMMANDS\n:token         Configure API token        :subtask  New subtask\n:theme dark    Dark theme                 :theme light  Light theme\n:sync / :w     Sync                       :config   Configuration path\n:noh           Clear search               :q / q    Quit\n\nPress any key to close help.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Shortcuts ".into(),true).padding(Padding::horizontal(2))),area);
+        f.render_widget(Paragraph::new("\nNAVIGATION\nh / l, Tab     Lists → tasks → card\n1 / 2 / 3      Focus lists / tasks / card\nj / k, 5j      Navigate with counts       gg / G    First / last\nCtrl-d / u     Scroll down / up 10 lines  Enter     Open task card\nEsc / h        Back to tasks              F         Zoom card\n< / >          Resize lists column\nb              Show / hide lists\n\nTASKS\na / o          New task                   A         New subtask\nza / zo / zc   Toggle / expand / collapse tree\ncc             Rename                     i         Edit in Vim/$EDITOR\nv + j/k        Select (v/Esc exits)       J / K     Move task/selection ↓ / ↑\nH / L          Outdent / nest under previous task\nm              Move to another list       D / R     Due date / reminders\nx / Space      Complete / reopen task     dd        Delete (confirm with y)\nzh             Show / hide completed tasks\np              Cycle priority             /         Search this list\nff             Global search (Enter applies; o opens result; q closes)\nfl             Go to view or list (filter; Enter or Ctrl-l selects)\n\nPREVIEW\nj / k, ] / [   Next / previous checkbox or subtask; otherwise scroll\nCtrl-d / u     Scroll text 10 lines\nSpace / x      Toggle checkbox/checklist item or complete subtask\nEnter          Toggle checkbox / open subtask (l also opens)\na / o / O      New item: end / below / above; paste multiple lines\nJ / K          Move item ↓ / ↑            u         Undo last edit\ncc / dd        Rename / delete item, checkbox or subtask\ngs             Item ↔ subtask             gx        Open link\nzh             Show / hide completed items\n\nREPORT\n[ / ]          Previous / next day        t         Today\n:report YYYY-MM-DD  Choose a date\n\nHABITS AND FOCUS\nSpace / x      Complete / reset habit\np / w          Pomodoro / Stopwatch (in Focus)\nSpace / Enter  Start / pause local timer\nt              Choose activity            c         Focus / break durations\nn              Next Pomodoro phase        s         Stop and save session\n:focus-retry   Retry pending upload after checking history\n\nCOMMANDS\n:token         Configure API token        :subtask  New subtask\n:theme dark    Dark theme                 :theme light  Light theme\n:sync / :w     Sync                       :config   Configuration path\n:noh           Clear search               :q / q    Quit\n\nPress any key to close help.").style(Style::default().bg(panel).fg(fg)).wrap(Wrap{trim:false}).block(block(" Shortcuts ".into(),true).padding(Padding::horizontal(2))),area);
     }
     if app.quitting {
         let area = centered(f.area(), 44, 5);
@@ -4488,8 +4478,7 @@ mod tests {
             preview_focus: false,
             preview_cursor: 0,
             preview_width: 60,
-            split: 34,
-            lists: 0,
+                lists: 0,
             zoom: false,
             hide_lists: false,
             collapsed: HashSet::new(),
@@ -4523,7 +4512,6 @@ mod tests {
             audio: None,
             pending: '\0',
             count: String::new(),
-            details: true,
             last_sync: Instant::now(),
             tx: None,
             rx: None,
@@ -4575,17 +4563,6 @@ mod tests {
         assert_eq!((a.cal, a.input.as_str()), (tomorrow, "1430"));
         press(&mut a, 'x');
         assert!(a.data.tasks[0].due_date.is_none());
-    }
-    #[test]
-    fn b_hides_lists_after_widening_them() {
-        let area = Rect::new(0, 0, 160, 40);
-        let mut hidden = app();
-        hidden.hide_lists = true;
-        let mut a = app();
-        a.projects_focus = true;
-        press(&mut a, '>');
-        press(&mut a, 'b');
-        assert_eq!(preview_area(area, &a), preview_area(area, &hidden));
     }
     #[test]
     fn wellness_views_render_and_block_task_mutations() {
@@ -5415,7 +5392,6 @@ mod tests {
                     .map(|c| c.symbol())
                     .collect::<String>();
                 assert!(text.contains("Global search"));
-                assert!(text.contains("3 Preview"));
                 assert!(text.contains("Work"));
                 assert_eq!(terminal.backend().buffer()[(6, 2)].symbol(), "╭");
             }
