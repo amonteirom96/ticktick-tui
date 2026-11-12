@@ -3541,6 +3541,8 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             .border_style(Style::default().fg(if active { accent } else { border }))
             .style(Style::default().bg(panel).fg(fg))
     };
+    // Main panes keep the border's space (layout math) but draw it blank.
+    let pane = |title: String, active: bool| block(title, active).border_set(symbols::border::EMPTY);
     let preview = preview_area(f.area(), app);
     let card = app.card().then(|| app.preview(t));
     if preview.width == 0 {
@@ -3639,7 +3641,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         let mut state = ListState::default().with_selected(Some(app.project));
         f.render_stateful_widget(
             List::new(projects).block(
-                block(" 1 Lists ".into(), app.projects_focus),
+                pane(" 1 Lists ".into(), app.projects_focus),
             ),
             cols[0],
             &mut state,
@@ -3773,7 +3775,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
         } else {
             format!(" 2 /{} ", app.query)
         };
-        let taskblock = block(title, !app.projects_focus && (!app.preview_focus || card.is_some()))
+        let taskblock = pane(title, !app.projects_focus && (!app.preview_focus || card.is_some()))
             .padding(Padding::new(0, 1, 0, 0));
         let inner = taskblock.inner(cols[1]);
         let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
@@ -3876,7 +3878,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     }
     if preview.width > 0 {
         let document = app.preview(t);
-        let preview_block = block(
+        let preview_block = pane(
             if app.view() == View::Report {
                 " Completed · h back ".into()
             } else {
