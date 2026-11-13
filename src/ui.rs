@@ -4248,7 +4248,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
     let title = match app.mode {
         Mode::Add => Some(" New task ".to_owned()),
         Mode::Subtask => Some(format!(" Subtask of {target} ")),
-        Mode::Item => Some(format!(" New item in {target} ")),
+        Mode::Item => Some(format!(" New item |> {target} ")),
         Mode::ItemRename => Some(" Item ".to_owned()),
         Mode::Rename => Some(" Title ".to_owned()),
         Mode::FocusConfig => Some(" Focus · break · long break (minutes) ".to_owned()),
