@@ -778,7 +778,9 @@ pub fn render(
     if area.height == 0 {
         return;
     }
-    let scroll = cursor.saturating_sub(area.height.saturating_sub(3) as usize);
+    let scroll = cursor
+        .saturating_sub(area.height.saturating_sub(3) as usize)
+        .min(rows.len().saturating_sub(area.height as usize));
     let lines = rows
         .iter()
         .enumerate()
