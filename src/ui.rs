@@ -3767,7 +3767,12 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
                         .min(cols[1].height.saturating_sub(2) as usize);
                     lines.resize(height.max(lines.len()), Line::default());
                 }
-                let item = ListItem::new(lines);
+                // With a card open, dim the other rows so it is clear we are inside the task.
+                let item = ListItem::new(lines).style(if card.is_some() && !selected {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                });
                 match visual {
                     Some((lo, hi)) if (lo..=hi).contains(&i) => {
                         item.style(Style::default().bg(tasks_selection))
@@ -4238,13 +4243,15 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             area,
         );
     }
+    // Name where the new entry goes: the list, or the task the card has open.
+    let target = app.target.as_ref().map(|t| truncate(&t.title, 40)).unwrap_or_default();
     let title = match app.mode {
-        Mode::Add => Some(" New task "),
-        Mode::Subtask => Some(" Subtask "),
-        Mode::Item => Some(" New item "),
-        Mode::ItemRename => Some(" Item "),
-        Mode::Rename => Some(" Title "),
-        Mode::FocusConfig => Some(" Focus · break · long break (minutes) "),
+        Mode::Add => Some(" New task ".to_owned()),
+        Mode::Subtask => Some(format!(" Subtask of {target} ")),
+        Mode::Item => Some(format!(" New item in {target} ")),
+        Mode::ItemRename => Some(" Item ".to_owned()),
+        Mode::Rename => Some(" Title ".to_owned()),
+        Mode::FocusConfig => Some(" Focus · break · long break (minutes) ".to_owned()),
         _ => None,
     };
     if let Some(title) = title {
@@ -4268,7 +4275,7 @@ fn draw_main(f: &mut Frame, app: &App, c: &Config) {
             Paragraph::new(text)
                 .style(Style::default().bg(panel).fg(fg))
                 .scroll((scroll, 0))
-                .block(block(title.into(), true).padding(Padding::horizontal(1))),
+                .block(block(title, true).padding(Padding::horizontal(1))),
             area,
         );
         if inner.width > 0 && inner.height > 0 {
